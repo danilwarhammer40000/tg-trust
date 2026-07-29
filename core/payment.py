@@ -4,8 +4,7 @@
 
 PAYMENT_INFO = (
     "💳 Для продления переведите клубный донат из расчета 100руб/мес ( без комиссии и из любого банка):\n"
-    "https://finance.ozon.ru/apps/sbp/ozonbankpay/019deec7-3a90-7887-aed0-13b23f04ee5b
-\n"
+    "https://finance.ozon.ru/apps/sbp/ozonbankpay/019deec7-3a90-7887-aed0-13b23f04ee5b \n"
     "Даниил П.\n"
     "Чек или скрин для проверки отправьте прямо сюда в чат ✅.\n"
 )
