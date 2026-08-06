@@ -459,6 +459,55 @@ def sorted_users_for_display(users: list) -> list:
     return sorted(users, key=_expiry_sort_key)
 
 
+# ---------------- PAGINATION ----------------
+#
+# Telegram inline keyboards silently break past a certain size (the client
+# either refuses to render the message's reply_markup, or truncates it) —
+# with enough clients, one row per user meant the list just cut off partway
+# through with no error, no scroll, nothing. Every "one row per user" list
+# in this file (List users, Get link, mass delete, broadcast recipient
+# picker, trial management) goes through this helper instead of dumping
+# every row into one InlineKeyboardMarkup.
+
+USERS_PAGE_SIZE = 15
+
+
+def paginate(items: list, page: int):
+    """Returns (page_items, total_pages, page) — page is clamped into range."""
+    total_pages = max(1, (len(items) + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * USERS_PAGE_SIZE
+    page_items = items[start:start + USERS_PAGE_SIZE]
+
+    return page_items, total_pages, page
+
+
+def pagination_nav_row(page: int, total_pages: int, callback_prefix: str) -> list:
+    """
+    Builds the ⬅️/➡️ row for a given page. callback_prefix's handler must
+    accept a trailing ":{page}" and re-render the same list at that page —
+    see e.g. F.data.startswith("listpage:").
+    """
+    if total_pages <= 1:
+        return []
+
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton(text="⬅️ Пред.", callback_data=f"{callback_prefix}:{page - 1}"))
+    row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        row.append(InlineKeyboardButton(text="След. ➡️", callback_data=f"{callback_prefix}:{page + 1}"))
+
+    return [row]
+
+
+@dp.callback_query(F.data == "noop")
+async def noop_callback(call: CallbackQuery):
+    """The "3/7" page-indicator button in the middle of the nav row — not clickable."""
+    await call.answer()
+
+
 def renewal_admin_kb(username: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -780,19 +829,27 @@ def recipient_button_label(u: dict, selected: set) -> str:
     return f"{mark} {username} ({expires_at or '∞'})"
 
 
-def build_recipient_kb(users: list, selected: set) -> InlineKeyboardMarkup:
+def build_recipient_kb(users: list, selected: set, page: int) -> tuple:
+    page_users, total_pages, page = paginate(users, page)
+
     rows = [
         [InlineKeyboardButton(
             text=recipient_button_label(u, selected),
             callback_data=f"selrecipient:{u['username']}"
         )]
-        for u in users if u.get("username")
+        for u in page_users if u.get("username")
     ]
+    rows += pagination_nav_row(page, total_pages, "selrecipientpage")
     rows.append([
         InlineKeyboardButton(text=f"✅ Готово ({len(selected)})", callback_data="selrecipients:done"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="selrecipients:cancel"),
     ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(inline_keyboard=rows), total_pages, page
+
+
+def recipient_picker_label(total: int, page: int, total_pages: int) -> str:
+    suffix = f", стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
+    return f"Выберите получателей ({total} всего{suffix}), тап переключает ☑️/⬜, затем «Готово»:"
 
 
 @dp.message(F.text == "📢 Рассылка")
@@ -845,12 +902,30 @@ async def broadcast_mode_select(call: CallbackQuery, state: FSMContext):
         return
 
     await state.set_state(AdminMessage.select_recipients)
-    await state.update_data(selected=[])
+    await state.update_data(selected=[], page=0)
 
-    await call.message.answer(
-        "Выберите получателей (тап переключает ☑️/⬜), затем «Готово»:",
-        reply_markup=build_recipient_kb(users, set())
-    )
+    kb, total_pages, page = build_recipient_kb(users, set(), 0)
+    await call.message.answer(recipient_picker_label(len(users), page, total_pages), reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("selrecipientpage:"), AdminMessage.select_recipients)
+async def recipient_picker_page(call: CallbackQuery, state: FSMContext):
+    if not await admin_only(call):
+        return
+
+    page = int(call.data.split(":", 1)[1])
+    await state.update_data(page=page)
+
+    data = await state.get_data()
+    selected = set(data.get("selected", []))
+    users = prepare_users_for_display([u for u in (list_users() or []) if u.get("telegram_id") and u.get("username")])
+
+    kb, total_pages, page = build_recipient_kb(users, selected, page)
+    try:
+        await call.message.edit_text(recipient_picker_label(len(users), page, total_pages), reply_markup=kb)
+    except Exception:
+        pass
     await call.answer()
 
 
@@ -863,6 +938,7 @@ async def toggle_recipient(call: CallbackQuery, state: FSMContext):
 
     data = await state.get_data()
     selected = set(data.get("selected", []))
+    page = data.get("page", 0)
 
     if username in selected:
         selected.discard(username)
@@ -874,7 +950,8 @@ async def toggle_recipient(call: CallbackQuery, state: FSMContext):
     users = prepare_users_for_display([u for u in (list_users() or []) if u.get("telegram_id") and u.get("username")])
 
     try:
-        await call.message.edit_reply_markup(reply_markup=build_recipient_kb(users, selected))
+        kb, total_pages, page = build_recipient_kb(users, selected, page)
+        await call.message.edit_reply_markup(reply_markup=kb)
     except Exception:
         pass  # "message is not modified" if tapped same state twice quickly — harmless
 
@@ -1446,11 +1523,42 @@ async def db_trial_remove_list(call: CallbackQuery):
         await call.answer()
         return
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    await render_trial_remove_list(call, ids, 0, edit=False)
+    await call.answer()
+
+
+async def render_trial_remove_list(call: CallbackQuery, ids: list, page: int, edit: bool):
+    page_ids, total_pages, page = paginate(ids, page)
+
+    rows = [
         [InlineKeyboardButton(text=trial_used_label(tg_id), callback_data=f"trialdel:{tg_id}")]
-        for tg_id in ids
-    ])
-    await call.message.answer("Выберите, кому разрешить новый триал:", reply_markup=kb)
+        for tg_id in page_ids
+    ]
+    rows += pagination_nav_row(page, total_pages, "trialdelpage")
+
+    suffix = f", стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
+    label = f"Выберите, кому разрешить новый триал ({len(ids)} всего{suffix}):"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if edit:
+        try:
+            await call.message.edit_text(label, reply_markup=kb)
+        except Exception:
+            pass
+    else:
+        await call.message.answer(label, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("trialdelpage:"))
+async def db_trial_remove_page(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    page = int(call.data.split(":", 1)[1])
+    ids = sorted(_load_trial_used_ids())
+
+    await render_trial_remove_list(call, ids, page, edit=True)
     await call.answer()
 
 
@@ -1483,20 +1591,47 @@ async def db_trial_add_list(call: CallbackQuery):
         await call.answer()
         return
 
+    await render_trial_add_list(call, prepare_users_for_display(users), 0, edit=False)
+    await call.answer()
+
+
+async def render_trial_add_list(call: CallbackQuery, users: list, page: int, edit: bool):
+    page_users, total_pages, page = paginate(users, page)
     used_ids = _load_trial_used_ids()
+
     rows = []
-    for u in prepare_users_for_display(users):
+    for u in page_users:
         tg_id = u["telegram_id"]
         mark = "✅ " if tg_id in used_ids else ""
         rows.append([InlineKeyboardButton(
             text=f"{mark}{u.get('username')} (id {tg_id})",
             callback_data=f"trialadd:{tg_id}"
         )])
+    rows += pagination_nav_row(page, total_pages, "trialaddpage")
 
-    await call.message.answer(
-        "Выберите, кого пометить как уже использовавшего триал:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-    )
+    suffix = f", стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
+    label = f"Выберите, кого пометить как уже использовавшего триал ({len(users)} всего{suffix}):"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if edit:
+        try:
+            await call.message.edit_text(label, reply_markup=kb)
+        except Exception:
+            pass
+    else:
+        await call.message.answer(label, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("trialaddpage:"))
+async def db_trial_add_page(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    page = int(call.data.split(":", 1)[1])
+    users = [u for u in (list_users() or []) if u.get("telegram_id")]
+
+    await render_trial_add_list(call, prepare_users_for_display(users), page, edit=True)
     await call.answer()
 
 
@@ -2041,6 +2176,22 @@ async def multi_add_get_cards(call: CallbackQuery, state: FSMContext):
 
 # ---------------- LIST USERS ----------------
 
+def build_list_users_kb(users: list, page: int) -> tuple:
+    """Returns (keyboard, total_pages, page)."""
+    page_users, total_pages, page = paginate(users, page)
+
+    rows = [
+        [InlineKeyboardButton(
+            text=user_button_label(u),
+            callback_data=f"user:{u.get('username')}"
+        )]
+        for u in page_users if u.get("username")
+    ]
+    rows += pagination_nav_row(page, total_pages, "listpage")
+
+    return InlineKeyboardMarkup(inline_keyboard=rows), total_pages, page
+
+
 @dp.message(F.text == "📋 List users")
 async def menu_list(msg: Message):
     if not await admin_only(msg):
@@ -2052,15 +2203,28 @@ async def menu_list(msg: Message):
         await msg.answer("No users")
         return
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=user_button_label(u),
-            callback_data=f"user:{u.get('username')}"
-        )]
-        for u in users if u.get("username")
-    ])
+    kb, total_pages, page = build_list_users_kb(users, 0)
+    label = f"Select user ({len(users)} всего" + (f", стр. {page + 1}/{total_pages}" if total_pages > 1 else "") + "):"
 
-    await msg.answer("Select user:", reply_markup=kb)
+    await msg.answer(label, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("listpage:"))
+async def menu_list_page(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    page = int(call.data.split(":", 1)[1])
+    users = prepare_users_for_display(list_users() or [])
+
+    kb, total_pages, page = build_list_users_kb(users, page)
+    label = f"Select user ({len(users)} всего" + (f", стр. {page + 1}/{total_pages}" if total_pages > 1 else "") + "):"
+
+    try:
+        await call.message.edit_text(label, reply_markup=kb)
+    except Exception:
+        pass  # "message is not modified" if the same page is tapped twice
+    await call.answer()
 
 
 # ---------------- USER ACTIONS MENU ----------------
@@ -2329,19 +2493,27 @@ async def manual_date(msg: Message, state: FSMContext):
 
 # ---------------- MASS DELETE (checkbox picker, same UX as selective broadcast) ----------------
 
-def build_delete_kb(users: list, selected: set) -> InlineKeyboardMarkup:
+def build_delete_kb(users: list, selected: set, page: int) -> tuple:
+    page_users, total_pages, page = paginate(users, page)
+
     rows = [
         [InlineKeyboardButton(
             text=("☑️ " if u.get("username") in selected else "⬜ ") + user_button_label(u),
             callback_data=f"deltoggle:{u['username']}"
         )]
-        for u in users if u.get("username")
+        for u in page_users if u.get("username")
     ]
+    rows += pagination_nav_row(page, total_pages, "delpage")
     rows.append([
         InlineKeyboardButton(text=f"🗑 Готово ({len(selected)})", callback_data="delsel:done"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="delsel:cancel"),
     ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(inline_keyboard=rows), total_pages, page
+
+
+def mass_delete_label(total: int, page: int, total_pages: int) -> str:
+    suffix = f", стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
+    return f"Выберите пользователей для удаления ({total} всего{suffix}), тап переключает ☑️/⬜:"
 
 
 @dp.message(F.text == "🗑 Удаление пользователей")
@@ -2355,12 +2527,30 @@ async def mass_delete_start(msg: Message, state: FSMContext):
         return
 
     await state.set_state(MassDelete.select)
-    await state.update_data(selected=[])
+    await state.update_data(selected=[], page=0)
 
-    await msg.answer(
-        "Выберите пользователей для удаления (тап переключает ☑️/⬜):",
-        reply_markup=build_delete_kb(users, set())
-    )
+    kb, total_pages, page = build_delete_kb(users, set(), 0)
+    await msg.answer(mass_delete_label(len(users), page, total_pages), reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("delpage:"), MassDelete.select)
+async def mass_delete_page(call: CallbackQuery, state: FSMContext):
+    if not await admin_only(call):
+        return
+
+    page = int(call.data.split(":", 1)[1])
+    await state.update_data(page=page)
+
+    data = await state.get_data()
+    selected = set(data.get("selected", []))
+    users = prepare_users_for_display([u for u in (list_users() or []) if u.get("username")])
+
+    kb, total_pages, page = build_delete_kb(users, selected, page)
+    try:
+        await call.message.edit_text(mass_delete_label(len(users), page, total_pages), reply_markup=kb)
+    except Exception:
+        pass
+    await call.answer()
 
 
 @dp.callback_query(F.data.startswith("deltoggle:"), MassDelete.select)
@@ -2373,6 +2563,7 @@ async def toggle_delete_selection(call: CallbackQuery, state: FSMContext):
 
         data = await state.get_data()
         selected = set(data.get("selected", []))
+        page = data.get("page", 0)
 
         if username in selected:
             selected.discard(username)
@@ -2384,7 +2575,8 @@ async def toggle_delete_selection(call: CallbackQuery, state: FSMContext):
         users = prepare_users_for_display([u for u in (list_users() or []) if u.get("username")])
 
         try:
-            await call.message.edit_reply_markup(reply_markup=build_delete_kb(users, selected))
+            kb, total_pages, page = build_delete_kb(users, selected, page)
+            await call.message.edit_reply_markup(reply_markup=kb)
         except Exception as e:
             log.debug("edit_reply_markup failed (likely unchanged markup): %s", e)
 
@@ -2481,6 +2673,21 @@ async def mass_delete_execute(call: CallbackQuery, state: FSMContext):
 
 # ---------------- GET LINK ----------------
 
+def build_get_link_kb(users: list, page: int) -> tuple:
+    page_users, total_pages, page = paginate(users, page)
+
+    rows = [
+        [InlineKeyboardButton(
+            text=user_button_label(u),
+            callback_data=f"link:{u.get('username')}"
+        )]
+        for u in page_users if u.get("username")
+    ]
+    rows += pagination_nav_row(page, total_pages, "linkpage")
+
+    return InlineKeyboardMarkup(inline_keyboard=rows), total_pages, page
+
+
 @dp.message(F.text == "🔗 Get link")
 async def menu_link(msg: Message):
     if not await admin_only(msg):
@@ -2488,15 +2695,32 @@ async def menu_link(msg: Message):
 
     users = prepare_users_for_display(list_users() or [])
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=user_button_label(u),
-            callback_data=f"link:{u.get('username')}"
-        )]
-        for u in users if u.get("username")
-    ])
+    if not users:
+        await msg.answer("No users")
+        return
 
-    await msg.answer("Select user:", reply_markup=kb)
+    kb, total_pages, page = build_get_link_kb(users, 0)
+    label = f"Select user ({len(users)} всего" + (f", стр. {page + 1}/{total_pages}" if total_pages > 1 else "") + "):"
+
+    await msg.answer(label, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("linkpage:"))
+async def menu_link_page(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    page = int(call.data.split(":", 1)[1])
+    users = prepare_users_for_display(list_users() or [])
+
+    kb, total_pages, page = build_get_link_kb(users, page)
+    label = f"Select user ({len(users)} всего" + (f", стр. {page + 1}/{total_pages}" if total_pages > 1 else "") + "):"
+
+    try:
+        await call.message.edit_text(label, reply_markup=kb)
+    except Exception:
+        pass
+    await call.answer()
 
 
 @dp.callback_query(F.data.startswith("link:"))
