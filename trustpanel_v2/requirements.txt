@@ -1,0 +1,5 @@
+aiogram==3.4.1
+python-dotenv==1.0.1
+toml==0.10.2
+filelock==3.13.1
+requests==2.31.0
