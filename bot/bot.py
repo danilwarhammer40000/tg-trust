@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 import re
@@ -54,6 +55,9 @@ from core.instructions import (
     render_android_instructions,
     render_ios_instructions,
     MANUAL_CONNECT_STEPS,
+    ROUTING_INTRO,
+    ANDROID_BYPASS_DOMAINS,
+    IOS_BYPASS_DOMAINS,
 )
 from services import cleanup as cleanup_service
 
@@ -194,6 +198,7 @@ class ReceiptConfirm(StatesGroup):
 
 class Feedback(StatesGroup):
     waiting = State()
+    media_confirm = State()
 
 
 class MassDelete(StatesGroup):
@@ -265,6 +270,7 @@ client_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="ℹ️ Мой статус")],
         [KeyboardButton(text="🔗 Моя ссылка")],
+        [KeyboardButton(text="📖 Инструкция")],
         [KeyboardButton(text="💳 Реквизиты для оплаты")],
         [KeyboardButton(text="✉️ Написать администратору")],
     ],
@@ -359,6 +365,56 @@ async def howto_android(call: CallbackQuery):
     link = extract_qr_link(generate_link(user["username"], DOMAIN)) if user and user.get("username") else None
 
     await call.message.answer(render_android_instructions(link))
+    await call.answer()
+
+
+# ---------------- CLIENT: INSTRUCTIONS MENU ----------------
+
+def instructions_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📲 Подключение", callback_data="instr:connect")],
+        [InlineKeyboardButton(text="🇷🇺 РФ-сайты и ВПН", callback_data="instr:routing")],
+    ])
+
+
+@dp.message(F.text == "📖 Инструкция")
+async def client_instructions_menu(msg: Message):
+    if is_admin(msg.from_user.id):
+        return
+    await msg.answer("Что показать?", reply_markup=instructions_menu_kb())
+
+
+@dp.callback_query(F.data == "instr:connect")
+async def instructions_connect(call: CallbackQuery):
+    await call.message.answer("Выберите вашу платформу:", reply_markup=platform_choice_kb())
+    await call.answer()
+
+
+def routing_platform_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Список для Android", callback_data="route:android")],
+        [InlineKeyboardButton(text="📋 Список для iOS", callback_data="route:ios")],
+    ])
+
+
+@dp.callback_query(F.data == "instr:routing")
+async def instructions_routing(call: CallbackQuery):
+    await call.message.answer(ROUTING_INTRO, reply_markup=routing_platform_kb())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "route:android")
+async def routing_list_android(call: CallbackQuery):
+    # Wrapped in <pre> so Telegram renders it as a monospace block with a
+    # tap-to-copy affordance — much easier to grab the whole list on mobile
+    # than plain text.
+    await call.message.answer(f"<pre>{html.escape(ANDROID_BYPASS_DOMAINS)}</pre>", parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "route:ios")
+async def routing_list_ios(call: CallbackQuery):
+    await call.message.answer(f"<pre>{html.escape(IOS_BYPASS_DOMAINS)}</pre>", parse_mode="HTML")
     await call.answer()
 
 
@@ -713,6 +769,113 @@ async def client_feedback_start(msg: Message, state: FSMContext):
     await msg.answer("Напишите сообщение администратору одним сообщением:", reply_markup=cancel_kb)
 
 
+@dp.message(Feedback.waiting, F.photo | F.document)
+async def client_feedback_media(msg: Message, state: FSMContext):
+    """
+    CHANGED: previously ANY message here (including a photo/document) fell
+    through to client_feedback_send() below, which only ever read msg.text —
+    an attached photo/file was silently dropped and the admin got just the
+    placeholder "[сообщение без текста — фото/файл]" with no way to see
+    what was actually sent. Now: if it's a photo or document, ask whether
+    it's a payment receipt (same question the general catch-all asks) before
+    deciding where it goes.
+    """
+    user = get_user_by_telegram_id(msg.from_user.id)
+    if not user:
+        await state.clear()
+        await msg.answer("Не удалось определить ваш аккаунт.", reply_markup=client_menu)
+        return
+
+    is_photo = bool(msg.photo)
+    file_id = msg.photo[-1].file_id if is_photo else msg.document.file_id
+
+    await state.update_data(
+        media_file_id=file_id,
+        media_is_photo=is_photo,
+        media_caption=msg.caption or msg.text,
+        media_username=user["username"],
+    )
+    await state.set_state(Feedback.media_confirm)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Это чек на оплату", callback_data="fbmedia:receipt")],
+        [InlineKeyboardButton(text="✉️ Обычное сообщение", callback_data="fbmedia:message")],
+    ])
+    await msg.answer("📎 Это чек об оплате для проверки, или просто файл к сообщению?", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "fbmedia:receipt", Feedback.media_confirm)
+async def feedback_media_as_receipt(call: CallbackQuery, state: FSMContext):
+    """Same handling as the general receipt flow (receipt:yes) — routes into
+    the renewal approval queue with the ➕1мес/➕2мес/✍️/❌ admin buttons."""
+    data = await state.get_data()
+    file_id = data.get("media_file_id")
+    username = data.get("media_username")
+    is_photo = data.get("media_is_photo", True)
+    await state.clear()
+
+    update_user(username, pending_request={
+        "type": "renewal",
+        "receipt_file_id": file_id,
+        "receipt_is_photo": is_photo,
+        "requested_at": utcnow_naive().isoformat()
+    })
+
+    user = get_user(username) or {}
+    current_expiry = user.get("expires_at")
+    expiry_line = current_expiry or "∞ (безлимит)"
+    if current_expiry and is_expired(current_expiry):
+        expiry_line += " (уже истёк)"
+
+    caption = f"📥 Заявка на продление от {username}\n⏳ Текущая дата истечения: {expiry_line}"
+    kb = renewal_admin_kb(username)
+
+    if is_photo:
+        await bot.send_photo(ADMIN_ID, photo=file_id, caption=caption, reply_markup=kb)
+    else:
+        await bot.send_document(ADMIN_ID, document=file_id, caption=caption, reply_markup=kb)
+
+    await call.message.answer("✅ Отправлено администратору на проверку чека.", reply_markup=client_menu)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "fbmedia:message", Feedback.media_confirm)
+async def feedback_media_as_message(call: CallbackQuery, state: FSMContext):
+    """Forwards the actual photo/document to the admin (with the ↩️ Ответить
+    button), instead of the old silent placeholder-text-only behaviour."""
+    data = await state.get_data()
+    file_id = data.get("media_file_id")
+    username = data.get("media_username")
+    is_photo = data.get("media_is_photo", True)
+    caption_text = data.get("media_caption")
+    await state.clear()
+
+    tg_id = call.from_user.id
+    caption = f"✉️ Обращение от {username} (tg id: {tg_id}):"
+    if caption_text:
+        caption += f"\n\n{caption_text}"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Ответить", callback_data=f"reply:{username}")]
+    ])
+
+    if is_photo:
+        await bot.send_photo(ADMIN_ID, photo=file_id, caption=caption, reply_markup=kb)
+    else:
+        await bot.send_document(ADMIN_ID, document=file_id, caption=caption, reply_markup=kb)
+
+    await call.message.answer("✅ Отправлено администратору.", reply_markup=client_menu)
+    await call.answer()
+
+
+@dp.message(Feedback.media_confirm)
+async def feedback_media_confirm_fallback(msg: Message):
+    await msg.answer(
+        "У вас есть файл, ожидающий подтверждения ⬆️\n"
+        "Сначала нажмите «💳 Это чек на оплату» или «✉️ Обычное сообщение» на предыдущем сообщении."
+    )
+
+
 @dp.message(Feedback.waiting)
 async def client_feedback_send(msg: Message, state: FSMContext):
     user = get_user_by_telegram_id(msg.from_user.id)
@@ -722,7 +885,7 @@ async def client_feedback_send(msg: Message, state: FSMContext):
         await msg.answer("Не удалось определить ваш аккаунт.", reply_markup=client_menu)
         return
 
-    text = msg.text or "[сообщение без текста — фото/файл]"
+    text = msg.text or "[сообщение без текста]"
     username = user.get("username")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[

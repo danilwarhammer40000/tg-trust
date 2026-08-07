@@ -81,3 +81,174 @@ MANUAL_CONNECT_STEPS = (
     "4. Затем нажмите на круглую кнопку переключатель рядом с сервером "
     "(синий — включено)."
 )
+
+
+# ---------------- ROUTING / BYPASS (RU sites while VPN is on) ----------------
+#
+# "Bypass" in the app = "не пускать через VPN, а пустить напрямую". Adding
+# these domains there is what makes Russian banks/services/marketplaces work
+# correctly even while the tunnel is on (otherwise many of them geo-block or
+# behave oddly seeing a non-RU IP).
+
+ROUTING_INTRO = (
+    "🇷🇺 Чтобы российские сайты и приложения (Госуслуги, банки, VK, Ozon, "
+    "Wildberries и т.д.) продолжали нормально работать, даже когда TrustTunnel "
+    "включён, нужно один раз добавить их в список Bypass — это значит "
+    "«трафик к этим адресам идёт напрямую, минуя VPN».\n\n"
+    "1. Откройте приложение TrustTunnel → внизу вкладка \"Routing\"\n"
+    "2. Нажмите \"Default profile\"\n"
+    "3. Переключитесь на вкладку \"Bypass\" (сверху слева)\n"
+    "4. Скопируйте список ниже (кнопка под этим сообщением) и вставьте его "
+    "целиком в поле\n"
+    "5. Нажмите \"Save\"\n\n"
+    "Выберите список под вашу платформу:"
+)
+
+ANDROID_BYPASS_DOMAINS = """vk.com
+*.vk.com
+vk.ru
+*.vk.ru
+vkontakte.ru
+*.vkontakte.ru
+vk.me
+*.vk.me
+id.vk.com
+login.vk.com
+oauth.vk.com
+vkvideo.ru
+*.vkvideo.ru
+vkuservideo.net
+*.vkuservideo.net
+*.vkuservideo.com
+*.vk-cdn.net
+*.vkcache.com
+api.vk.com
+*.api.vk.com
+*.userapi.com
+*.vkuseraudio.net
+*.vkuseraudio.com
+max.ru
+*.max.ru
+msg.max.ru
+api.max.ru
+auth.max.ru
+*.gosuslugi.ru
+*.esia.gosuslugi.ru
+*.digital.gov.ru
+*.cdn.max.ru
+*.static.max.ru
+*.media.max.ru
+*.ws.max.ru
+*.ru
+ru.max.messenger
+ru.yandex.mail
+*.yandex.ru
+*.yandex.net
+*.yandex.com
+com.wildberries.ru
+*.wildberries.ru
+*.wb.ru
+*.wbstatic.net
+*.wbbasket.ru
+*.content.wb.ru
+ru.rostel
+ru.dublgis.dgismobile
+com.avito.android
+com.yandex.aliceapp
+ru.alfabank.mobile.android
+com.gnivts.selfemployed
+ru.rzd.pass
+ru.sberbankmobile
+com.idamob.tinkoff.android
+ru.yandex.music
+ru.oneme.app
+ru.ozon.app.android
+ru.ozon.fintech.finance
+ru.vk.store
+ru.rutube.app
+com.vkontakte.android"""
+
+IOS_BYPASS_DOMAINS = """vk.com
+vk.ru
+vkontakte.ru
+vk.me
+id.vk.com
+login.vk.com
+oauth.vk.com
+api.vk.com
+vkvideo.ru
+vkuservideo.net
+vkuservideo.com
+vk-cdn.net
+vkcache.com
+userapi.com
+vkuseraudio.net
+vkuseraudio.com
+vk-portal.net
+vkuser.net
+mail.ru
+vkid.ru
+
+max.ru
+msg.max.ru
+api.max.ru
+auth.max.ru
+cdn.max.ru
+static.max.ru
+media.max.ru
+ws.max.ru
+
+gosuslugi.ru
+esia.gosuslugi.ru
+digital.gov.ru
+pos.gosuslugi.ru
+
+yandex.ru
+yandex.net
+yandex.com
+ya.ru
+ru.yandex.mail
+yastatic.net
+yandexstatic.net
+
+wildberries.ru
+wb.ru
+wbstatic.net
+wbbasket.ru
+content.wb.ru
+cdn.wildberries.ru
+api.wildberries.ru
+seller.wildberries.ru
+security.wildberries.ru
+chat.wildberries.ru
+video.wildberries.ru
+finance.wildberries.ru
+static.wildberries.ru
+images.wildberries.ru
+wbpay.ru
+wbank.ru
+wildberries-bank.ru
+
+ozon.ru
+ozon.com
+finance.ozon.ru
+seller.ozon.ru
+api.ozon.ru
+cdn.ozon.ru
+ir.ozon.ru
+i.ozon.ru
+s.ozon.ru
+pay.ozon.ru
+checkout.ozon.ru
+o3t.ru
+o3.ru
+ozon-dostavka.ru
+
+rutube.ru
+rutube.app
+
+google.com
+googleapis.com
+gstatic.com
+android.clients.google.com
+play.googleapis.com"""
