@@ -9,7 +9,7 @@ from core.dates import parse_expiry, utcnow_naive
 from core.db import list_users, update_user
 from core.service import full_resync_and_reload, mark_user_inactive
 from core.notify import notify_user, notify_admin
-from core.payment import PAYMENT_INFO
+from core.payment import PAYMENT_INFO, ACCESS_EXPIRED_MESSAGE
 
 setup_logging()
 log = logging.getLogger(__name__)
@@ -118,12 +118,7 @@ def run() -> bool:
             mark_user_inactive(username)
             update_user(username, status="inactive", notified_days=[])
 
-            notify_user(
-                u,
-                "❌ Ваш доступ истёк и был отключён.\n"
-                "Пришлите чек об оплате в этот чат, чтобы продлить доступ.\n\n"
-                f"{PAYMENT_INFO}",
-            )
+            notify_user(u, ACCESS_EXPIRED_MESSAGE)
             notify_admin(f"⚠️ Пользователь {username} отключён (истёк срок).")
 
             changed = True

@@ -50,7 +50,7 @@ from core.db import (
     DB_PATH,
 )
 from core.paths import TRIAL_USED_PATH, SETTINGS_PATH, BACKUP_FILES
-from core.payment import PAYMENT_INFO
+from core.payment import PAYMENT_INFO, ACCESS_EXPIRED_MESSAGE
 from core.instructions import (
     render_android_instructions,
     render_ios_instructions,
@@ -706,6 +706,16 @@ async def client_my_link(msg: Message):
     user = get_user_by_telegram_id(msg.from_user.id)
     if not user:
         await msg.answer("Вы ещё не привязаны. Пришлите вашу карточку подключения (Username/Password).")
+        return
+
+    # CHANGED: previously this always sent the connection card/link, even for
+    # an expired account — the client would just get a link that no longer
+    # actually connects to anything, with no explanation why. Now it shows
+    # the same "expired" message cleanup.py sends when it disables someone
+    # (covers both: already marked inactive by cleanup, and expired-but-not-
+    # yet-disabled in the window before the next sync runs).
+    if user.get("status") != "active" or is_expired(user.get("expires_at")):
+        await msg.answer(ACCESS_EXPIRED_MESSAGE)
         return
 
     username = user.get("username")
