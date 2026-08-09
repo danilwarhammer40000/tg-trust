@@ -1,0 +1,57 @@
+from aiogram import Router, F
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+from bot.access import admin_only
+from bot.display import is_grouping_enabled, is_hide_unlimited_enabled, toggle_grouping, toggle_hide_unlimited
+
+router = Router()
+
+
+def sorting_menu_kb() -> InlineKeyboardMarkup:
+    grouping_on = is_grouping_enabled()
+    hide_on = is_hide_unlimited_enabled()
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"{'✅' if grouping_on else '⬜'} Группировка по подписке (сверху подписанные)",
+            callback_data="sort:toggle_group"
+        )],
+        [InlineKeyboardButton(
+            text=f"{'✅' if hide_on else '⬜'} Скрывать безлимитных",
+            callback_data="sort:toggle_hide"
+        )],
+    ])
+
+
+@router.message(F.text == "⚙️ Сортировка БД")
+async def sorting_menu(msg: Message):
+    if not await admin_only(msg):
+        return
+
+    await msg.answer("⚙️ Настройки отображения списков (тап переключает):", reply_markup=sorting_menu_kb())
+
+
+@router.callback_query(F.data == "sort:toggle_group")
+async def sorting_toggle_group(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    toggle_grouping()
+    try:
+        await call.message.edit_reply_markup(reply_markup=sorting_menu_kb())
+    except Exception:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data == "sort:toggle_hide")
+async def sorting_toggle_hide(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    toggle_hide_unlimited()
+    try:
+        await call.message.edit_reply_markup(reply_markup=sorting_menu_kb())
+    except Exception:
+        pass
+    await call.answer()

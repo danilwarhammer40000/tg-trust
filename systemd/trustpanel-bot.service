@@ -1,0 +1,37 @@
+[Unit]
+Description=TrustPanel Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trustpanel
+EnvironmentFile=/opt/trustpanel/.env
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/trustpanel/venv/bin/python -m bot.bot
+
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+# Bot runs as root because it calls `systemctl restart trusttunnel.service`
+# and writes to /opt/trusttunnel (owned by root in a standard install). If
+# your trusttunnel install grants a dedicated service user permission to
+# restart the unit (see `systemctl edit --full` + PolicyKit, or a sudoers
+# rule scoped to that one command) and write access to its directory, drop
+# root and run as that user instead — the sandboxing below only helps if
+# the process isn't root to begin with.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+StandardOutput=journal
+StandardError=journal
+
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

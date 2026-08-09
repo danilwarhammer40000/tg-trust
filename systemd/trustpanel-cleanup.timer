@@ -1,0 +1,10 @@
+[Unit]
+Description=Run TrustPanel cleanup daily at 08:00 MSK
+
+[Timer]
+OnCalendar=*-*-* 05:00:00
+Persistent=true
+Unit=trustpanel-cleanup.service
+
+[Install]
+WantedBy=timers.target
