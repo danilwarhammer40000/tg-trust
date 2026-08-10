@@ -52,6 +52,10 @@ class MassDelete(StatesGroup):
     confirm = State()
 
 
+class LeaderLink(StatesGroup):
+    select = State()
+
+
 class RenewalApproval(StatesGroup):
     manual_date = State()
 

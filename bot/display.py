@@ -59,6 +59,9 @@ def user_button_label(u: dict) -> str:
     if u.get("telegram_id"):
         label = f"🔔 {label}"
 
+    if u.get("linked_to"):
+        label = f"🔗 {label}"
+
     return f"🔸 {label}" if is_expired(expires_at) else label
 
 

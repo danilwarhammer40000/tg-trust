@@ -32,12 +32,14 @@ bot/
     sync_deploy.py                — 🔄 Sync users / 🚀 Деплой
     add_user.py                    — ➕ Add user (один / несколько)
     list_users.py                   — 📋 List users + меню действий над пользователем
+    leader_link.py                   — «👑 Назначить ведущим» (связка мульти-девайс клиентов)
     extend.py                        — раздел "⏳ Extend" из меню действий
     mass_delete.py                    — 🗑 Удаление пользователей
     get_link.py                        — 🔗 Get link
 core/
   dates.py             — единая точка правды для парсинга/сравнения дат
-  db.py                — JSON-хранилище пользователей (users.json), с file-lock
+  db.py                — JSON-хранилище пользователей (users.json), с file-lock;
+                          + синхронизация даты/статуса для связанных ведущий/ведомый
   credentials.py       — генерация credentials.toml для самого туннеля
   generator.py         — генерация ссылки подключения
   service.py           — пересборка credentials + перезапуск trusttunnel.service

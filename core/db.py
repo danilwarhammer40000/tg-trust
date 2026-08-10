@@ -100,6 +100,15 @@ def delete_user(username: str) -> None:
     with _lock:
         data = load()
         data = [u for u in data if u.get("username") != username]
+
+        # If the deleted user was a leader, its followers would otherwise be
+        # left with a dangling linked_to pointing at nobody. Unlink them so
+        # they become independent (keeping whatever expires_at/status they
+        # last had synced) instead of silently orphaned.
+        for u in data:
+            if u.get("linked_to") == username:
+                u["linked_to"] = None
+
         save(data)
 
 
@@ -110,24 +119,105 @@ def get_user(username: str) -> Optional[Dict]:
     return None
 
 
-def update_user(username: str, **kwargs) -> bool:
-    """Returns True if a matching user was found and updated."""
+# ================= LEADER / FOLLOWER LINKING =================
+#
+# A "follower" record has linked_to set to its leader's username. Its
+# expires_at/status are meant to always mirror the leader's — see
+# update_user() below, which is the single place that enforces this:
+# any change to expires_at/status is redirected to the leader (if the
+# target is a follower) and then fanned out to every follower of whoever
+# actually got updated. notified_days and telegram_id are deliberately
+# NOT synced — each linked account can still have its own Telegram and
+# its own notification history, only the actual access (expiry + active/
+# inactive) is shared.
+
+_SYNCED_FIELDS = ("expires_at", "status")
+
+
+def get_followers(username: str) -> List[Dict]:
+    return [u for u in load() if u.get("linked_to") == username]
+
+
+def link_user(follower_username: str, leader_username: str) -> bool:
+    """
+    Makes follower_username a follower of leader_username, immediately
+    copying the leader's current expires_at/status onto it. Returns False
+    if either username doesn't exist or they're the same user.
+    """
+    if follower_username == leader_username:
+        return False
+
     with _lock:
         data = load()
-        found = False
+        leader = next((u for u in data if u.get("username") == leader_username), None)
+        follower = next((u for u in data if u.get("username") == follower_username), None)
 
-        for u in data:
-            if u.get("username") == username:
-                u.update(kwargs)
-                found = True
-                break
+        if leader is None or follower is None:
+            return False
 
-        if found:
-            save(data)
-        else:
+        follower["linked_to"] = leader_username
+        for field in _SYNCED_FIELDS:
+            follower[field] = leader.get(field)
+
+        save(data)
+        return True
+
+
+def unlink_user(username: str) -> bool:
+    """Detaches a follower — it keeps its last-synced expires_at/status but
+    stops mirroring the (former) leader going forward."""
+    with _lock:
+        data = load()
+        target = next((u for u in data if u.get("username") == username), None)
+
+        if target is None or not target.get("linked_to"):
+            return False
+
+        target["linked_to"] = None
+        save(data)
+        return True
+
+
+def update_user(username: str, **kwargs) -> bool:
+    """
+    Returns True if a matching user was found and updated.
+
+    If kwargs touches expires_at and/or status, and `username` is itself a
+    follower (has linked_to set), the change is redirected onto the leader
+    instead — a follower's real access is never independently editable.
+    Whichever record actually ends up updated (leader or a plain
+    independent user), the same fields then get copied onto every one of
+    ITS followers, so the whole group stays in sync in one atomic write.
+    """
+    touches_sync_fields = any(f in kwargs for f in _SYNCED_FIELDS)
+
+    with _lock:
+        data = load()
+        target = next((u for u in data if u.get("username") == username), None)
+
+        if target is None:
             log.warning("update_user: no such user %r (kwargs=%r)", username, kwargs)
+            return False
 
-        return found
+        effective = target
+        if touches_sync_fields and target.get("linked_to"):
+            leader = next((u for u in data if u.get("username") == target["linked_to"]), None)
+            if leader is not None:
+                effective = leader
+            # else: dangling link (leader was deleted but this record wasn't
+            # cleaned up somehow) -- fall back to updating the record itself.
+
+        effective.update(kwargs)
+
+        if touches_sync_fields:
+            for u in data:
+                if u is not effective and u.get("linked_to") == effective.get("username"):
+                    for field in _SYNCED_FIELDS:
+                        if field in kwargs:
+                            u[field] = effective.get(field)
+
+        save(data)
+        return True
 
 
 # ================= TELEGRAM LOOKUP =================

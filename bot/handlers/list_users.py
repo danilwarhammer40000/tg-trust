@@ -1,9 +1,12 @@
 """
 Owns: SetTelegramId.waiting.
 
-action_extend transitions into ExtendUser.mode (owned by handlers/extend.py)
-and action_call transitions into AdminMessage.personal (owned by
-handlers/feedback.py) — see bot/states.py's docstring on why that's fine.
+action_extend transitions into ExtendUser.mode (owned by handlers/extend.py),
+action_call transitions into AdminMessage.personal (owned by
+handlers/feedback.py), and action_leader_start transitions into
+LeaderLink.select (owned by handlers/leader_link.py) — see bot/states.py's
+docstring on why that's fine. action_unlink is a one-shot action with no
+state of its own.
 """
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -17,7 +20,7 @@ from bot.keyboards import cancel_kb, main_menu
 from bot.pagination import paginate, pagination_nav_row
 from bot.states import AdminMessage, ExtendUser, SetTelegramId
 from core.dates import is_expired
-from core.db import delete_user, get_user, list_users, update_user
+from core.db import delete_user, get_followers, get_user, list_users, unlink_user, update_user
 from core.generator import generate_link
 
 router = Router()
@@ -89,7 +92,18 @@ async def user_actions_menu(call: CallbackQuery):
     tg_id = user.get("telegram_id")
     sub_status = f"🔔 Подписан (id {tg_id})" if tg_id else "🔕 Не подписан на уведомления"
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    link_lines = []
+    linked_to = user.get("linked_to")
+    if linked_to:
+        link_lines.append(f"🔗 Ведомый у: {linked_to}")
+    else:
+        followers = get_followers(username)
+        if followers:
+            names = ", ".join(f.get("username", "?") for f in followers)
+            link_lines.append(f"👑 Ведущий для: {names}")
+    link_status = ("\n" + "\n".join(link_lines)) if link_lines else ""
+
+    rows = [
         [InlineKeyboardButton(text="🔗 Get link", callback_data=f"act_link:{username}")],
         [InlineKeyboardButton(text="⏳ Extend", callback_data=f"act_extend:{username}")],
         [InlineKeyboardButton(text="❌ Delete", callback_data=f"act_del:{username}")],
@@ -98,9 +112,43 @@ async def user_actions_menu(call: CallbackQuery):
             text="🆔 Записать/перезаписать ID",
             callback_data=f"act_setid:{username}"
         )],
-    ])
+    ]
 
-    await call.message.answer(f"👤 {username}\n{sub_status}\n\nChoose action:", reply_markup=kb)
+    # A follower's own expiry/status is redirected to its leader anyway (see
+    # core.db.update_user), so it can't become a leader itself — offer only
+    # "unlink" for it. Anyone else (independent, or already a leader — you
+    # can always attach more followers) gets "assign as leader" instead.
+    if linked_to:
+        rows.append([InlineKeyboardButton(text="🔓 Отвязать", callback_data=f"act_unlink:{username}")])
+    else:
+        rows.append([InlineKeyboardButton(text="👑 Назначить ведущим", callback_data=f"act_leader:{username}")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    await call.message.answer(f"👤 {username}\n{sub_status}{link_status}\n\nChoose action:", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("act_unlink:"))
+async def action_unlink(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    username = call.data.split(":", 1)[1]
+    user = get_user(username)
+
+    if not user or not user.get("linked_to"):
+        await call.answer("Уже не привязан", show_alert=True)
+        return
+
+    former_leader = user["linked_to"]
+    unlink_user(username)
+
+    await call.message.answer(
+        f"🔓 {username} отвязан от {former_leader}. Дата/статус сохранены как собственные "
+        f"и больше не будут меняться автоматически вместе с {former_leader}.",
+        reply_markup=main_menu
+    )
     await call.answer()
 
 
