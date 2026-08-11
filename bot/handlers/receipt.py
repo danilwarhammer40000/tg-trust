@@ -158,7 +158,8 @@ async def approve_renewal(call: CallbackQuery, state: FSMContext):
         expires_at=new_expires,
         status="active",
         pending_request=None,
-        notified_days=[]
+        notified_days=[],
+        post_disable_notified=[],
     )
 
     # Only resync + restart trusttunnel if this user was actually missing from
@@ -206,7 +207,8 @@ async def approve_renewal_manual_date(msg: Message, state: FSMContext):
         expires_at=new_expires,
         status="active",
         pending_request=None,
-        notified_days=[]
+        notified_days=[],
+        post_disable_notified=[],
     )
 
     if was_expired_or_inactive:

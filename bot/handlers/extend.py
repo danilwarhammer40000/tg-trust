@@ -39,19 +39,19 @@ async def extend_handler(call: CallbackQuery, state: FSMContext):
     new_expires_at = user.get("expires_at")
 
     if mode == "0":
-        update_user(username, expires_at=None, status="active", notified_days=[])
+        update_user(username, expires_at=None, status="active", notified_days=[], post_disable_notified=[])
         new_expires_at = None
 
     elif mode == "3":
         new_expires_at = calc_new_expiry(user.get("expires_at"), 3)
-        update_user(username, expires_at=new_expires_at, status="active", notified_days=[])
+        update_user(username, expires_at=new_expires_at, status="active", notified_days=[], post_disable_notified=[])
 
     elif mode == "30":
         # "1 месяц" must be a calendar month (same day next month), not a
         # flat +30 days — otherwise short months quietly shift the renewal
         # date earlier every cycle.
         new_expires_at = calc_new_expiry_months(user.get("expires_at"), 1)
-        update_user(username, expires_at=new_expires_at, status="active", notified_days=[])
+        update_user(username, expires_at=new_expires_at, status="active", notified_days=[], post_disable_notified=[])
 
     elif mode == "manual":
         await state.set_state(ExtendUser.manual)
@@ -97,7 +97,7 @@ async def manual_date(msg: Message, state: FSMContext):
     was_expired_or_inactive = user.get("status") != "active" or is_expired(user.get("expires_at"))
     new_expires_at = msg.text.strip()
 
-    update_user(username, expires_at=new_expires_at, status="active", notified_days=[])
+    update_user(username, expires_at=new_expires_at, status="active", notified_days=[], post_disable_notified=[])
 
     if was_expired_or_inactive:
         await run_sync()

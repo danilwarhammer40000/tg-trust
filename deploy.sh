@@ -103,6 +103,8 @@ install_unit_if_changed "trustpanel-cleanup.service"
 install_unit_if_changed "trustpanel-cleanup.timer"
 install_unit_if_changed "trustpanel-backup.service"
 install_unit_if_changed "trustpanel-backup.timer"
+install_unit_if_changed "trustpanel-post-disable.service"
+install_unit_if_changed "trustpanel-post-disable.timer"
 
 if [ "$UNITS_CHANGED" = "1" ]; then
     systemctl daemon-reload
@@ -129,6 +131,7 @@ echo "[5/6] Restarting changed timers..."
 if [ "$UNITS_CHANGED" = "1" ]; then
     systemctl restart trustpanel-cleanup.timer 2>/dev/null || true
     systemctl restart trustpanel-backup.timer 2>/dev/null || true
+    systemctl restart trustpanel-post-disable.timer 2>/dev/null || true
 else
     echo "[INFO] No unit changes — leaving timers as-is"
 fi

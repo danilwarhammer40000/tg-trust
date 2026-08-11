@@ -1,0 +1,9 @@
+[Unit]
+Description=TrustPanel Post-Disable Reminders (+1/+3 days)
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/trustpanel/.env
+ExecStart=/opt/trustpanel/venv/bin/python -u /opt/trustpanel/services/post_disable_reminders.py
+StandardOutput=journal
+StandardError=journal

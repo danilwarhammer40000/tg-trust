@@ -1,0 +1,10 @@
+[Unit]
+Description=Run TrustPanel post-disable reminders daily at 09:00 MSK
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+Unit=trustpanel-post-disable.service
+
+[Install]
+WantedBy=timers.target

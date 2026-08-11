@@ -117,8 +117,10 @@ install_unit () {
 install_unit "trustpanel-bot.service"
 install_unit "trustpanel-cleanup.service"
 install_unit "trustpanel-backup.service"
+install_unit "trustpanel-post-disable.service"
 install_unit "trustpanel-cleanup.timer"
 install_unit "trustpanel-backup.timer"
+install_unit "trustpanel-post-disable.timer"
 
 # -------------------------
 # SYSTEMD APPLY
@@ -134,6 +136,7 @@ systemctl restart trustpanel-bot.service
 
 systemctl start trustpanel-cleanup.timer 2>/dev/null || true
 systemctl start trustpanel-backup.timer 2>/dev/null || true
+systemctl start trustpanel-post-disable.timer 2>/dev/null || true
 
 # -------------------------
 # HEALTH CHECK
