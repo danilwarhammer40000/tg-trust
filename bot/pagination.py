@@ -19,7 +19,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton
 
 router = Router()
 
-USERS_PAGE_SIZE = 15
+USERS_PAGE_SIZE = 13
 
 
 def paginate(items: list, page: int):

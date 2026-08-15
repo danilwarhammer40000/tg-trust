@@ -1,9 +1,9 @@
 """
 Everything about HOW the admin's user lists are displayed: persistent
-toggles (group-by-subscription, hide-unlimited), sort order, and the
-per-row button label (🔔/🔸 markers). Used by every handlers/ file that
-renders a "one row per user" keyboard: list_users, get_link, mass_delete,
-broadcast (recipient picker), database (trial lists).
+toggles (group-by-subscription, hide-unlimited, hide-expired), sort order,
+and the per-row button label (🔔/🔸 markers). Used by every handlers/ file
+that renders a "one row per user" keyboard: list_users, get_link,
+mass_delete, broadcast (recipient picker), database (trial lists).
 """
 import json
 import os
@@ -11,7 +11,7 @@ import os
 from core.dates import is_expired, parse_expiry
 from core.paths import SETTINGS_PATH
 
-DEFAULT_SETTINGS = {"group_by_subscription": True, "hide_unlimited": False}
+DEFAULT_SETTINGS = {"group_by_subscription": True, "hide_unlimited": False, "hide_expired": False}
 
 
 def _load_settings() -> dict:
@@ -49,6 +49,17 @@ def toggle_hide_unlimited() -> bool:
     settings["hide_unlimited"] = not settings.get("hide_unlimited", False)
     _save_settings(settings)
     return settings["hide_unlimited"]
+
+
+def is_hide_expired_enabled() -> bool:
+    return _load_settings().get("hide_expired", False)
+
+
+def toggle_hide_expired() -> bool:
+    settings = _load_settings()
+    settings["hide_expired"] = not settings.get("hide_expired", False)
+    _save_settings(settings)
+    return settings["hide_expired"]
 
 
 def user_button_label(u: dict) -> str:
@@ -99,11 +110,14 @@ def sorted_users_for_display(users: list) -> list:
 
 def prepare_users_for_display(users: list) -> list:
     """
-    Applies both display settings, in order: optional hide-unlimited filter,
-    then sort (grouped-by-subscription + date, or plain date-only — see
-    sorted_users_for_display). Use this everywhere a full user list gets
-    rendered as buttons, instead of calling list_users() directly.
+    Applies both display settings, in order: optional hide-unlimited and/or
+    hide-expired filters, then sort (grouped-by-subscription + date, or
+    plain date-only — see sorted_users_for_display). Use this everywhere a
+    full user list gets rendered as buttons, instead of calling
+    list_users() directly.
     """
     if is_hide_unlimited_enabled():
         users = [u for u in users if u.get("expires_at")]
+    if is_hide_expired_enabled():
+        users = [u for u in users if not is_expired(u.get("expires_at"))]
     return sorted_users_for_display(users)
