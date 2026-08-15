@@ -2,14 +2,22 @@ from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.access import admin_only
-from bot.display import is_grouping_enabled, is_hide_unlimited_enabled, toggle_grouping, toggle_hide_unlimited
+from bot.display import (
+    is_grouping_enabled,
+    is_hide_expired_enabled,
+    is_hide_unlimited_enabled,
+    toggle_grouping,
+    toggle_hide_expired,
+    toggle_hide_unlimited,
+)
 
 router = Router()
 
 
 def sorting_menu_kb() -> InlineKeyboardMarkup:
     grouping_on = is_grouping_enabled()
-    hide_on = is_hide_unlimited_enabled()
+    hide_unlimited_on = is_hide_unlimited_enabled()
+    hide_expired_on = is_hide_expired_enabled()
 
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
@@ -17,8 +25,12 @@ def sorting_menu_kb() -> InlineKeyboardMarkup:
             callback_data="sort:toggle_group"
         )],
         [InlineKeyboardButton(
-            text=f"{'✅' if hide_on else '⬜'} Скрывать безлимитных",
+            text=f"{'✅' if hide_unlimited_on else '⬜'} Скрывать безлимитных",
             callback_data="sort:toggle_hide"
+        )],
+        [InlineKeyboardButton(
+            text=f"{'✅' if hide_expired_on else '⬜'} Скрывать просроченных",
+            callback_data="sort:toggle_hide_expired"
         )],
     ])
 
@@ -50,6 +62,19 @@ async def sorting_toggle_hide(call: CallbackQuery):
         return
 
     toggle_hide_unlimited()
+    try:
+        await call.message.edit_reply_markup(reply_markup=sorting_menu_kb())
+    except Exception:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data == "sort:toggle_hide_expired")
+async def sorting_toggle_hide_expired(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    toggle_hide_expired()
     try:
         await call.message.edit_reply_markup(reply_markup=sorting_menu_kb())
     except Exception:
