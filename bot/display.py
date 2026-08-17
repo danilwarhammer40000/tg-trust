@@ -11,7 +11,12 @@ import os
 from core.dates import is_expired, parse_expiry
 from core.paths import SETTINGS_PATH
 
-DEFAULT_SETTINGS = {"group_by_subscription": True, "hide_unlimited": False, "hide_expired": False}
+DEFAULT_SETTINGS = {
+    "group_by_subscription": True,
+    "hide_unlimited": False,
+    "hide_expired": False,
+    "hide_followers": False,
+}
 
 
 def _load_settings() -> dict:
@@ -62,6 +67,17 @@ def toggle_hide_expired() -> bool:
     return settings["hide_expired"]
 
 
+def is_hide_followers_enabled() -> bool:
+    return _load_settings().get("hide_followers", False)
+
+
+def toggle_hide_followers() -> bool:
+    settings = _load_settings()
+    settings["hide_followers"] = not settings.get("hide_followers", False)
+    _save_settings(settings)
+    return settings["hide_followers"]
+
+
 def user_button_label(u: dict) -> str:
     username = u.get("username", "?")
     expires_at = u.get("expires_at")
@@ -110,14 +126,25 @@ def sorted_users_for_display(users: list) -> list:
 
 def prepare_users_for_display(users: list) -> list:
     """
-    Applies both display settings, in order: optional hide-unlimited and/or
-    hide-expired filters, then sort (grouped-by-subscription + date, or
-    plain date-only — see sorted_users_for_display). Use this everywhere a
-    full user list gets rendered as buttons, instead of calling
-    list_users() directly.
+    Applies all three display settings, in order: optional hide-unlimited,
+    hide-expired, hide-followers filters, then sort (grouped-by-subscription
+    + date, or plain date-only — see sorted_users_for_display). Use this
+    everywhere a full user list gets rendered as buttons for general
+    browsing — List users, Get link, mass delete, broadcast recipient
+    picker, trial management.
+
+    IMPORTANT: the leader/follower linking flows in
+    bot/handlers/leader_link.py deliberately do NOT use this function —
+    they need to see followers regardless of hide_followers (to re-parent
+    them, or to show a leader's own current group), so they call
+    sorted_users_for_display() directly instead. If you add a new list
+    here, ask whether it's "general browsing" (use this) or "managing
+    links" (bypass the hide-filters).
     """
     if is_hide_unlimited_enabled():
         users = [u for u in users if u.get("expires_at")]
     if is_hide_expired_enabled():
         users = [u for u in users if not is_expired(u.get("expires_at"))]
+    if is_hide_followers_enabled():
+        users = [u for u in users if not u.get("linked_to")]
     return sorted_users_for_display(users)
