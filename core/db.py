@@ -138,6 +138,15 @@ def get_followers(username: str) -> List[Dict]:
     return [u for u in load() if u.get("linked_to") == username]
 
 
+def get_leaders() -> List[Dict]:
+    """Every user who currently has at least one follower — used by the
+    "🔗 Сделать ведомым" reverse-direction flow to offer a picker scoped to
+    existing leaders only, instead of the full user list."""
+    data = load()
+    leader_usernames = {u.get("linked_to") for u in data if u.get("linked_to")}
+    return [u for u in data if u.get("username") in leader_usernames]
+
+
 def link_user(follower_username: str, leader_username: str) -> bool:
     """
     Makes follower_username a follower of leader_username, immediately
@@ -227,6 +236,15 @@ def get_user_by_telegram_id(tg_id: int) -> Optional[Dict]:
 
     for u in load():
         if str(u.get("telegram_id")) == tg_id:
+            return u
+    return None
+
+
+def get_user_by_max_chat_id(chat_id: int) -> Optional[Dict]:
+    chat_id = str(chat_id)
+
+    for u in load():
+        if str(u.get("max_chat_id")) == chat_id:
             return u
     return None
 
