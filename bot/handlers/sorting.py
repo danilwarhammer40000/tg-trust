@@ -5,9 +5,11 @@ from bot.access import admin_only
 from bot.display import (
     is_grouping_enabled,
     is_hide_expired_enabled,
+    is_hide_followers_enabled,
     is_hide_unlimited_enabled,
     toggle_grouping,
     toggle_hide_expired,
+    toggle_hide_followers,
     toggle_hide_unlimited,
 )
 
@@ -18,6 +20,7 @@ def sorting_menu_kb() -> InlineKeyboardMarkup:
     grouping_on = is_grouping_enabled()
     hide_unlimited_on = is_hide_unlimited_enabled()
     hide_expired_on = is_hide_expired_enabled()
+    hide_followers_on = is_hide_followers_enabled()
 
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
@@ -31,6 +34,10 @@ def sorting_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             text=f"{'✅' if hide_expired_on else '⬜'} Скрывать просроченных",
             callback_data="sort:toggle_hide_expired"
+        )],
+        [InlineKeyboardButton(
+            text=f"{'✅' if hide_followers_on else '⬜'} Скрывать ведомых",
+            callback_data="sort:toggle_hide_followers"
         )],
     ])
 
@@ -75,6 +82,19 @@ async def sorting_toggle_hide_expired(call: CallbackQuery):
         return
 
     toggle_hide_expired()
+    try:
+        await call.message.edit_reply_markup(reply_markup=sorting_menu_kb())
+    except Exception:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data == "sort:toggle_hide_followers")
+async def sorting_toggle_hide_followers(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    toggle_hide_followers()
     try:
         await call.message.edit_reply_markup(reply_markup=sorting_menu_kb())
     except Exception:
