@@ -3,10 +3,10 @@ Owns: SetTelegramId.waiting.
 
 action_extend transitions into ExtendUser.mode (owned by handlers/extend.py),
 action_call transitions into AdminMessage.personal (owned by
-handlers/feedback.py), and action_leader_start transitions into
-LeaderLink.select (owned by handlers/leader_link.py) — see bot/states.py's
-docstring on why that's fine. action_unlink is a one-shot action with no
-state of its own.
+handlers/feedback.py), and action_leader_start/action_ungroup_start
+transition into LeaderLink.select (owned by handlers/leader_link.py) — see
+bot/states.py's docstring on why that's fine. action_unlink and
+action_follow_start (also in leader_link.py) are one-shot/stateless.
 """
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -20,7 +20,7 @@ from bot.keyboards import cancel_kb, main_menu
 from bot.pagination import paginate, pagination_nav_row
 from bot.states import AdminMessage, ExtendUser, SetTelegramId
 from core.dates import is_expired
-from core.db import delete_user, get_followers, get_user, list_users, unlink_user, update_user
+from core.db import delete_user, get_followers, get_leaders, get_user, list_users, unlink_user, update_user
 from core.generator import generate_link
 
 router = Router()
@@ -94,13 +94,12 @@ async def user_actions_menu(call: CallbackQuery):
 
     link_lines = []
     linked_to = user.get("linked_to")
+    followers = [] if linked_to else get_followers(username)
     if linked_to:
         link_lines.append(f"🔗 Ведомый у: {linked_to}")
-    else:
-        followers = get_followers(username)
-        if followers:
-            names = ", ".join(f.get("username", "?") for f in followers)
-            link_lines.append(f"👑 Ведущий для: {names}")
+    elif followers:
+        names = ", ".join(f.get("username", "?") for f in followers)
+        link_lines.append(f"👑 Ведущий для: {names}")
     link_status = ("\n" + "\n".join(link_lines)) if link_lines else ""
 
     rows = [
@@ -116,12 +115,21 @@ async def user_actions_menu(call: CallbackQuery):
 
     # A follower's own expiry/status is redirected to its leader anyway (see
     # core.db.update_user), so it can't become a leader itself — offer only
-    # "unlink" for it. Anyone else (independent, or already a leader — you
-    # can always attach more followers) gets "assign as leader" instead.
+    # "unlink" for it.
     if linked_to:
         rows.append([InlineKeyboardButton(text="🔓 Отвязать", callback_data=f"act_unlink:{username}")])
     else:
-        rows.append([InlineKeyboardButton(text="👑 Назначить ведущим", callback_data=f"act_leader:{username}")])
+        is_leader = bool(followers)
+
+        leader_label = "👑 Управление ведомыми" if is_leader else "👑 Назначить ведущим"
+        rows.append([InlineKeyboardButton(text=leader_label, callback_data=f"act_leader:{username}")])
+
+        if is_leader:
+            rows.append([InlineKeyboardButton(text="💔 Разгруппировать", callback_data=f"act_ungroup:{username}")])
+        elif get_leaders():
+            # Only worth offering if there's at least one existing leader to
+            # attach to — otherwise this button would open an empty list.
+            rows.append([InlineKeyboardButton(text="🔗 Сделать ведомым", callback_data=f"act_follow:{username}")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
 
