@@ -113,6 +113,15 @@ async def user_actions_menu(call: CallbackQuery):
         )],
     ]
 
+    if tg_id:
+        # tg://user?id=... opens a direct 1:1 chat with that Telegram
+        # account in the client app — a real chat window, not routed
+        # through the bot like "✉️ Написать" above. Works in Telegram
+        # Desktop/mobile as long as the app can resolve the numeric id
+        # (it generally can once the account has messaged the bot, which
+        # is exactly when telegram_id gets set in the first place).
+        rows.append([InlineKeyboardButton(text="💬 Открыть чат в Telegram", url=f"tg://user?id={tg_id}")])
+
     # A follower's own expiry/status is redirected to its leader anyway (see
     # core.db.update_user), so it can't become a leader itself — offer only
     # "unlink" for it.
