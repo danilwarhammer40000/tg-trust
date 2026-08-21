@@ -16,6 +16,7 @@ DEFAULT_SETTINGS = {
     "hide_unlimited": False,
     "hide_expired": False,
     "hide_followers": False,
+    "sort_soonest_first": False,
 }
 
 
@@ -78,6 +79,17 @@ def toggle_hide_followers() -> bool:
     return settings["hide_followers"]
 
 
+def is_sort_soonest_first_enabled() -> bool:
+    return _load_settings().get("sort_soonest_first", False)
+
+
+def toggle_sort_soonest_first() -> bool:
+    settings = _load_settings()
+    settings["sort_soonest_first"] = not settings.get("sort_soonest_first", False)
+    _save_settings(settings)
+    return settings["sort_soonest_first"]
+
+
 def user_button_label(u: dict) -> str:
     username = u.get("username", "?")
     expires_at = u.get("expires_at")
@@ -92,36 +104,52 @@ def user_button_label(u: dict) -> str:
     return f"🔸 {label}" if is_expired(expires_at) else label
 
 
-def _expiry_sort_key(u: dict):
+def _expiry_sort_key(u: dict, soonest_first: bool = False):
     """
-    Mirrors core.db._sort_key's date ordering: unlimited (no expiry) first,
-    then furthest-expiring first, nearest-expiring last, broken dates at
-    the very end.
+    Two orderings, picked by the "Сначала истекающие" toggle:
+
+    - Default (soonest_first=False): unlimited (no expiry) first, then
+      furthest-expiring first, nearest-expiring last, broken dates at the
+      very end. Good for "everything's fine, skim past the top".
+    - soonest_first=True: nearest-expiring first, unlimited pushed to the
+      very end (they need zero attention), broken dates still last either
+      way. Good for "who do I need to deal with today" — the accounts
+      that actually need a decision aren't buried behind pages of
+      lifetime/far-future ones.
+
+    Takes soonest_first as a parameter (read once by the caller) rather
+    than calling is_sort_soonest_first_enabled() here — this function runs
+    once per user being sorted, and re-reading settings.json from disk
+    that many times per list render would be wasteful I/O for no benefit.
     """
     expires_at = u.get("expires_at")
 
     if not expires_at:
-        return (0, 0)
+        return (1, 0) if soonest_first else (0, 0)
 
     d = parse_expiry(expires_at)
     if d is None:
-        return (2, 0)
+        return (2, 0)  # broken dates always sort last, in either mode
 
-    return (1, -d.date().toordinal())
+    ordinal = d.date().toordinal()
+    return (0, ordinal) if soonest_first else (1, -ordinal)
 
 
 def sorted_users_for_display(users: list) -> list:
     """
     If grouping is enabled: subscribed (🔔, telegram_id set) users above
-    unsubscribed ones. Either way, keeps the same expiry-date ordering
-    list_users() already provides as the (secondary, or only) sort key.
+    unsubscribed ones. Either way, applies the expiry-date ordering from
+    _expiry_sort_key (default or "soonest first", per the current setting)
+    as the (secondary, or only) sort key.
     """
+    soonest_first = is_sort_soonest_first_enabled()
+
     if is_grouping_enabled():
         return sorted(
             users,
-            key=lambda u: (0 if u.get("telegram_id") else 1, *_expiry_sort_key(u))
+            key=lambda u: (0 if u.get("telegram_id") else 1, *_expiry_sort_key(u, soonest_first))
         )
-    return sorted(users, key=_expiry_sort_key)
+    return sorted(users, key=lambda u: _expiry_sort_key(u, soonest_first))
 
 
 def prepare_users_for_display(users: list) -> list:
