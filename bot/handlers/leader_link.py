@@ -3,17 +3,22 @@ Owns: LeaderLink.select.
 
 All the leader/follower group-management UI lives here:
 - act_leader:   (list_users.py button) -> manage a leader's group: general
-                candidate list, existing followers pre-checked, checking/
-                unchecking both adds and removes -- one screen for both.
+                candidate list (free users + this leader's own current
+                followers only -- see _eligible_candidates), existing
+                followers pre-checked, checking/unchecking both adds and
+                removes -- one screen for both.
 - act_ungroup:  (list_users.py button, only shown for existing leaders) ->
                 same mechanics, but scoped to ONLY the current group (not
                 the general list), plus a one-tap "unlink everyone" button.
-- act_follow:   (list_users.py button, only shown for independent users,
-                only when at least one leader exists) -> the reverse
-                direction: pick which EXISTING leader this user should
-                follow, from a list scoped to leaders only. No FSM needed
-                here -- it's a single pick, so the follower's username is
-                just threaded through each button's own callback_data.
+- act_follow:   (list_users.py button, only shown for independent users)
+                -> the reverse direction: pick who this user should
+                follow. Starts on a list scoped to existing leaders, with
+                a "📋 Показать всех свободных" button to switch to a
+                second list of genuinely unattached users (for starting a
+                brand new group instead of joining an existing one). No
+                FSM needed -- it's a single pick, so the follower's
+                username (and current list mode) is threaded directly
+                through each button's own callback_data.
 
 See bot/states.py's docstring on why a different file (list_users.py)
 owning the buttons that transition into LeaderLink.select is fine.
@@ -28,7 +33,7 @@ from bot.keyboards import main_menu
 from bot.pagination import paginate, pagination_nav_row
 from bot.states import LeaderLink
 from core.dates import is_expired
-from core.db import get_followers, get_leaders, get_user, link_user, list_users, unlink_user
+from core.db import get_followers, get_leaders, get_unlinked_users, get_user, link_user, list_users, unlink_user
 
 router = Router()
 
@@ -44,30 +49,31 @@ router = Router()
 def _candidate_label(u: dict, selected: set) -> str:
     username = u.get("username", "?")
     mark = "☑️" if username in selected else "⬜"
-    label = user_button_label(u)
-    linked_to = u.get("linked_to")
-    if linked_to and username not in selected:
-        # Only worth calling out when NOT selected here -- if it's checked
-        # in THIS screen, the "current group" is obvious from context.
-        label += f" (сейчас ведомый {linked_to})"
-    return f"{mark} {label}"
+    return f"{mark} {user_button_label(u)}"
 
 
 def _eligible_candidates(leader_username: str) -> list:
     """
-    Anyone except the leader itself and anyone who is themselves already a
-    leader (has followers) — linking one leader under another would create
-    a chain that core.db.update_user's one-level propagation doesn't
-    support. Already-linked-to-someone-else users ARE included on purpose
-    — checking one just re-parents it onto this leader. Current followers
-    of THIS leader are included too (they have no followers of their own),
-    which is what lets them show up pre-checked.
+    Only genuinely free users (not the leader itself, not themselves a
+    leader elsewhere, not already someone ELSE's follower) — PLUS this
+    leader's own current followers, so they still show up pre-checked and
+    can be unchecked to remove.
+
+    Deliberately excludes followers of OTHER leaders now (previously they
+    were included, letting the general list double as a "re-parent"
+    picker — but that cluttered the general "who can I add" list with
+    people already spoken for elsewhere. Re-parenting is still possible,
+    just not from this general list — unlink them from their current
+    leader first via that leader's "💔 Разгруппировать", then they show up
+    here as free.
     """
+    current_followers = {f["username"] for f in get_followers(leader_username)}
     users = list_users() or []
     return [
         u for u in users
         if u.get("username") and u.get("username") != leader_username
-        and not get_followers(u["username"])
+        and not get_followers(u["username"])  # not themselves a leader
+        and (u["username"] in current_followers or not u.get("linked_to"))  # free, or already in THIS group
     ]
 
 
@@ -297,22 +303,78 @@ async def confirm_leader_link(call: CallbackQuery, state: FSMContext):
 
 # ---------------- REVERSE DIRECTION: "🔗 Сделать ведомым" ----------------
 #
-# No FSM needed -- it's a single pick from a list scoped to existing
-# leaders, so the follower's own username is threaded directly through
-# each button's callback_data instead of being stored in state.
+# No FSM needed -- it's a single pick, so the follower's own username (and
+# now the current list mode) is threaded directly through each button's
+# callback_data instead of being stored in state.
+#
+# Two modes:
+# - "leaders": the common case -- attach to an EXISTING group.
+# - "free": fallback for when the leader you want isn't a leader yet --
+#   scoped to users who are neither a leader nor a follower of anyone.
+#   Picking one there makes them a first-time leader (link_user() doesn't
+#   care whether the target already had followers or not).
 
-def build_follow_leader_kb(follower_username: str, leaders: list, page: int) -> tuple:
-    page_leaders, total_pages, page = paginate(leaders, page)
+def build_follow_picker_kb(follower_username: str, users: list, page: int, mode: str) -> tuple:
+    page_users, total_pages, page = paginate(users, page)
 
-    rows = [
+    rows = []
+    if mode == "leaders":
+        rows.append([InlineKeyboardButton(text="📋 Показать всех свободных", callback_data=f"followall:{follower_username}")])
+    else:
+        rows.append([InlineKeyboardButton(text="👑 Показать только ведущих", callback_data=f"act_follow:{follower_username}")])
+
+    rows += [
         [InlineKeyboardButton(
-            text=user_button_label(l),
-            callback_data=f"followto:{follower_username}:{l['username']}"
+            text=user_button_label(u),
+            callback_data=f"followto:{follower_username}:{u['username']}"
         )]
-        for l in page_leaders
+        for u in page_users
     ]
-    rows += pagination_nav_row(page, total_pages, f"followpage:{follower_username}")
+    rows += pagination_nav_row(page, total_pages, f"followpage:{follower_username}:{mode}")
     return InlineKeyboardMarkup(inline_keyboard=rows), total_pages, page
+
+
+def follow_picker_label(follower_username: str, total: int, page: int, total_pages: int, mode: str) -> str:
+    suffix = f", стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
+
+    if mode == "free":
+        return (
+            f"К кому привязать {follower_username}? Свободные пользователи "
+            f"({total}{suffix}) — выбор станет новым ведущим:"
+        )
+    return f"К кому привязать {follower_username} как ведомого — существующие ведущие ({total}{suffix})?"
+
+
+def _follow_candidates(follower_username: str, mode: str) -> list:
+    if mode == "free":
+        users = [u for u in get_unlinked_users() if u.get("username") != follower_username]
+    else:
+        users = get_leaders()
+    return sorted_users_for_display(users)
+
+
+async def _render_follow_picker(call: CallbackQuery, follower_username: str, mode: str, page: int, edit: bool):
+    candidates = _follow_candidates(follower_username, mode)
+
+    if not candidates:
+        text = (
+            "У этого пользователя пока нет ведомых."
+            if mode == "leaders"
+            else "Нет свободных пользователей для привязки."
+        )
+        await call.answer(text, show_alert=True)
+        return
+
+    kb, total_pages, page = build_follow_picker_kb(follower_username, candidates, page, mode)
+    label = follow_picker_label(follower_username, len(candidates), page, total_pages, mode)
+
+    if edit:
+        try:
+            await call.message.edit_text(label, reply_markup=kb)
+        except Exception:
+            pass
+    else:
+        await call.message.answer(label, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("act_follow:"))
@@ -321,32 +383,33 @@ async def action_follow_start(call: CallbackQuery):
         return
 
     follower_username = call.data.split(":", 1)[1]
-    leaders = sorted_users_for_display(get_leaders())
 
-    if not leaders:
-        await call.answer("Пока нет ни одного ведущего с ведомыми.", show_alert=True)
+    # If there are no leaders at all yet, skip straight to "free" mode --
+    # showing an empty leaders list with nothing to do but tap through to
+    # "free" anyway would just be an extra step for no reason.
+    mode = "leaders" if get_leaders() else "free"
+
+    await _render_follow_picker(call, follower_username, mode=mode, page=0, edit=False)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("followall:"))
+async def action_follow_show_all(call: CallbackQuery):
+    if not await admin_only(call):
         return
 
-    kb, total_pages, page = build_follow_leader_kb(follower_username, leaders, 0)
-    label = f"К кому привязать {follower_username} как ведомого ({len(leaders)} ведущих)?"
-    await call.message.answer(label, reply_markup=kb)
+    follower_username = call.data.split(":", 1)[1]
+    await _render_follow_picker(call, follower_username, mode="free", page=0, edit=True)
     await call.answer()
 
 
 @router.callback_query(F.data.startswith("followpage:"))
-async def follow_leader_page(call: CallbackQuery):
+async def follow_picker_page(call: CallbackQuery):
     if not await admin_only(call):
         return
 
-    _, follower_username, page_str = call.data.split(":", 2)
-    page = int(page_str)
-    leaders = sorted_users_for_display(get_leaders())
-
-    kb, total_pages, page = build_follow_leader_kb(follower_username, leaders, page)
-    try:
-        await call.message.edit_reply_markup(reply_markup=kb)
-    except Exception:
-        pass
+    _, follower_username, mode, page_str = call.data.split(":", 3)
+    await _render_follow_picker(call, follower_username, mode=mode, page=int(page_str), edit=True)
     await call.answer()
 
 
@@ -359,7 +422,7 @@ async def follow_leader_confirm(call: CallbackQuery):
 
     leader = get_user(leader_username)
     if not leader:
-        await call.answer("Ведущий не найден", show_alert=True)
+        await call.answer("Пользователь не найден", show_alert=True)
         return
 
     was_expired_or_inactive = leader.get("status") != "active" or is_expired(leader.get("expires_at"))
