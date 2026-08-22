@@ -20,7 +20,7 @@ from bot.keyboards import cancel_kb, main_menu
 from bot.pagination import paginate, pagination_nav_row
 from bot.states import AdminMessage, ExtendUser, SetTelegramId
 from core.dates import is_expired
-from core.db import delete_user, get_followers, get_leaders, get_user, list_users, unlink_user, update_user
+from core.db import delete_user, get_followers, get_user, list_users, unlink_user, update_user
 from core.generator import generate_link
 
 router = Router()
@@ -135,9 +135,10 @@ async def user_actions_menu(call: CallbackQuery):
 
         if is_leader:
             rows.append([InlineKeyboardButton(text="💔 Разгруппировать", callback_data=f"act_ungroup:{username}")])
-        elif get_leaders():
-            # Only worth offering if there's at least one existing leader to
-            # attach to — otherwise this button would open an empty list.
+        else:
+            # The flow itself (leader_link.py's action_follow_start) falls
+            # back to a "free users" list when there are no leaders yet, so
+            # no need to gate this button on get_leaders() anymore.
             rows.append([InlineKeyboardButton(text="🔗 Сделать ведомым", callback_data=f"act_follow:{username}")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
