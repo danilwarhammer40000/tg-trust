@@ -147,6 +147,21 @@ def get_leaders() -> List[Dict]:
     return [u for u in data if u.get("username") in leader_usernames]
 
 
+def get_unlinked_users() -> List[Dict]:
+    """Users who are neither a leader (nobody follows them) nor a follower
+    (linked_to not set) — i.e. not part of any group yet. Used by the
+    "🔗 Сделать ведомым" flow's "показать всех свободных" fallback, for
+    when the leader you want isn't in the leaders list yet (because you're
+    starting a brand new group, not adding to an existing one)."""
+    data = load()
+    leader_usernames = {u.get("linked_to") for u in data if u.get("linked_to")}
+    return [
+        u for u in data
+        if u.get("username") not in leader_usernames
+        and not u.get("linked_to")
+    ]
+
+
 def link_user(follower_username: str, leader_username: str) -> bool:
     """
     Makes follower_username a follower of leader_username, immediately
