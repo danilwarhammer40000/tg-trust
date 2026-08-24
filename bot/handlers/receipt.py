@@ -8,7 +8,9 @@ first. The equivalent flow reached FROM inside the feedback conversation
 lives in handlers/feedback.py (client_feedback_media) — the two are
 separate entry points into conceptually the same "is this a receipt?"
 question, deliberately duplicated rather than shared, since they attach to
-different states and different confirm-button callback_data.
+different states and different confirm-button callback_data. Both hook
+into the AI auto-renewal pipeline (core/auto_renewal.py) the same way —
+see receipt_yes below.
 """
 import logging
 from datetime import datetime
@@ -18,12 +20,14 @@ from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from bot import auto_renewal_hook
 from bot.access import admin_only, run_sync
 from bot.config import ADMIN_ID, bot
 from bot.keyboards import cancel_kb, main_menu, renewal_admin_kb
 from bot.states import ReceiptConfirm, RenewalApproval
 from core.dates import calc_new_expiry_months, is_expired, utcnow_naive
 from core.db import get_user, get_user_by_telegram_id, update_user
+from core.notify import log_to_channel
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -83,6 +87,18 @@ async def receipt_yes(call: CallbackQuery, state: FSMContext):
         f"📥 Заявка на продление от {username}\n"
         f"⏳ Текущая дата истечения: {expiry_line}"
     )
+
+    # Every receipt submission gets logged with the file, regardless of
+    # whether auto-renewal ends up handling it — rule "логируем всё".
+    log_to_channel(caption, file_id=file_id, is_photo=is_photo)
+
+    await state.clear()
+
+    if await auto_renewal_hook.try_auto_renewal(username, file_id, is_photo):
+        await call.message.answer("✅ Чек принят — доступ уже продлён автоматически, администратор проверит позже.")
+        await call.answer()
+        return
+
     kb = renewal_admin_kb(username)
 
     if is_photo:
@@ -91,7 +107,6 @@ async def receipt_yes(call: CallbackQuery, state: FSMContext):
         await bot.send_document(ADMIN_ID, document=file_id, caption=caption, reply_markup=kb)
 
     await call.message.answer("✅ Отправлено администратору. Ждите подтверждения.")
-    await state.clear()
     await call.answer()
 
 
@@ -112,6 +127,35 @@ async def media_while_waiting_confirm(msg: Message):
 
 # ---------------- ADMIN: APPROVE / REJECT RENEWAL ----------------
 
+def _ai_in_progress_or_done(pending: dict):
+    """
+    Returns (blocked: bool, message: str) — used to keep a manual approval
+    from colliding with the AI pipeline processing (or having already
+    processed) the same request. See core.db.claim_pending_request_for_ai
+    for the matching "claim" side of this — same staleness rule (a claim
+    older than AI_CLAIM_STALE_SECONDS with no recorded result is treated
+    as abandoned/crashed, not blocking).
+    """
+    if not pending:
+        return False, ""
+
+    if pending.get("ai_result") == "approved":
+        return True, "Эта заявка уже обработана автоматически — проверьте карточку в чате с ботом."
+
+    claimed_at = pending.get("ai_claimed_at")
+    if claimed_at and not pending.get("ai_result"):
+        try:
+            from core.db import AI_CLAIM_STALE_SECONDS
+            claimed_dt = datetime.fromisoformat(claimed_at)
+            still_fresh = (utcnow_naive() - claimed_dt).total_seconds() < AI_CLAIM_STALE_SECONDS
+        except ValueError:
+            still_fresh = False
+        if still_fresh:
+            return True, "Заявка сейчас обрабатывается автоматически, попробуйте через минуту."
+
+    return False, ""
+
+
 @router.callback_query(F.data.startswith("apr:"))
 async def approve_renewal(call: CallbackQuery, state: FSMContext):
     if not await admin_only(call):
@@ -124,9 +168,15 @@ async def approve_renewal(call: CallbackQuery, state: FSMContext):
         await call.answer("User not found", show_alert=True)
         return
 
+    blocked, message = _ai_in_progress_or_done(user.get("pending_request"))
+    if blocked:
+        await call.answer(message, show_alert=True)
+        return
+
     if action == "reject":
         update_user(username, pending_request=None)
         await call.message.edit_caption(caption=f"❌ Заявка {username} отклонена")
+        log_to_channel(f"❌ Заявка {username} отклонена администратором (вручную).")
 
         if user.get("telegram_id"):
             await bot.send_message(
@@ -170,6 +220,7 @@ async def approve_renewal(call: CallbackQuery, state: FSMContext):
         await run_sync()
 
     await call.message.edit_caption(caption=f"✅ {username} продлён до {new_expires}")
+    log_to_channel(f"✅ {username} продлён вручную администратором до {new_expires} ({months} мес.).")
 
     if user.get("telegram_id"):
         await bot.send_message(
@@ -200,6 +251,11 @@ async def approve_renewal_manual_date(msg: Message, state: FSMContext):
         await msg.answer("Пользователь не найден.", reply_markup=main_menu)
         return
 
+    blocked, message = _ai_in_progress_or_done(user.get("pending_request"))
+    if blocked:
+        await msg.answer(message, reply_markup=main_menu)
+        return
+
     was_expired_or_inactive = user.get("status") != "active" or is_expired(user.get("expires_at"))
 
     update_user(
@@ -213,6 +269,8 @@ async def approve_renewal_manual_date(msg: Message, state: FSMContext):
 
     if was_expired_or_inactive:
         await run_sync()
+
+    log_to_channel(f"✅ {username} продлён вручную администратором до {new_expires} (ручная дата).")
 
     if user.get("telegram_id"):
         await bot.send_message(

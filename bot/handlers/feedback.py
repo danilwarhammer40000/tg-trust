@@ -13,12 +13,14 @@ from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from bot import auto_renewal_hook
 from bot.access import admin_only, is_admin
 from bot.config import ADMIN_ID, bot
 from bot.keyboards import cancel_kb, client_menu, main_menu, renewal_admin_kb
 from bot.states import AdminMessage, Feedback
 from core.dates import is_expired, utcnow_naive
 from core.db import get_user, get_user_by_telegram_id, update_user
+from core.notify import log_to_channel
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -77,7 +79,8 @@ async def client_feedback_media(msg: Message, state: FSMContext):
 async def feedback_media_as_receipt(call: CallbackQuery, state: FSMContext):
     """Same handling as the general receipt flow (receipt:yes in
     handlers/receipt.py) — routes into the renewal approval queue with the
-    ➕1мес/➕2мес/✍️/❌ admin buttons."""
+    ➕1мес/➕2мес/✍️/❌ admin buttons, unless AI auto-renewal claims it
+    first (see bot/auto_renewal_hook.py)."""
     data = await state.get_data()
     file_id = data.get("media_file_id")
     username = data.get("media_username")
@@ -98,6 +101,17 @@ async def feedback_media_as_receipt(call: CallbackQuery, state: FSMContext):
         expiry_line += " (уже истёк)"
 
     caption = f"📥 Заявка на продление от {username}\n⏳ Текущая дата истечения: {expiry_line}"
+
+    log_to_channel(caption, file_id=file_id, is_photo=is_photo)
+
+    if await auto_renewal_hook.try_auto_renewal(username, file_id, is_photo):
+        await call.message.answer(
+            "✅ Чек принят — доступ уже продлён автоматически, администратор проверит позже.",
+            reply_markup=client_menu
+        )
+        await call.answer()
+        return
+
     kb = renewal_admin_kb(username)
 
     if is_photo:

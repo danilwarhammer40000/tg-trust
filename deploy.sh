@@ -61,6 +61,10 @@ source "$PROJECT_DIR/venv/bin/activate"
 
 pip install -r requirements.txt --quiet
 
+if [ -n "${MAX_BOT_TOKEN:-}" ]; then
+    pip install -r requirements-max.txt --quiet
+fi
+
 # -------------------------
 # 3) REFRESH SYSTEMD UNITS
 # -------------------------
@@ -105,6 +109,12 @@ install_unit_if_changed "trustpanel-backup.service"
 install_unit_if_changed "trustpanel-backup.timer"
 install_unit_if_changed "trustpanel-post-disable.service"
 install_unit_if_changed "trustpanel-post-disable.timer"
+install_unit_if_changed "trustpanel-auto-renewal-check.service"
+install_unit_if_changed "trustpanel-auto-renewal-check.timer"
+
+if [ -n "${MAX_BOT_TOKEN:-}" ]; then
+    install_unit_if_changed "trustpanel-max-bot.service"
+fi
 
 if [ "$UNITS_CHANGED" = "1" ]; then
     systemctl daemon-reload
@@ -121,6 +131,10 @@ echo "[4/6] Restarting bot..."
 
 systemctl restart trustpanel-bot.service
 
+if [ -n "${MAX_BOT_TOKEN:-}" ]; then
+    systemctl restart trustpanel-max-bot.service
+fi
+
 # -------------------------
 # 5) RESTART TIMERS (only if their unit actually changed — a timer restart
 #    re-schedules the next run, which matters if OnCalendar/OnUnitActiveSec
@@ -132,6 +146,7 @@ if [ "$UNITS_CHANGED" = "1" ]; then
     systemctl restart trustpanel-cleanup.timer 2>/dev/null || true
     systemctl restart trustpanel-backup.timer 2>/dev/null || true
     systemctl restart trustpanel-post-disable.timer 2>/dev/null || true
+    systemctl restart trustpanel-auto-renewal-check.timer 2>/dev/null || true
 else
     echo "[INFO] No unit changes — leaving timers as-is"
 fi
@@ -166,6 +181,18 @@ fi
 echo ""
 echo "=== TIMERS ==="
 systemctl list-timers | grep trustpanel || true
+
+if [ -n "${MAX_BOT_TOKEN:-}" ]; then
+    echo ""
+    echo "=== MAX BOT STATUS ==="
+    if systemctl is-active --quiet trustpanel-max-bot.service; then
+        echo "✅ MAX BOT RUNNING"
+    else
+        echo "❌ MAX BOT FAILED"
+        systemctl status trustpanel-max-bot.service --no-pager || true
+        journalctl -u trustpanel-max-bot.service -n 40 --no-pager || true
+    fi
+fi
 
 if [ -n "${BOT_TOKEN:-}" ] && [ -n "${ADMIN_ID:-}" ]; then
     curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \

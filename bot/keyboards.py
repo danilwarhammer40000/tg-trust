@@ -20,6 +20,7 @@ main_menu = ReplyKeyboardMarkup(
         [KeyboardButton(text="📢 Рассылка")],
         [KeyboardButton(text="🗄 База данных")],
         [KeyboardButton(text="⚙️ Сортировка БД")],
+        [KeyboardButton(text="🤖 Автопродление")],
         [KeyboardButton(text="🔄 Sync users")],
         [KeyboardButton(text="🚀 Деплой")]
     ],

@@ -3,11 +3,12 @@ import logging
 import os
 import stat
 import tempfile
+from datetime import datetime
 from typing import List, Dict, Optional
 
 from filelock import FileLock
 
-from core.dates import parse_expiry
+from core.dates import parse_expiry, utcnow_naive
 
 log = logging.getLogger(__name__)
 
@@ -198,6 +199,59 @@ def unlink_user(username: str) -> bool:
             return False
 
         target["linked_to"] = None
+        save(data)
+        return True
+
+
+# ================= AI AUTO-RENEWAL CLAIMING =================
+#
+# Two independent triggers can try to auto-process the same pending
+# receipt: the real-time "night window" hook (bot/handlers/receipt.py,
+# feedback.py) and the periodic "3 hours overdue" checker
+# (services/auto_renewal_overdue_check.py). This is the single choke
+# point that prevents both from processing — and therefore extending —
+# the same request twice.
+
+AI_CLAIM_STALE_SECONDS = 300  # 5 minutes -- see claim_pending_request_for_ai
+
+
+def claim_pending_request_for_ai(username: str) -> bool:
+    """
+    Atomically marks a user's pending_request as claimed for AI
+    processing. Returns True only if THIS call did the claiming (i.e. it
+    wasn't already being — or already been — processed), so the caller
+    knows it's safe to proceed with the (slow) Gemini call.
+
+    Self-healing: if a previous claim is older than AI_CLAIM_STALE_SECONDS
+    and never recorded an ai_result (meaning that attempt crashed or the
+    process was killed mid-way), the claim is treated as abandoned and can
+    be re-claimed — otherwise a crash would permanently wedge that request,
+    unclaimable by anything, forever.
+    """
+    with _lock:
+        data = load()
+        target = next((u for u in data if u.get("username") == username), None)
+
+        if target is None:
+            return False
+
+        pending = target.get("pending_request")
+        if not pending:
+            return False
+
+        claimed_at = pending.get("ai_claimed_at")
+        if claimed_at and not pending.get("ai_result"):
+            try:
+                claimed_dt = datetime.fromisoformat(claimed_at)
+                still_fresh = (utcnow_naive() - claimed_dt).total_seconds() < AI_CLAIM_STALE_SECONDS
+            except ValueError:
+                still_fresh = False  # unparseable timestamp -- treat as stale, safe to reclaim
+
+            if still_fresh:
+                return False
+
+        pending["ai_claimed_at"] = utcnow_naive().isoformat()
+        pending.pop("ai_result", None)  # clear any stale result from an abandoned attempt
         save(data)
         return True
 

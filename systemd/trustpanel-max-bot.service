@@ -1,0 +1,33 @@
+[Unit]
+Description=TrustPanel MAX Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trustpanel
+EnvironmentFile=/opt/trustpanel/.env
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/trustpanel/venv/bin/python -m max_bot.main
+
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+# Same reasoning as trustpanel-bot.service: trial signup calls
+# core.service.safe_sync(), which runs `systemctl restart
+# trusttunnel.service` and writes to /opt/trusttunnel.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+StandardOutput=journal
+StandardError=journal
+
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

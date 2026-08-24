@@ -1,0 +1,9 @@
+[Unit]
+Description=TrustPanel AI Auto-Renewal Overdue Check (>3h unprocessed)
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/trustpanel/.env
+ExecStart=/opt/trustpanel/venv/bin/python -u /opt/trustpanel/services/auto_renewal_overdue_check.py
+StandardOutput=journal
+StandardError=journal

@@ -69,6 +69,24 @@ BOT_TOKEN=$(echo "$BOT_TOKEN" | tr -d '\r')
 ADMIN_ID=$(echo "$ADMIN_ID" | tr -d '\r')
 DOMAIN=$(echo "$DOMAIN" | tr -d '\r')
 
+# Optional — the MAX bot (max_bot/) only gets installed/started if this is
+# given. Leave blank and press Enter to skip it entirely.
+read -r -p "MAX_BOT_TOKEN (Enter to skip MAX bot): " MAX_BOT_TOKEN
+MAX_BOT_TOKEN=$(echo "$MAX_BOT_TOKEN" | tr -d '\r')
+
+# Optional — AI auto-renewal (🤖 Автопродление). Both empty = feature
+# stays off and unconfigured; the bot itself also refuses to let it be
+# turned ON without LOG_CHANNEL_ID (every decision must be logged).
+echo ""
+echo "AI auto-renewal (optional) — reads payment receipts via Gemini and can"
+echo "auto-extend access at night / when a request sits unanswered too long."
+echo "Get a free key: https://aistudio.google.com/apikey"
+read -r -p "GEMINI_API_KEY (Enter to skip this feature): " GEMINI_API_KEY
+GEMINI_API_KEY=$(echo "$GEMINI_API_KEY" | tr -d '\r')
+
+read -r -p "LOG_CHANNEL_ID (numeric channel id, needed for auto-renewal, Enter to skip): " LOG_CHANNEL_ID
+LOG_CHANNEL_ID=$(echo "$LOG_CHANNEL_ID" | tr -d '\r')
+
 # -------------------------
 # ENV
 # -------------------------
@@ -78,10 +96,18 @@ cat > "$PROJECT_DIR/.env" <<EOF
 BOT_TOKEN=$BOT_TOKEN
 ADMIN_ID=$ADMIN_ID
 TRUSTTUNNEL_DOMAIN=$DOMAIN
+MAX_BOT_TOKEN=$MAX_BOT_TOKEN
+GEMINI_API_KEY=$GEMINI_API_KEY
+LOG_CHANNEL_ID=$LOG_CHANNEL_ID
 PYTHONPATH=$PROJECT_DIR
 EOF
 
 chmod 600 "$PROJECT_DIR/.env"
+
+if [ -n "$MAX_BOT_TOKEN" ]; then
+    echo "[INFO] MAX_BOT_TOKEN given — installing maxapi..."
+    pip install -r requirements-max.txt
+fi
 
 # -------------------------
 # DATA DIRECTORY (users.json etc. contain plaintext VPN passwords)
@@ -118,9 +144,15 @@ install_unit "trustpanel-bot.service"
 install_unit "trustpanel-cleanup.service"
 install_unit "trustpanel-backup.service"
 install_unit "trustpanel-post-disable.service"
+install_unit "trustpanel-auto-renewal-check.service"
 install_unit "trustpanel-cleanup.timer"
 install_unit "trustpanel-backup.timer"
 install_unit "trustpanel-post-disable.timer"
+install_unit "trustpanel-auto-renewal-check.timer"
+
+if [ -n "$MAX_BOT_TOKEN" ]; then
+    install_unit "trustpanel-max-bot.service"
+fi
 
 # -------------------------
 # SYSTEMD APPLY
@@ -137,6 +169,13 @@ systemctl restart trustpanel-bot.service
 systemctl start trustpanel-cleanup.timer 2>/dev/null || true
 systemctl start trustpanel-backup.timer 2>/dev/null || true
 systemctl start trustpanel-post-disable.timer 2>/dev/null || true
+systemctl start trustpanel-auto-renewal-check.timer 2>/dev/null || true
+
+if [ -n "$MAX_BOT_TOKEN" ]; then
+    systemctl stop trustpanel-max-bot.service 2>/dev/null || true
+    systemctl enable trustpanel-max-bot.service
+    systemctl restart trustpanel-max-bot.service
+fi
 
 # -------------------------
 # HEALTH CHECK
@@ -152,6 +191,17 @@ if systemctl is-active --quiet trustpanel-bot.service; then
 else
     echo "❌ BOT FAILED"
     systemctl status trustpanel-bot.service --no-pager || true
+fi
+
+if [ -n "$MAX_BOT_TOKEN" ]; then
+    echo ""
+    echo "=== MAX BOT STATUS ==="
+    if systemctl is-active --quiet trustpanel-max-bot.service; then
+        echo "✅ MAX BOT RUNNING"
+    else
+        echo "❌ MAX BOT FAILED"
+        systemctl status trustpanel-max-bot.service --no-pager || true
+    fi
 fi
 
 echo ""

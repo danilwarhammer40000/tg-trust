@@ -18,10 +18,10 @@ from bot.display import prepare_users_for_display
 from bot.keyboards import cancel_kb, main_menu
 from bot.pagination import paginate, pagination_nav_row
 from bot.states import DBImport
-from bot.trial import load_trial_used_ids, save_trial_used_ids, mark_trial_used
 from core.dates import utcnow_naive
 from core.db import get_user_by_telegram_id, list_users
 from core.paths import BACKUP_FILES
+from core.trial import load_trial_used_ids, save_trial_used_ids, mark_trial_used
 
 router = Router()
 log = logging.getLogger(__name__)

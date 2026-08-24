@@ -19,9 +19,9 @@ from bot.access import is_admin, run_sync
 from bot.config import ADMIN_ID, bot
 from bot.formatting import CARD_RE, looks_like_card
 from bot.keyboards import client_menu, main_menu, platform_choice_kb
-from bot.trial import generate_trial_password, generate_username_from_name, has_used_trial, mark_trial_used
 from core.dates import utcnow_naive
 from core.db import add_user, get_user, get_user_by_telegram_id, update_user
+from core.trial import generate_trial_password, generate_username_from_name, has_used_trial, mark_trial_used
 
 router = Router()
 

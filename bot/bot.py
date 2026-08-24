@@ -25,6 +25,7 @@ from aiogram import Dispatcher
 
 from bot.handlers import (
     add_user,
+    auto_renewal_review,
     broadcast,
     client_menu,
     database,
@@ -55,6 +56,7 @@ for router in (
     broadcast.router,
     database.router,
     sorting.router,
+    auto_renewal_review.router,
     sync_deploy.router,
     add_user.router,
     list_users.router,
