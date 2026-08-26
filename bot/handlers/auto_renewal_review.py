@@ -1,47 +1,77 @@
 """
-Owns no FSM state — everything here is either a menu toggle or a one-shot
-review action driven by callback_data alone.
+Owns: AutoRenewalSettings.waiting_value.
 
-Two things live in this file:
-1. "🤖 Автопродление" admin menu — shows current ON/OFF state and the
-   toggle button. Turning it ON is refused if LOG_CHANNEL_ID isn't
-   configured (see core.auto_renewal.log_channel_configured) — rule 4 was
-   "everything gets logged", so the feature simply can't run without
-   somewhere to log to.
-2. aircheck:{username}:confirm / aircheck:{username}:disable — the
+Three things live in this file:
+1. "🤖 Автопродление" admin menu — ON/OFF toggle, "🚀 Полностью
+   автоматический режим" toggle, and "⚙️ Настроить условия" (opens the
+   trigger-tuning submenu). Turning the master toggle ON is refused if
+   LOG_CHANNEL_ID isn't configured (see core.auto_renewal.
+   log_channel_configured) — rule 4 was "everything gets logged", so the
+   feature simply can't run without somewhere to log to.
+2. The settings submenu — one "✏️ field: value" row per editable trigger
+   parameter (night window bounds, overdue threshold, min amount, min
+   confidence, date tolerance). Tapping one asks for a new value as plain
+   text; core.auto_renewal.set_setting_validated() does all the bounds
+   checking, this file just relays its ok/error result.
+3. aircheck:{username}:confirm / aircheck:{username}:disable — the
    post-hoc review buttons attached to every auto-renewal decision card
    (core/auto_renewal.py's _apply_and_request_review). "Подтвердить" just
    clears the pending review; "Отключить" disables the account AND rolls
    the expiry/status back to what they were before the auto-renewal —
-   full undo, not just a disable.
+   full undo, not just a disable. airretry:{username} (attached to
+   *fallback* cards instead) re-runs the AI pipeline on demand — useful
+   when the fallback reason was a transient problem (e.g. an outdated
+   Gemini model name) rather than a genuinely bad receipt.
 """
+import asyncio
 import logging
 
 from aiogram import Router, F
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import core.auto_renewal as auto_renewal
 from bot.access import admin_only, run_sync
-from core.db import get_user, update_user
+from bot.keyboards import main_menu
+from bot.states import AutoRenewalSettings
+from core.db import claim_pending_request_for_ai, get_user, update_user
 from core.notify import log_to_channel, notify_user
 
 router = Router()
 log = logging.getLogger(__name__)
 
 
+# ---------------- MAIN MENU ----------------
+
 def auto_renewal_menu_kb() -> InlineKeyboardMarkup:
     enabled = auto_renewal.is_auto_renewal_enabled()
+    fully_auto = auto_renewal.is_fully_automatic_enabled()
+
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text=f"{'✅ Включено' if enabled else '⬜ Выключено'} — переключить",
             callback_data="autoren:toggle"
         )],
+        [InlineKeyboardButton(
+            text=f"{'🚀 Полностью автоматически' if fully_auto else '🌙 Только в ночном окне'} — переключить",
+            callback_data="autoren:toggle_full"
+        )],
+        [InlineKeyboardButton(text="⚙️ Настроить условия", callback_data="autoren:settings")],
     ])
 
 
 def _status_text() -> str:
     enabled = auto_renewal.is_auto_renewal_enabled()
+    fully_auto = auto_renewal.is_fully_automatic_enabled()
     log_ok = auto_renewal.log_channel_configured()
+
+    if fully_auto:
+        window_line = "• Круглосуточно, при поступлении любого чека (полностью автоматический режим)"
+    else:
+        window_line = (
+            f"• {auto_renewal.get_setting('night_start')}–{auto_renewal.get_setting('night_end')} "
+            f"по Красноярску — сразу при поступлении чека"
+        )
 
     lines = [
         "🤖 Автопродление по чеку через Gemini",
@@ -50,13 +80,14 @@ def _status_text() -> str:
         f"Канал лога: {'✅ настроен' if log_ok else '❌ НЕ настроен (LOG_CHANNEL_ID в .env)'}",
         "",
         "Условия срабатывания:",
-        "• 22:00–06:00 по Красноярску — сразу при поступлении чека",
-        "• Заявка висит без ответа администратора > 3 часов — в любое время суток",
+        window_line,
+        f"• Заявка висит без ответа администратора > {auto_renewal.get_setting('overdue_hours')} ч. "
+        f"— в любое время суток",
         "",
         "Решение принимает не ИИ напрямую — Gemini только распознаёт сумму/дату "
-        "с чека, дальше код проверяет по правилам (сумма кратна 100₽, дата "
-        "сегодня/вчера, уверенность распознавания). Каждое автопродление "
-        "приходит сюда на проверку — можно подтвердить или отключить с откатом.",
+        "с чека, дальше код проверяет по правилам (см. «⚙️ Настроить условия»). "
+        "Каждое автопродление приходит на проверку — можно подтвердить или "
+        "отключить с откатом.",
     ]
     return "\n".join(lines)
 
@@ -91,6 +122,117 @@ async def auto_renewal_toggle(call: CallbackQuery):
     except Exception:
         pass
     await call.answer()
+
+
+@router.callback_query(F.data == "autoren:toggle_full")
+async def auto_renewal_toggle_full(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    now_full = auto_renewal.toggle_fully_automatic()
+
+    try:
+        await call.message.edit_text(_status_text(), reply_markup=auto_renewal_menu_kb())
+    except Exception:
+        pass
+    await call.answer(
+        "Теперь работает круглосуточно" if now_full else "Теперь только в ночном окне"
+    )
+
+
+# ---------------- SETTINGS SUBMENU ----------------
+
+def _settings_text() -> str:
+    lines = ["⚙️ Условия срабатывания автопродления:", ""]
+    for key, meta in auto_renewal.FIELD_META.items():
+        lines.append(f"{meta['label']}: {auto_renewal.get_setting(key)}")
+    return "\n".join(lines)
+
+
+def _settings_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"✏️ {meta['label']}", callback_data=f"autoren:edit:{key}")]
+        for key, meta in auto_renewal.FIELD_META.items()
+    ]
+    rows.append([InlineKeyboardButton(text="↩️ Сбросить по умолчанию", callback_data="autoren:reset")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="autoren:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "autoren:settings")
+async def auto_renewal_settings_menu(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+    try:
+        await call.message.edit_text(_settings_text(), reply_markup=_settings_kb())
+    except Exception:
+        await call.message.answer(_settings_text(), reply_markup=_settings_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data == "autoren:back")
+async def auto_renewal_back(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+    try:
+        await call.message.edit_text(_status_text(), reply_markup=auto_renewal_menu_kb())
+    except Exception:
+        await call.message.answer(_status_text(), reply_markup=auto_renewal_menu_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data == "autoren:reset")
+async def auto_renewal_reset(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+    auto_renewal.reset_settings_to_defaults()
+    try:
+        await call.message.edit_text(_settings_text(), reply_markup=_settings_kb())
+    except Exception:
+        pass
+    await call.answer("Условия сброшены к значениям по умолчанию")
+
+
+@router.callback_query(F.data.startswith("autoren:edit:"))
+async def auto_renewal_edit_start(call: CallbackQuery, state: FSMContext):
+    if not await admin_only(call):
+        return
+
+    key = call.data.split(":", 2)[2]
+    meta = auto_renewal.FIELD_META.get(key)
+    if not meta:
+        await call.answer("Неизвестный параметр", show_alert=True)
+        return
+
+    await state.set_state(AutoRenewalSettings.waiting_value)
+    await state.update_data(field=key)
+
+    current = auto_renewal.get_setting(key)
+    await call.message.answer(f"{meta['label']}\nТекущее значение: {current}\n\n{meta['prompt']}")
+    await call.answer()
+
+
+@router.message(AutoRenewalSettings.waiting_value)
+async def auto_renewal_edit_apply(msg: Message, state: FSMContext):
+    if not await admin_only(msg):
+        return
+
+    data = await state.get_data()
+    key = data.get("field")
+    await state.clear()
+
+    ok, error = auto_renewal.set_setting_validated(key, msg.text or "")
+
+    if not ok:
+        await msg.answer(f"❌ {error}\n\nЗначение не сохранено, попробуйте ещё раз через «⚙️ Настроить условия».", reply_markup=main_menu)
+        return
+
+    meta = auto_renewal.FIELD_META.get(key, {})
+    new_value = auto_renewal.get_setting(key)
+    await msg.answer(
+        f"✅ {meta.get('label', key)} сохранено: {new_value}",
+        reply_markup=main_menu
+    )
 
 
 # ---------------- REVIEW: confirm / disable ----------------
@@ -163,3 +305,36 @@ async def auto_renewal_review(call: CallbackQuery):
         return
 
     await call.answer("Неизвестное действие", show_alert=True)
+
+
+# ---------------- RETRY (attached to fallback cards) ----------------
+
+@router.callback_query(F.data.startswith("airretry:"))
+async def auto_renewal_retry(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    username = call.data.split(":", 1)[1]
+    user = get_user(username)
+
+    if not user or not user.get("pending_request"):
+        await call.answer("Заявка не найдена или уже обработана.", show_alert=True)
+        return
+
+    if not claim_pending_request_for_ai(username):
+        await call.answer("Уже обрабатывается — подождите немного.", show_alert=True)
+        return
+
+    await call.answer("Повторяю проверку через Gemini...")
+
+    loop = asyncio.get_event_loop()
+    approved = await loop.run_in_executor(
+        None, auto_renewal.process_pending_request_with_ai, username, "manual_retry"
+    )
+
+    note = "\n\n🔄 Повторная проверка: одобрено (см. новую карточку выше)." if approved \
+        else "\n\n🔄 Повторная проверка снова не прошла — см. новое сообщение."
+    try:
+        await call.message.edit_caption(caption=(call.message.caption or "") + note)
+    except Exception:
+        pass

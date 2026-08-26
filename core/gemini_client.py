@@ -23,7 +23,12 @@ import requests
 log = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# gemini-2.5-flash was retired (Gemini API now returns 404 for it,
+# telling callers to switch to gemini-3.6-flash). Google's flash-tier
+# models seem to get retired every few months (2.0 -> 2.5 -> 3.x already),
+# so this is deliberately read from GEMINI_MODEL first — if this breaks
+# again, set GEMINI_MODEL in .env instead of needing a code change.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # Keep this in Russian: the receipts themselves are Russian bank transfer

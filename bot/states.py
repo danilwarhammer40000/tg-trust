@@ -76,3 +76,7 @@ class AdminMessage(StatesGroup):
 
 class DBImport(StatesGroup):
     waiting = State()
+
+
+class AutoRenewalSettings(StatesGroup):
+    waiting_value = State()
