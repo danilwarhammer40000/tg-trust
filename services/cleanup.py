@@ -116,7 +116,12 @@ def run() -> bool:
             log.info("DISABLING: %s", username)
 
             mark_user_inactive(username)
-            update_user(username, status="inactive", notified_days=[])
+            # A real expiry is a clean cycle boundary -- release the
+            # auto-renewal anti-abuse lock (see core/auto_renewal.py) so
+            # the next genuine payment can be auto-renewed again instead
+            # of being forced to manual review forever after the first
+            # auto-renewal this account ever got.
+            update_user(username, status="inactive", notified_days=[], auto_renewal_applied=False)
 
             notify_user(u, ACCESS_EXPIRED_MESSAGE)
             notify_admin(f"⚠️ Пользователь {username} отключён (истёк срок).")
