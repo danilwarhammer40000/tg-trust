@@ -1,27 +1,40 @@
 """
 Owns: AutoRenewalSettings.waiting_value.
 
-Three things live in this file:
+Four things live in this file:
 1. "🤖 Автопродление" admin menu — ON/OFF toggle, "🚀 Полностью
-   автоматический режим" toggle, and "⚙️ Настроить условия" (opens the
-   trigger-tuning submenu). Turning the master toggle ON is refused if
-   LOG_CHANNEL_ID isn't configured (see core.auto_renewal.
-   log_channel_configured) — rule 4 was "everything gets logged", so the
-   feature simply can't run without somewhere to log to.
+   автоматический режим" toggle, "⚙️ Настроить условия" (opens the
+   trigger-tuning submenu), and "🔍 Диагностика" (live Bot API checks for
+   why the log channel might not be receiving posts). Turning the master
+   toggle ON is refused if LOG_CHANNEL_ID isn't configured (see
+   core.auto_renewal.log_channel_configured) — rule 4 was "everything
+   gets logged", so the feature simply can't run without somewhere to
+   log to.
 2. The settings submenu — one "✏️ field: value" row per editable trigger
    parameter (night window bounds, overdue threshold, min amount, min
-   confidence, date tolerance). Tapping one asks for a new value as plain
-   text; core.auto_renewal.set_setting_validated() does all the bounds
+   confidence). Tapping one asks for a new value as plain text;
+   core.auto_renewal.set_setting_validated() does all the bounds
    checking, this file just relays its ok/error result.
 3. aircheck:{username}:confirm / aircheck:{username}:disable — the
    post-hoc review buttons attached to every auto-renewal decision card
-   (core/auto_renewal.py's _apply_and_request_review). "Подтвердить" just
-   clears the pending review; "Отключить" disables the account AND rolls
-   the expiry/status back to what they were before the auto-renewal —
-   full undo, not just a disable. airretry:{username} (attached to
-   *fallback* cards instead) re-runs the AI pipeline on demand — useful
-   when the fallback reason was a transient problem (e.g. an outdated
-   Gemini model name) rather than a genuinely bad receipt.
+   (core/auto_renewal.py's _apply_and_request_review). "Подтвердить"
+   sends the client the SAME renewal message a manual approval would
+   (bot/handlers/receipt.py) — this is the only point the client learns
+   their subscription was renewed at all; nothing is sent earlier.
+   "Отключить" is a full undo (status AND expiry both roll back to what
+   they were before the auto-renewal, and the one-shot anti-abuse lock is
+   released so a genuine future payment can auto-renew again) — the
+   message the client gets never mentions "automatic", by the same rule.
+   airretry:{username} (attached to *fallback* cards instead) re-runs the
+   AI pipeline on demand — useful when the fallback reason was a
+   transient problem (e.g. an outdated Gemini model name) rather than a
+   genuinely bad receipt.
+
+Client-invisibility rule: nowhere in this file (or in
+bot/handlers/receipt.py / feedback.py) does any client-facing message
+mention "автоматически" / auto-renewal. As far as the client is concerned
+every renewal is "the admin checked it, eventually" — see each message's
+wording below.
 """
 import asyncio
 import logging
@@ -35,7 +48,7 @@ from bot.access import admin_only, run_sync
 from bot.keyboards import main_menu
 from bot.states import AutoRenewalSettings
 from core.db import claim_pending_request_for_ai, get_user, update_user
-from core.notify import log_to_channel, notify_user
+from core.notify import diagnose_log_channel, log_to_channel, notify_user
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -57,6 +70,7 @@ def auto_renewal_menu_kb() -> InlineKeyboardMarkup:
             callback_data="autoren:toggle_full"
         )],
         [InlineKeyboardButton(text="⚙️ Настроить условия", callback_data="autoren:settings")],
+        [InlineKeyboardButton(text="🔍 Диагностика лога", callback_data="autoren:diag")],
     ])
 
 
@@ -84,10 +98,19 @@ def _status_text() -> str:
         f"• Заявка висит без ответа администратора > {auto_renewal.get_setting('overdue_hours')} ч. "
         f"— в любое время суток",
         "",
-        "Решение принимает не ИИ напрямую — Gemini только распознаёт сумму/дату "
-        "с чека, дальше код проверяет по правилам (см. «⚙️ Настроить условия»). "
-        "Каждое автопродление приходит на проверку — можно подтвердить или "
-        "отключить с откатом.",
+        "Решение принимает не ИИ напрямую — Gemini только распознаёт сумму "
+        "с чека (дата платежа не проверяется, важна только сумма), дальше "
+        "код проверяет по правилам (см. «⚙️ Настроить условия»).",
+        "",
+        "🔒 Защита от накрутки: автопродление может применяться не более "
+        "одного раза подряд на пользователя — пока предыдущее не "
+        "подтверждено/откачено администратором или не наступил новый цикл "
+        "оплаты, повторные попытки уходят только в ручную очередь.",
+        "",
+        "Клиент не получает никаких сообщений об автопродлении — доступ "
+        "продлевается сразу, а стандартное «Ваша подписка продлена…» "
+        "уходит клиенту только после того, как администратор нажмёт "
+        "«✅ Подтвердить» на карточке проверки.",
     ]
     return "\n".join(lines)
 
@@ -146,6 +169,7 @@ def _settings_text() -> str:
     lines = ["⚙️ Условия срабатывания автопродления:", ""]
     for key, meta in auto_renewal.FIELD_META.items():
         lines.append(f"{meta['label']}: {auto_renewal.get_setting(key)}")
+    lines += ["", "Дата платежа на чеке не проверяется — важна только сумма."]
     return "\n".join(lines)
 
 
@@ -235,6 +259,81 @@ async def auto_renewal_edit_apply(msg: Message, state: FSMContext):
     )
 
 
+# ---------------- DIAGNOSTICS ----------------
+
+def _format_diag(d: dict) -> str:
+    lines = ["🔍 Диагностика лог-канала автопродления", ""]
+
+    lines.append(f"BOT_TOKEN в .env: {'✅ задан' if d['bot_token_set'] else '❌ НЕ задан'}")
+    lines.append(f"ADMIN_ID в .env: {'✅ задан' if d['admin_id_set'] else '❌ НЕ задан'}")
+    lines.append(f"LOG_CHANNEL_ID в .env: {'✅ задан (' + str(d['log_channel_id']) + ')' if d['log_channel_id_set'] else '❌ НЕ задан'}")
+    lines.append("")
+
+    if d["get_me_ok"]:
+        lines.append(f"getMe: ✅ токен рабочий, бот @{d['bot_username']} (id {d['bot_id']})")
+    else:
+        lines.append(f"getMe: ❌ {d['get_me_error']}")
+
+    if not d["log_channel_id_set"]:
+        lines.append("")
+        lines.append("Дальше проверять нечего — сначала задайте LOG_CHANNEL_ID в .env и перезапустите бота.")
+        return "\n".join(lines)
+
+    if d["get_chat_ok"]:
+        lines.append(f"getChat: ✅ канал виден, «{d['chat_title']}»")
+    else:
+        lines.append(f"getChat: ❌ {d['get_chat_error']}")
+        lines.append("   → скорее всего неверный LOG_CHANNEL_ID, либо бота там вообще нет.")
+
+    if d["member_status"] is not None:
+        status_ru = {
+            "creator": "создатель",
+            "administrator": "администратор",
+            "member": "участник",
+            "restricted": "ограничен",
+            "left": "НЕ состоит в канале",
+            "kicked": "исключён/забанен",
+        }.get(d["member_status"], d["member_status"])
+        lines.append(f"Статус бота в канале: {status_ru}")
+
+        if d["member_status"] in ("left", "kicked"):
+            lines.append("   → бот не состоит в канале (или был удалён) — добавьте его заново как администратора.")
+        elif d["can_post_messages"] is False:
+            lines.append(
+                "can_post_messages: ❌ ВЫКЛЮЧЕНО — вот и причина. Статуса «администратор» "
+                "недостаточно: зайдите в настройки канала → Администраторы → права бота → "
+                "включите «Публикация сообщений»."
+            )
+        elif d["can_post_messages"] is True:
+            lines.append("can_post_messages: ✅ включено")
+    elif d["get_member_error"]:
+        lines.append(f"getChatMember: ❌ {d['get_member_error']}")
+
+    lines.append("")
+    if d["test_send_ok"]:
+        lines.append("Тестовая отправка в канал: ✅ УСПЕШНО — лог физически работает прямо сейчас.")
+        lines.append("Если сообщения всё равно не появляются в реальных сценариях — проверьте, что "
+                      "включён сам тумблер автопродления и что канал в .env совпадает с этим же ID.")
+    else:
+        lines.append(f"Тестовая отправка в канал: ❌ {d['test_send_error']}")
+        lines.append("   → это точная причина, по которой log_to_channel() сейчас не работает.")
+
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data == "autoren:diag")
+async def auto_renewal_diag(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    await call.answer("Проверяю...")
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, diagnose_log_channel)
+
+    await call.message.answer(_format_diag(result))
+
+
 # ---------------- REVIEW: confirm / disable ----------------
 
 @router.callback_query(F.data.startswith("aircheck:"))
@@ -262,9 +361,18 @@ async def auto_renewal_review(call: CallbackQuery):
 
     if action == "confirm":
         update_user(username, pending_request=None)
+
+        # This is the ONLY message the client ever gets about this
+        # renewal — same wording as a manual approval in
+        # bot/handlers/receipt.py, sent only now (not when the renewal
+        # was actually applied). The client cannot tell this apart from
+        # an admin manually checking their receipt.
+        new_expires_at = decision.get("new_expires_at")
+        notify_user(user, f"✅ Ваша подписка продлена до {new_expires_at}. Спасибо!")
+
         log_to_channel(f"✅ Автопродление {username} подтверждено администратором.")
         try:
-            await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n✅ Подтверждено администратором.")
+            await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n✅ Подтверждено администратором, клиент уведомлён.")
         except Exception:
             pass
         await call.answer("Подтверждено")
@@ -276,24 +384,32 @@ async def auto_renewal_review(call: CallbackQuery):
 
         # Full rollback, not just a disable -- undo the auto-renewal
         # entirely: status AND expiry both go back to what they were
-        # right before Gemini's decision was applied.
+        # right before Gemini's decision was applied. Also releases the
+        # one-shot anti-abuse lock (auto_renewal_applied) -- this
+        # auto-renewal is being treated as if it never happened, so it
+        # shouldn't cost the user their next legitimate chance either.
         update_user(
             username,
             status="inactive",
             expires_at=previous_expires_at,
             pending_request=None,
+            auto_renewal_applied=False,
         )
         await run_sync()
 
+        # Generic wording, same as any other manual rejection -- never
+        # mentions "automatic" so the client learns nothing about how
+        # auto-renewal works.
         notify_user(
             user,
-            "❌ Автоматическое продление отменено администратором после проверки. "
+            "❌ Продление отменено администратором после проверки. "
             "Если это ошибка — напишите администратору."
         )
 
         log_to_channel(
             f"🚫 Автопродление {username} отклонено администратором — "
-            f"откат: статус inactive, дата вернулась на {previous_expires_at or '∞'}."
+            f"откат: статус inactive, дата вернулась на {previous_expires_at or '∞'}, "
+            f"защита от повторной накрутки снята."
         )
         try:
             await call.message.edit_caption(

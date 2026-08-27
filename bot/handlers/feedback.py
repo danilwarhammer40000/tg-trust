@@ -80,7 +80,9 @@ async def feedback_media_as_receipt(call: CallbackQuery, state: FSMContext):
     """Same handling as the general receipt flow (receipt:yes in
     handlers/receipt.py) — routes into the renewal approval queue with the
     ➕1мес/➕2мес/✍️/❌ admin buttons, unless AI auto-renewal claims it
-    first (see bot/auto_renewal_hook.py)."""
+    first (see bot/auto_renewal_hook.py). The client-facing acknowledgement
+    is identical either way -- see core/auto_renewal.py's module docstring
+    on why the client is never told about auto-renewal."""
     data = await state.get_data()
     file_id = data.get("media_file_id")
     username = data.get("media_username")
@@ -106,7 +108,7 @@ async def feedback_media_as_receipt(call: CallbackQuery, state: FSMContext):
 
     if await auto_renewal_hook.try_auto_renewal(username, file_id, is_photo):
         await call.message.answer(
-            "✅ Чек принят — доступ уже продлён автоматически, администратор проверит позже.",
+            "✅ Отправлено администратору на проверку чека.",
             reply_markup=client_menu
         )
         await call.answer()

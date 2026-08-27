@@ -11,6 +11,11 @@ question, deliberately duplicated rather than shared, since they attach to
 different states and different confirm-button callback_data. Both hook
 into the AI auto-renewal pipeline (core/auto_renewal.py) the same way —
 see receipt_yes below.
+
+Client-invisibility rule: receipt_yes's acknowledgement text is IDENTICAL
+whether auto-renewal claims the receipt or not — the client is never told
+their receipt is being (or was) handled automatically. See
+core/auto_renewal.py's module docstring for the full rationale.
 """
 import logging
 from datetime import datetime
@@ -94,8 +99,11 @@ async def receipt_yes(call: CallbackQuery, state: FSMContext):
 
     await state.clear()
 
+    # Whether or not auto-renewal actually claims this receipt, the
+    # client sees the exact same acknowledgement below — auto-renewal is
+    # purely an admin-side thing, invisible from the client's side.
     if await auto_renewal_hook.try_auto_renewal(username, file_id, is_photo):
-        await call.message.answer("✅ Чек принят — доступ уже продлён автоматически, администратор проверит позже.")
+        await call.message.answer("✅ Отправлено администратору. Ждите подтверждения.")
         await call.answer()
         return
 
@@ -210,6 +218,10 @@ async def approve_renewal(call: CallbackQuery, state: FSMContext):
         pending_request=None,
         notified_days=[],
         post_disable_notified=[],
+        # A real manual approval is exactly the "human checked it" event
+        # that resets the auto-renewal anti-abuse lock for next cycle —
+        # see core/auto_renewal.py's process pipeline.
+        auto_renewal_applied=False,
     )
 
     # Only resync + restart trusttunnel if this user was actually missing from
@@ -265,6 +277,7 @@ async def approve_renewal_manual_date(msg: Message, state: FSMContext):
         pending_request=None,
         notified_days=[],
         post_disable_notified=[],
+        auto_renewal_applied=False,
     )
 
     if was_expired_or_inactive:
