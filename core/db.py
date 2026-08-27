@@ -8,7 +8,7 @@ from typing import List, Dict, Optional
 
 from filelock import FileLock
 
-from core.dates import parse_expiry, utcnow_naive
+from core.dates import parse_expiry
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +22,14 @@ LOCK_PATH = DB_PATH + ".lock"
 # silently discards the other's change. FileLock is process-safe and already
 # a project dependency (used in core/credentials.py), so no new dependency.
 _lock = FileLock(LOCK_PATH, timeout=10)
+
+# How long an AI claim on a pending_request can sit with no recorded result
+# (ai_result) before it's treated as abandoned (the process that made the
+# claim almost certainly crashed mid-processing) and can be re-claimed by
+# someone else -- either the next trigger, or an admin's "🔄 Повторить"
+# tap. Without this, one crashed run would permanently lock a request out
+# of both auto-renewal and manual approval. See claim_pending_request_for_ai.
+AI_CLAIM_STALE_SECONDS = 5 * 60
 
 
 def _ensure():
@@ -101,15 +109,6 @@ def delete_user(username: str) -> None:
     with _lock:
         data = load()
         data = [u for u in data if u.get("username") != username]
-
-        # If the deleted user was a leader, its followers would otherwise be
-        # left with a dangling linked_to pointing at nobody. Unlink them so
-        # they become independent (keeping whatever expires_at/status they
-        # last had synced) instead of silently orphaned.
-        for u in data:
-            if u.get("linked_to") == username:
-                u["linked_to"] = None
-
         save(data)
 
 
@@ -120,182 +119,82 @@ def get_user(username: str) -> Optional[Dict]:
     return None
 
 
-# ================= LEADER / FOLLOWER LINKING =================
-#
-# A "follower" record has linked_to set to its leader's username. Its
-# expires_at/status are meant to always mirror the leader's — see
-# update_user() below, which is the single place that enforces this:
-# any change to expires_at/status is redirected to the leader (if the
-# target is a follower) and then fanned out to every follower of whoever
-# actually got updated. notified_days and telegram_id are deliberately
-# NOT synced — each linked account can still have its own Telegram and
-# its own notification history, only the actual access (expiry + active/
-# inactive) is shared.
-
-_SYNCED_FIELDS = ("expires_at", "status")
-
-
-def get_followers(username: str) -> List[Dict]:
-    return [u for u in load() if u.get("linked_to") == username]
-
-
-def get_leaders() -> List[Dict]:
-    """Every user who currently has at least one follower — used by the
-    "🔗 Сделать ведомым" reverse-direction flow to offer a picker scoped to
-    existing leaders only, instead of the full user list."""
-    data = load()
-    leader_usernames = {u.get("linked_to") for u in data if u.get("linked_to")}
-    return [u for u in data if u.get("username") in leader_usernames]
-
-
-def get_unlinked_users() -> List[Dict]:
-    """Users who are neither a leader (nobody follows them) nor a follower
-    (linked_to not set) — i.e. not part of any group yet. Used by the
-    "🔗 Сделать ведомым" flow's "показать всех свободных" fallback, for
-    when the leader you want isn't in the leaders list yet (because you're
-    starting a brand new group, not adding to an existing one)."""
-    data = load()
-    leader_usernames = {u.get("linked_to") for u in data if u.get("linked_to")}
-    return [
-        u for u in data
-        if u.get("username") not in leader_usernames
-        and not u.get("linked_to")
-    ]
-
-
-def link_user(follower_username: str, leader_username: str) -> bool:
-    """
-    Makes follower_username a follower of leader_username, immediately
-    copying the leader's current expires_at/status onto it. Returns False
-    if either username doesn't exist or they're the same user.
-    """
-    if follower_username == leader_username:
-        return False
-
+def update_user(username: str, **kwargs) -> bool:
+    """Returns True if a matching user was found and updated."""
     with _lock:
         data = load()
-        leader = next((u for u in data if u.get("username") == leader_username), None)
-        follower = next((u for u in data if u.get("username") == follower_username), None)
+        found = False
 
-        if leader is None or follower is None:
-            return False
+        for u in data:
+            if u.get("username") == username:
+                u.update(kwargs)
+                found = True
+                break
 
-        follower["linked_to"] = leader_username
-        for field in _SYNCED_FIELDS:
-            follower[field] = leader.get(field)
+        if found:
+            save(data)
+        else:
+            log.warning("update_user: no such user %r (kwargs=%r)", username, kwargs)
 
-        save(data)
-        return True
-
-
-def unlink_user(username: str) -> bool:
-    """Detaches a follower — it keeps its last-synced expires_at/status but
-    stops mirroring the (former) leader going forward."""
-    with _lock:
-        data = load()
-        target = next((u for u in data if u.get("username") == username), None)
-
-        if target is None or not target.get("linked_to"):
-            return False
-
-        target["linked_to"] = None
-        save(data)
-        return True
+        return found
 
 
-# ================= AI AUTO-RENEWAL CLAIMING =================
-#
-# Two independent triggers can try to auto-process the same pending
-# receipt: the real-time "night window" hook (bot/handlers/receipt.py,
-# feedback.py) and the periodic "3 hours overdue" checker
-# (services/auto_renewal_overdue_check.py). This is the single choke
-# point that prevents both from processing — and therefore extending —
-# the same request twice.
-
-AI_CLAIM_STALE_SECONDS = 300  # 5 minutes -- see claim_pending_request_for_ai
-
+# ================= AI AUTO-RENEWAL CLAIM =================
 
 def claim_pending_request_for_ai(username: str) -> bool:
     """
-    Atomically marks a user's pending_request as claimed for AI
-    processing. Returns True only if THIS call did the claiming (i.e. it
-    wasn't already being — or already been — processed), so the caller
-    knows it's safe to proceed with the (slow) Gemini call.
+    Atomically marks a user's pending_request as "currently being
+    processed by the AI auto-renewal pipeline", under the same FileLock as
+    every other read-modify-write here. This is the race-guard that lets
+    three independent callers (the real-time night-window trigger, the
+    periodic overdue-check timer, and an admin's "🔄 Повторить автопроверку"
+    tap) share one pending request without ever processing it twice.
 
-    Self-healing: if a previous claim is older than AI_CLAIM_STALE_SECONDS
-    and never recorded an ai_result (meaning that attempt crashed or the
-    process was killed mid-way), the claim is treated as abandoned and can
-    be re-claimed — otherwise a crash would permanently wedge that request,
-    unclaimable by anything, forever.
+    Returns False (refuses the claim) if:
+    - there's no pending_request at all, or
+    - it's already claimed AND that claim is still fresh (< AI_CLAIM_STALE_SECONDS
+      old) AND has no recorded result yet (still actively running somewhere).
+
+    A stale claim (crashed process, no result ever recorded) is silently
+    reopened rather than refused — otherwise one crash would permanently
+    lock that request out of both auto and manual approval. Claiming also
+    clears any previous ai_result/ai_decision/ai_fallback_reason from an
+    earlier attempt, since a fresh claim means we're about to (re-)decide
+    from scratch.
     """
+    now = datetime.utcnow()
     with _lock:
         data = load()
-        target = next((u for u in data if u.get("username") == username), None)
 
-        if target is None:
-            return False
+        for u in data:
+            if u.get("username") != username:
+                continue
 
-        pending = target.get("pending_request")
-        if not pending:
-            return False
-
-        claimed_at = pending.get("ai_claimed_at")
-        if claimed_at and not pending.get("ai_result"):
-            try:
-                claimed_dt = datetime.fromisoformat(claimed_at)
-                still_fresh = (utcnow_naive() - claimed_dt).total_seconds() < AI_CLAIM_STALE_SECONDS
-            except ValueError:
-                still_fresh = False  # unparseable timestamp -- treat as stale, safe to reclaim
-
-            if still_fresh:
+            pending = u.get("pending_request") or {}
+            if not pending:
                 return False
 
-        pending["ai_claimed_at"] = utcnow_naive().isoformat()
-        pending.pop("ai_result", None)  # clear any stale result from an abandoned attempt
-        save(data)
-        return True
+            claimed_at = pending.get("ai_claimed_at")
+            if claimed_at and not pending.get("ai_result"):
+                try:
+                    claimed_dt = datetime.fromisoformat(claimed_at)
+                    still_fresh = (now - claimed_dt).total_seconds() < AI_CLAIM_STALE_SECONDS
+                except ValueError:
+                    still_fresh = False
+                if still_fresh:
+                    return False
 
+            pending["ai_claimed_at"] = now.isoformat()
+            pending.pop("ai_result", None)
+            pending.pop("ai_fallback_reason", None)
+            pending.pop("ai_trigger", None)
+            pending.pop("ai_decision", None)
 
-def update_user(username: str, **kwargs) -> bool:
-    """
-    Returns True if a matching user was found and updated.
+            u["pending_request"] = pending
+            save(data)
+            return True
 
-    If kwargs touches expires_at and/or status, and `username` is itself a
-    follower (has linked_to set), the change is redirected onto the leader
-    instead — a follower's real access is never independently editable.
-    Whichever record actually ends up updated (leader or a plain
-    independent user), the same fields then get copied onto every one of
-    ITS followers, so the whole group stays in sync in one atomic write.
-    """
-    touches_sync_fields = any(f in kwargs for f in _SYNCED_FIELDS)
-
-    with _lock:
-        data = load()
-        target = next((u for u in data if u.get("username") == username), None)
-
-        if target is None:
-            log.warning("update_user: no such user %r (kwargs=%r)", username, kwargs)
-            return False
-
-        effective = target
-        if touches_sync_fields and target.get("linked_to"):
-            leader = next((u for u in data if u.get("username") == target["linked_to"]), None)
-            if leader is not None:
-                effective = leader
-            # else: dangling link (leader was deleted but this record wasn't
-            # cleaned up somehow) -- fall back to updating the record itself.
-
-        effective.update(kwargs)
-
-        if touches_sync_fields:
-            for u in data:
-                if u is not effective and u.get("linked_to") == effective.get("username"):
-                    for field in _SYNCED_FIELDS:
-                        if field in kwargs:
-                            u[field] = effective.get(field)
-
-        save(data)
-        return True
+        return False
 
 
 # ================= TELEGRAM LOOKUP =================
@@ -305,15 +204,6 @@ def get_user_by_telegram_id(tg_id: int) -> Optional[Dict]:
 
     for u in load():
         if str(u.get("telegram_id")) == tg_id:
-            return u
-    return None
-
-
-def get_user_by_max_chat_id(chat_id: int) -> Optional[Dict]:
-    chat_id = str(chat_id)
-
-    for u in load():
-        if str(u.get("max_chat_id")) == chat_id:
             return u
     return None
 

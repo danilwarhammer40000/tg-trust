@@ -3,10 +3,16 @@ Synchronous wrapper around the Gemini API's generateContent endpoint,
 used to extract structured data from a payment receipt screenshot/PDF.
 
 Deliberately does NOT ask Gemini to decide whether to auto-renew — it
-only extracts what's on the image (amount, date, who/what bank). The
-actual approve/reject decision is core/auto_renewal.py's business-rule
-logic, in plain Python, so a bad extraction or hallucination can't
-directly grant VPN access — see evaluate_receipt_extraction() there.
+only extracts what's on the image (amount, who/what bank, how confident
+it is). The actual approve/reject decision is core/auto_renewal.py's
+business-rule logic, in plain Python, so a bad extraction or
+hallucination can't directly grant VPN access — see
+evaluate_receipt_extraction() there.
+
+NOTE: the extraction schema deliberately does NOT include a payment date.
+Auto-renewal only cares how much money was transferred — see
+core/auto_renewal.py's module docstring for why the date check was
+removed.
 
 Synchronous by design (plain `requests`, no aiohttp) so this can be called
 identically from an async bot handler (via run_in_executor, same pattern
@@ -42,20 +48,19 @@ EXTRACTION_PROMPT = """\
 {
   "readable": true или false,
   "amount": число (сумма перевода в рублях) или null,
-  "payment_date": "YYYY-MM-DD" (дата совершения платежа) или null,
   "recipient_or_bank": "строка" (получатель, банк-отправитель — что видно) или null,
   "confidence": число от 0.0 до 1.0 (насколько ты уверен в извлечённых данных),
   "notes": "краткая причина по-русски, если readable=false или уверенность низкая, иначе пустая строка"
 }
 
 Правила:
+- Нас интересует ТОЛЬКО сумма перевода — дата платежа не проверяется и не важна,
+  можно её игнорировать, даже если она нечитаема или отсутствует.
 - Если это вообще не похоже на банковский чек/перевод (случайное фото, другой \
 документ, нечитаемое изображение) — readable=false, остальные поля null.
 - Никогда не выдумывай значения, которых не видишь на изображении. Если что-то \
 не видно чётко — используй null для этого поля и снижай confidence.
 - amount — только число (например 300), без символа валюты и пробелов.
-- payment_date — если год не указан на чеке явно, но дата похожа на недавнюю, \
-можно принять текущий год; если совсем не понятно — null.
 """
 
 

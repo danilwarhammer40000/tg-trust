@@ -8,7 +8,8 @@ via core.db.claim_pending_request_for_ai() first, to prevent double
 processing):
   1. Real-time, from bot/handlers/receipt.py and feedback.py, when a
      receipt arrives while auto-renewal is ON and it's currently within
-     the night window (22:00-06:00 Krasnoyarsk).
+     the night window (22:00-06:00 Krasnoyarsk) -- or any time of day at
+     all if "fully automatic" mode is on (see should_attempt_now()).
   2. services/auto_renewal_overdue_check.py's periodic timer, for any
      receipt still unprocessed by the admin 3+ hours after submission —
      independent of time of day, but still gated on the master ON/OFF
@@ -18,6 +19,15 @@ Everything here is synchronous (plain function calls, no async/await) so
 it works identically called from an aiogram handler via
 loop.run_in_executor(...) and from the standalone periodic script, which
 has no event loop at all.
+
+The client is never told, at any point, that a renewal happened
+automatically -- see bot/handlers/receipt.py / feedback.py (the
+acknowledgement text after submitting a receipt is identical whether
+auto-renewal fires or not) and bot/handlers/auto_renewal_review.py (the
+post-hoc confirm/disable messages use the same wording as a manual
+approval/rejection). As far as the client can tell, every renewal is
+"the admin checked it" -- auto-renewal is purely an admin-side
+convenience.
 """
 import json
 import logging
@@ -25,9 +35,9 @@ import os
 from datetime import datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 
-from core.dates import calc_new_expiry_months, is_expired, parse_expiry, utcnow_naive
+from core.dates import calc_new_expiry_months, is_expired, utcnow_naive
 from core.db import get_user, update_user
-from core.notify import get_file_bytes, log_to_channel, notify_admin, notify_user, send_photo_by_file_id
+from core.notify import get_file_bytes, log_to_channel, notify_admin, send_photo_by_file_id
 from core.paths import AUTO_RENEWAL_SETTINGS_PATH
 from core.service import safe_sync
 
@@ -43,12 +53,15 @@ DEFAULT_SETTINGS = {
     "overdue_hours": 3,
     "min_amount": 100,
     "min_confidence": 0.75,
-    "date_tolerance_days": 1,   # accept "today" or N days back (Krasnoyarsk-local)
 }
 
 # Human-readable metadata for the bot's "⚙️ Настроить условия" screen — one
 # place that both the settings menu and the input-validation logic below
 # read from, so a new field only needs to be added here once.
+#
+# NOTE: there is deliberately no date-related field here. Auto-renewal only
+# ever needs to know how much money came in -- it does not check the date
+# printed on the receipt at all (see evaluate_receipt_extraction below).
 FIELD_META = {
     "night_start": {
         "label": "🌙 Начало ночного окна",
@@ -69,10 +82,6 @@ FIELD_META = {
     "min_confidence": {
         "label": "🎯 Мин. уверенность Gemini",
         "prompt": "Минимальная уверенность распознавания чека, от 0 до 1 (например 0.75):",
-    },
-    "date_tolerance_days": {
-        "label": "📅 Допуск по дате платежа (дней назад)",
-        "prompt": "На сколько дней назад от сегодня (по Красноярску) допускается дата платежа на чеке? 0 = только сегодня, 1 = сегодня или вчера:",
     },
 }
 
@@ -151,7 +160,7 @@ def set_setting_validated(key: str, raw_value: str):
     Returns (ok: bool, error_message_or_none: str) — used by
     bot/handlers/auto_renewal_review.py so the bot can show a specific
     "что не так" message instead of silently accepting garbage. This is
-    the one place all five editable fields get bounds-checked, since a bad
+    the one place all editable fields get bounds-checked, since a bad
     value here (e.g. confidence > 1, negative hours) could otherwise let
     the wrong receipts through automatically.
     """
@@ -187,14 +196,6 @@ def set_setting_validated(key: str, raw_value: str):
                 raise ValueError
         except ValueError:
             return False, "Введите число от 0 до 1, например 0.75"
-
-    elif key == "date_tolerance_days":
-        try:
-            value = int(raw_value)
-            if value < 0:
-                raise ValueError
-        except ValueError:
-            return False, "Введите целое число ≥ 0, например 1"
 
     else:
         return False, f"Неизвестный параметр: {key}"
@@ -280,10 +281,19 @@ def evaluate_receipt_extraction(extraction: dict):
     of these checks and falls back to the normal manual queue instead of
     granting access. Thresholds are all admin-editable (see
     set_setting_validated / bot/handlers/auto_renewal_review.py).
+
+    By design this only cares about how much money came in (and how
+    confidently that amount was read) -- it deliberately does NOT check
+    the date printed on the receipt. A screenshot of an old payment still
+    represents real money that was transferred, and requiring "today or
+    yesterday" caused legitimate receipts to bounce to manual review for
+    no reason other than a delay in sending it. The one-shot anti-abuse
+    lock below (see process_pending_request_with_ai / auto_renewal_applied)
+    is what actually prevents the same receipt being replayed for repeat
+    auto-renewals, not the date.
     """
     min_amount = get_setting("min_amount")
     min_confidence = get_setting("min_confidence")
-    date_tolerance_days = get_setting("date_tolerance_days")
 
     if not isinstance(extraction, dict) or not extraction.get("readable"):
         notes = (extraction or {}).get("notes") if isinstance(extraction, dict) else None
@@ -296,15 +306,6 @@ def evaluate_receipt_extraction(extraction: dict):
     amount = extraction.get("amount")
     if not isinstance(amount, (int, float)) or amount < min_amount or amount % min_amount != 0:
         return False, 0, f"Сумма не кратна {min_amount}₽ или не распознана: {amount!r}"
-
-    payment_date = parse_expiry(extraction.get("payment_date") or "")
-    if payment_date is None:
-        return False, 0, f"Не удалось определить дату платежа: {extraction.get('payment_date')!r}"
-
-    today_kra = krasnoyarsk_now().date()
-    delta_days = (today_kra - payment_date.date()).days
-    if delta_days < 0 or delta_days > date_tolerance_days:
-        return False, 0, f"Дата платежа не сегодня/вчера (Красноярск): {payment_date.date()}"
 
     months = int(amount) // min_amount
     return True, months, "OK"
@@ -360,6 +361,11 @@ def _log_or_warn(caption: str, file_id: str = None, is_photo: bool = True) -> No
     the single most common cause) failed completely silently: the admin
     would keep getting the normal Telegram notifications and never notice
     the audit trail simply wasn't being written anywhere.
+
+    See also core.notify.diagnose_log_channel() / the "🔍 Диагностика"
+    button in the "🤖 Автопродление" menu — that runs live Bot API checks
+    (getMe / getChat / getChatMember / a real test send) and reports back
+    Telegram's own error text instead of this function's best guess.
     """
     ok = log_to_channel(caption, file_id=file_id, is_photo=is_photo)
     if not ok and log_channel_configured():
@@ -370,18 +376,19 @@ def _log_or_warn(caption: str, file_id: str = None, is_photo: bool = True) -> No
             "право «Публикация сообщений» — зайдите в настройки канала → "
             "Администраторы → права бота, и включите его.\n"
             "Также проверьте, что LOG_CHANNEL_ID в .env указан верно "
-            "(для приватных каналов обычно начинается с -100)."
+            "(для приватных каналов обычно начинается с -100).\n\n"
+            "Точную причину можно посмотреть в «🤖 Автопродление» → «🔍 Диагностика»."
         )
 
 
 def process_pending_request_with_ai(username: str, trigger: str) -> bool:
     """
     MUST be called only after core.db.claim_pending_request_for_ai(username)
-    returned True. Returns True if auto-approved (client already notified,
-    access already extended, admin sent a review card) — False if it fell
-    back to the normal manual queue (the fallback card itself already has
-    the usual ➕1мес/➕2мес/✍️/❌ buttons attached, plus a 🔄 retry button —
-    see _fallback_to_manual).
+    returned True. Returns True if auto-approved (client's access already
+    extended, admin sent a review card) — False if it fell back to the
+    normal manual queue (the fallback card itself already has the usual
+    ➕1мес/➕2мес/✍️/❌ buttons attached, plus a 🔄 retry button — see
+    _fallback_to_manual).
     """
     try:
         return _process_pending_request_with_ai_inner(username, trigger)
@@ -397,6 +404,29 @@ def _process_pending_request_with_ai_inner(username: str, trigger: str) -> bool:
 
     user = get_user(username)
     if not user:
+        return False
+
+    # ---- anti-abuse: auto-renewal can apply at most once per cycle ----
+    # Without this, a client could resubmit the same (or a slightly
+    # doctored) receipt repeatedly and have auto-renewal extend their
+    # access again and again, unattended, purely because it happened to
+    # land in the night window / stayed unanswered long enough each time.
+    # The flag is set the moment auto-renewal actually applies a renewal
+    # (see _apply_and_request_review) and only cleared again by a REAL
+    # human check: an admin manually approving/extending the account
+    # (bot/handlers/receipt.py, extend.py), an admin rolling back a wrong
+    # auto-renewal ("🚫 Отключить"), or the account naturally running out
+    # and being disabled by services/cleanup.py (a fresh cycle starts next
+    # time they actually pay). Every other attempt in between falls
+    # straight to manual review, no Gemini call spent on it.
+    if user.get("auto_renewal_applied"):
+        _fallback_to_manual(
+            username,
+            "Автопродление уже было применено для этого пользователя и ждёт/дождалось "
+            "проверки администратором — повторное автопродление заблокировано "
+            "(защита от накрутки). Нужна ручная проверка.",
+            trigger,
+        )
         return False
 
     pending = user.get("pending_request") or {}
@@ -481,6 +511,17 @@ def _fallback_to_manual(username, reason, trigger, file_id=None, is_photo=True, 
 
 
 def _apply_and_request_review(username, months, extraction, trigger, file_id=None, is_photo=True):
+    """
+    Applies the renewal immediately (access works right away) and sends
+    the admin a post-hoc review card. Deliberately does NOT notify the
+    client here — the client should not learn anything happened until the
+    admin actually confirms it (see aircheck:confirm in
+    bot/handlers/auto_renewal_review.py, which sends the same "Ваша
+    подписка продлена..." text a manual approval would). This keeps
+    auto-renewal completely invisible to the client: from their side,
+    every renewal looks exactly like an admin checked their receipt and
+    approved it, whenever that actually happens.
+    """
     user = get_user(username)
     previous_expires_at = user.get("expires_at")
     previous_status = user.get("status")
@@ -507,12 +548,11 @@ def _apply_and_request_review(username, months, extraction, trigger, file_id=Non
         notified_days=[],
         post_disable_notified=[],
         pending_request=pending,
+        auto_renewal_applied=True,  # one-shot anti-abuse lock, see _process_pending_request_with_ai_inner
     )
 
     if was_expired_or_inactive:
         safe_sync()
-
-    notify_user(user, f"✅ Ваша подписка продлена до {new_expires_at}. Спасибо!")
 
     amount = extraction.get("amount")
     confidence = extraction.get("confidence")
@@ -522,7 +562,9 @@ def _apply_and_request_review(username, months, extraction, trigger, file_id=Non
         f"💰 Сумма по чеку: {amount}₽ → {months} мес.\n"
         f"📅 {previous_expires_at or '∞'} → {new_expires_at}\n"
         f"🎯 Уверенность распознавания: {confidence}\n\n"
-        f"Проверьте чек и подтвердите, либо отключите с откатом даты:"
+        f"Клиенту пока ничего не отправлено — сообщение о продлении уйдёт "
+        f"только после «✅ Подтвердить». Проверьте чек и подтвердите, "
+        f"либо отключите с откатом даты:"
     )
 
     review_kb = {

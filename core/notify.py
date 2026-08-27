@@ -18,6 +18,7 @@ DOCUMENT_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument" if BO
 PHOTO_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto" if BOT_TOKEN else None
 GET_FILE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile" if BOT_TOKEN else None
 FILE_DOWNLOAD_BASE = f"https://api.telegram.org/file/bot{BOT_TOKEN}" if BOT_TOKEN else None
+BOT_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 
 # Optional channel the bot posts an audit trail to: every receipt
 # submission (with the file) and every auto-renewal decision (automatic
@@ -226,6 +227,119 @@ def notify_user(user: dict, text: str) -> None:
     max_chat_id = user.get("max_chat_id")
     if max_chat_id:
         send_max_message(max_chat_id, text)
+
+
+# ---------------- DIAGNOSTICS ----------------
+
+def diagnose_log_channel() -> dict:
+    """
+    Runs LIVE checks against the real Telegram Bot API to explain exactly
+    why log_to_channel() might be failing — used by the "🔍 Диагностика"
+    button in the "🤖 Автопродление" menu
+    (bot/handlers/auto_renewal_review.py). Unlike _log_or_warn()'s guess
+    in core/auto_renewal.py, every field here is either a real fact read
+    straight from .env, or Telegram's own error text from an actual API
+    call made just now — never a guess.
+
+    Checks, in order (each one only runs if the previous prerequisite is
+    present, so a missing token doesn't produce five confusing errors):
+      1. Is BOT_TOKEN / ADMIN_ID / LOG_CHANNEL_ID even set in .env?
+      2. getMe — is the token itself valid, and what's the bot's own id?
+      3. getChat — can the bot see the log channel at all (wrong ID /
+         bot never added to the channel both show up here)?
+      4. getChatMember — what's the bot's actual status in the channel,
+         and does it have can_post_messages? ("Administrator" status
+         alone is NOT enough — that's the single most common cause of
+         "everything looks configured but nothing gets logged".)
+      5. A real sendMessage test post to the channel — the only 100%
+         certain answer, since 2-4 can theoretically pass and posting
+         can still fail for a reason not covered above.
+    """
+    result = {
+        "bot_token_set": bool(BOT_TOKEN),
+        "admin_id_set": bool(ADMIN_ID),
+        "log_channel_id_set": bool(LOG_CHANNEL_ID),
+        "log_channel_id": LOG_CHANNEL_ID,
+        "get_me_ok": False,
+        "bot_id": None,
+        "bot_username": None,
+        "get_me_error": None,
+        "get_chat_ok": False,
+        "chat_title": None,
+        "get_chat_error": None,
+        "member_status": None,
+        "can_post_messages": None,
+        "get_member_error": None,
+        "test_send_ok": False,
+        "test_send_error": None,
+    }
+
+    if not BOT_TOKEN:
+        result["get_me_error"] = "BOT_TOKEN не задан в .env"
+        return result
+
+    try:
+        r = requests.get(f"{BOT_API_BASE}/getMe", timeout=10)
+        data = r.json()
+        if data.get("ok"):
+            result["get_me_ok"] = True
+            result["bot_id"] = data["result"]["id"]
+            result["bot_username"] = data["result"].get("username")
+        else:
+            result["get_me_error"] = data.get("description") or f"HTTP {r.status_code}"
+    except (requests.RequestException, ValueError) as e:
+        result["get_me_error"] = str(e)
+
+    if not LOG_CHANNEL_ID:
+        return result
+
+    try:
+        r = requests.get(f"{BOT_API_BASE}/getChat", params={"chat_id": LOG_CHANNEL_ID}, timeout=10)
+        data = r.json()
+        if data.get("ok"):
+            result["get_chat_ok"] = True
+            result["chat_title"] = data["result"].get("title") or data["result"].get("username")
+        else:
+            result["get_chat_error"] = data.get("description") or f"HTTP {r.status_code}"
+    except (requests.RequestException, ValueError) as e:
+        result["get_chat_error"] = str(e)
+
+    if result["bot_id"]:
+        try:
+            r = requests.get(
+                f"{BOT_API_BASE}/getChatMember",
+                params={"chat_id": LOG_CHANNEL_ID, "user_id": result["bot_id"]},
+                timeout=10,
+            )
+            data = r.json()
+            if data.get("ok"):
+                member = data["result"]
+                status = member.get("status")
+                result["member_status"] = status
+                result["can_post_messages"] = member.get("can_post_messages", status == "creator")
+            else:
+                result["get_member_error"] = data.get("description") or f"HTTP {r.status_code}"
+        except (requests.RequestException, ValueError) as e:
+            result["get_member_error"] = str(e)
+
+    try:
+        r = requests.post(
+            f"{BOT_API_BASE}/sendMessage",
+            json={
+                "chat_id": LOG_CHANNEL_ID,
+                "text": "🔧 Тестовое сообщение диагностики автопродления — можно игнорировать.",
+            },
+            timeout=10,
+        )
+        data = r.json()
+        if data.get("ok"):
+            result["test_send_ok"] = True
+        else:
+            result["test_send_error"] = data.get("description") or f"HTTP {r.status_code}"
+    except (requests.RequestException, ValueError) as e:
+        result["test_send_error"] = str(e)
+
+    return result
 
 
 # ---------------- MAX ----------------
