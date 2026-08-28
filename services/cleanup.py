@@ -121,7 +121,17 @@ def run() -> bool:
             # the next genuine payment can be auto-renewed again instead
             # of being forced to manual review forever after the first
             # auto-renewal this account ever got.
-            update_user(username, status="inactive", notified_days=[], auto_renewal_applied=False)
+            #
+            # Split into two calls: core.db.update_user() redirects
+            # status onto the leader (and fans out to the group) whenever
+            # it's in the kwargs -- bundling notified_days/
+            # auto_renewal_applied into that same call would misroute
+            # them onto the leader for a follower account instead of
+            # staying on `username` itself. (status="inactive" here is
+            # redundant with mark_user_inactive() above but harmless --
+            # kept explicit rather than assuming that function's internals.)
+            update_user(username, status="inactive")
+            update_user(username, notified_days=[], auto_renewal_applied=False, auto_renewal_applied_at=None)
 
             notify_user(u, ACCESS_EXPIRED_MESSAGE)
             notify_admin(f"⚠️ Пользователь {username} отключён (истёк срок).")
