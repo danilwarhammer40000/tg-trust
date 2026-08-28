@@ -41,21 +41,29 @@ async def extend_handler(call: CallbackQuery, state: FSMContext):
     # Every branch below is a real, admin-verified renewal -- this is
     # exactly the kind of human check that resets the auto-renewal
     # anti-abuse lock (auto_renewal_applied) for the next cycle, see
-    # core/auto_renewal.py.
+    # core/auto_renewal.py. Each branch is TWO update_user() calls, not
+    # one: core.db.update_user() redirects expires_at/status onto the
+    # leader (and fans out to the group) whenever they're in the kwargs —
+    # bundling notified_days/auto_renewal_applied into that same call
+    # would misroute them onto the leader for a follower account instead
+    # of staying on `username` itself.
     if mode == "0":
-        update_user(username, expires_at=None, status="active", notified_days=[], post_disable_notified=[], auto_renewal_applied=False)
+        update_user(username, expires_at=None, status="active")
+        update_user(username, notified_days=[], post_disable_notified=[], auto_renewal_applied=False, auto_renewal_applied_at=None)
         new_expires_at = None
 
     elif mode == "3":
         new_expires_at = calc_new_expiry(user.get("expires_at"), 3)
-        update_user(username, expires_at=new_expires_at, status="active", notified_days=[], post_disable_notified=[], auto_renewal_applied=False)
+        update_user(username, expires_at=new_expires_at, status="active")
+        update_user(username, notified_days=[], post_disable_notified=[], auto_renewal_applied=False, auto_renewal_applied_at=None)
 
     elif mode == "30":
         # "1 месяц" must be a calendar month (same day next month), not a
         # flat +30 days — otherwise short months quietly shift the renewal
         # date earlier every cycle.
         new_expires_at = calc_new_expiry_months(user.get("expires_at"), 1)
-        update_user(username, expires_at=new_expires_at, status="active", notified_days=[], post_disable_notified=[], auto_renewal_applied=False)
+        update_user(username, expires_at=new_expires_at, status="active")
+        update_user(username, notified_days=[], post_disable_notified=[], auto_renewal_applied=False, auto_renewal_applied_at=None)
 
     elif mode == "manual":
         await state.set_state(ExtendUser.manual)
@@ -101,13 +109,13 @@ async def manual_date(msg: Message, state: FSMContext):
     was_expired_or_inactive = user.get("status") != "active" or is_expired(user.get("expires_at"))
     new_expires_at = msg.text.strip()
 
+    update_user(username, expires_at=new_expires_at, status="active")
     update_user(
         username,
-        expires_at=new_expires_at,
-        status="active",
         notified_days=[],
         post_disable_notified=[],
         auto_renewal_applied=False,
+        auto_renewal_applied_at=None,
     )
 
     if was_expired_or_inactive:

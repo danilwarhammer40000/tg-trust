@@ -102,15 +102,18 @@ def _status_text() -> str:
         "с чека (дата платежа не проверяется, важна только сумма), дальше "
         "код проверяет по правилам (см. «⚙️ Настроить условия»).",
         "",
-        "🔒 Защита от накрутки: автопродление может применяться не более "
-        "одного раза подряд на пользователя — пока предыдущее не "
-        "подтверждено/откачено администратором или не наступил новый цикл "
-        "оплаты, повторные попытки уходят только в ручную очередь.",
+        f"🔒 Защита от накрутки: после одного автопродления следующее для "
+        f"того же пользователя блокируется на {auto_renewal.get_setting('abuse_lock_days')} дн. "
+        f"(настраивается). Первая заявка — автоматически, все последующие "
+        f"в этот период — только вручную, с отдельной пометкой "
+        f"«🚨 ЗАЩИТА ОТ НАКРУТКИ» в карточке админу. Снимается раньше срока "
+        f"вручную (любое ручное продление или «🚫 Отключить»), либо само "
+        f"по истечении срока.",
         "",
-        "Клиент не получает никаких сообщений об автопродлении — доступ "
-        "продлевается сразу, а стандартное «Ваша подписка продлена…» "
-        "уходит клиенту только после того, как администратор нажмёт "
-        "«✅ Подтвердить» на карточке проверки.",
+        "Клиент уведомляется о продлении сразу же, тем же текстом, что и "
+        "при ручном одобрении — про автопродление он не узнаёт ничего. "
+        "Единственный случай полной тишины для клиента — срабатывание "
+        "защиты от накрутки: заявка уходит только администратору.",
     ]
     return "\n".join(lines)
 
@@ -362,17 +365,12 @@ async def auto_renewal_review(call: CallbackQuery):
     if action == "confirm":
         update_user(username, pending_request=None)
 
-        # This is the ONLY message the client ever gets about this
-        # renewal — same wording as a manual approval in
-        # bot/handlers/receipt.py, sent only now (not when the renewal
-        # was actually applied). The client cannot tell this apart from
-        # an admin manually checking their receipt.
-        new_expires_at = decision.get("new_expires_at")
-        notify_user(user, f"✅ Ваша подписка продлена до {new_expires_at}. Спасибо!")
-
-        log_to_channel(f"✅ Автопродление {username} подтверждено администратором.")
+        # Client was already notified the moment auto-renewal applied
+        # (see core/auto_renewal.py's _apply_and_request_review) --
+        # "Подтвердить" just closes this review card, nothing more to send.
+        log_to_channel(f"✅ Автопродление {username} подтверждено администратором (доп. действий не требуется).")
         try:
-            await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n✅ Подтверждено администратором, клиент уведомлён.")
+            await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n✅ Подтверждено администратором.")
         except Exception:
             pass
         await call.answer("Подтверждено")
@@ -385,21 +383,23 @@ async def auto_renewal_review(call: CallbackQuery):
         # Full rollback, not just a disable -- undo the auto-renewal
         # entirely: status AND expiry both go back to what they were
         # right before Gemini's decision was applied. Also releases the
-        # one-shot anti-abuse lock (auto_renewal_applied) -- this
+        # anti-abuse lock (auto_renewal_applied/_at) early -- this
         # auto-renewal is being treated as if it never happened, so it
         # shouldn't cost the user their next legitimate chance either.
-        update_user(
-            username,
-            status="inactive",
-            expires_at=previous_expires_at,
-            pending_request=None,
-            auto_renewal_applied=False,
-        )
+        # Split into two calls -- core.db.update_user() redirects
+        # expires_at/status onto the leader (and fans out to the group)
+        # whenever they're in the kwargs; bundling pending_request/
+        # auto_renewal_applied into that same call would misroute them
+        # onto the leader for a follower account instead of staying on
+        # `username` itself.
+        update_user(username, status="inactive", expires_at=previous_expires_at)
+        update_user(username, pending_request=None, auto_renewal_applied=False, auto_renewal_applied_at=None)
         await run_sync()
 
-        # Generic wording, same as any other manual rejection -- never
-        # mentions "automatic" so the client learns nothing about how
-        # auto-renewal works.
+        # The client was already told "продлено" -- now they need to be
+        # told it's off again. Generic wording, same as any other manual
+        # rejection: never mentions "automatic" so the client learns
+        # nothing about how auto-renewal works.
         notify_user(
             user,
             "❌ Продление отменено администратором после проверки. "
@@ -413,7 +413,7 @@ async def auto_renewal_review(call: CallbackQuery):
         )
         try:
             await call.message.edit_caption(
-                caption=(call.message.caption or "") + "\n\n🚫 Отклонено, доступ отключён, дата откачена."
+                caption=(call.message.caption or "") + "\n\n🚫 Отклонено, доступ отключён, дата откачена, клиент уведомлён."
             )
         except Exception:
             pass

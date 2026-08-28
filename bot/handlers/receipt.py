@@ -211,10 +211,13 @@ async def approve_renewal(call: CallbackQuery, state: FSMContext):
     was_expired_or_inactive = user.get("status") != "active" or is_expired(user.get("expires_at"))
     new_expires = calc_new_expiry_months(user.get("expires_at"), months)
 
+    # Split into two calls -- see core/auto_renewal.py's
+    # _apply_and_request_review for why (core.db.update_user() redirects
+    # expires_at/status to the leader for a follower account; bundling
+    # non-sync fields into the same call would misroute them).
+    update_user(username, expires_at=new_expires, status="active")
     update_user(
         username,
-        expires_at=new_expires,
-        status="active",
         pending_request=None,
         notified_days=[],
         post_disable_notified=[],
@@ -222,6 +225,7 @@ async def approve_renewal(call: CallbackQuery, state: FSMContext):
         # that resets the auto-renewal anti-abuse lock for next cycle —
         # see core/auto_renewal.py's process pipeline.
         auto_renewal_applied=False,
+        auto_renewal_applied_at=None,
     )
 
     # Only resync + restart trusttunnel if this user was actually missing from
@@ -270,14 +274,14 @@ async def approve_renewal_manual_date(msg: Message, state: FSMContext):
 
     was_expired_or_inactive = user.get("status") != "active" or is_expired(user.get("expires_at"))
 
+    update_user(username, expires_at=new_expires, status="active")
     update_user(
         username,
-        expires_at=new_expires,
-        status="active",
         pending_request=None,
         notified_days=[],
         post_disable_notified=[],
         auto_renewal_applied=False,
+        auto_renewal_applied_at=None,
     )
 
     if was_expired_or_inactive:
