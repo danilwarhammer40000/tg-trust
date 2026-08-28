@@ -16,23 +16,47 @@ import core.auto_renewal as auto_renewal
 from core.db import claim_pending_request_for_ai
 
 
-async def try_auto_renewal(username: str, file_id: str, is_photo: bool) -> bool:
+async def try_auto_renewal(username: str, file_id: str, is_photo: bool) -> str:
     """
-    Returns True if auto-renewal actually applied (caller should skip
-    sending the normal manual-approval notification) — False if
-    auto-renewal isn't applicable right now, or it was attempted and fell
-    back to manual (in the fallback case, the normal manual notification
-    with ➕1мес/➕2мес/✍️/❌ buttons still needs to go out, exactly as if
-    auto-renewal didn't exist).
+    Returns one of three strings:
+
+    - "approved" — auto-renewal applied. The client was ALREADY notified
+      synchronously inside this call (the standard renewal text, sent
+      immediately — see core/auto_renewal.py's _apply_and_request_review).
+      The caller must NOT send any further message to either the client
+      or the admin — the admin already got their review card too.
+
+    - "fallback" — auto-renewal was attempted (claimed the request,
+      called Gemini or hit the anti-abuse lock) but did not apply. The
+      admin was ALREADY sent a card by the pipeline itself
+      (core/auto_renewal.py's _fallback_to_manual, or the crash-handler
+      path in process_pending_request_with_ai) — the caller must NOT send
+      a second admin card for the same receipt (that used to happen —
+      one plain card from the caller and one fallback/anti-abuse card
+      from the pipeline, both for the same submission). The caller
+      SHOULD still send the client the normal "Отправлено
+      администратору. Ждите подтверждения." acknowledgement, exactly as
+      if auto-renewal didn't exist — the client hasn't heard anything
+      about their receipt yet.
+
+    - "skipped" — auto-renewal isn't applicable at all right now (master
+      toggle off, not in the trigger window, or the request is already
+      claimed by something else). Nobody has been notified about
+      anything — the caller must run the FULL normal manual-approval flow
+      (send the admin a card AND acknowledge the client), same as if
+      auto-renewal didn't exist.
     """
     if not auto_renewal.should_attempt_now():
-        return False
+        return "skipped"
 
     if not claim_pending_request_for_ai(username):
         # Already being processed by something else (shouldn't normally
         # happen at submission time, but the overdue checker runs on its
         # own schedule) -- fall through to the normal manual path.
-        return False
+        return "skipped"
 
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, auto_renewal.process_pending_request_with_ai, username, "night_window")
+    approved = await loop.run_in_executor(
+        None, auto_renewal.process_pending_request_with_ai, username, "night_window"
+    )
+    return "approved" if approved else "fallback"
