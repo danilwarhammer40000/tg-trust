@@ -21,25 +21,28 @@ loop.run_in_executor(...) and from the standalone periodic script, which
 has no event loop at all.
 
 The client is never told THAT a renewal happened automatically -- see
-bot/handlers/receipt.py / feedback.py (the acknowledgement text after
-submitting a receipt is identical whether auto-renewal fires or not) and
-bot/handlers/auto_renewal_review.py (the disable/rollback message uses
-generic wording, never the word "automatic"). What the client DOES get,
-the moment auto-renewal actually approves their receipt, is the exact
-same "✅ Ваша подписка продлена..." text a manual approval sends -- no
-delay, no different timing (see _apply_and_request_review). The one case
-where the client gets nothing at all is the anti-abuse fallback (see
-AUTO_RENEWAL_LOCK_DAYS below): a blocked repeat attempt stays silent
-towards the client and goes to the admin only, as a clearly marked
-warning card.
+bot/handlers/receipt.py / feedback.py and bot/handlers/auto_renewal_review.py
+(the disable/rollback message uses generic wording, never the word
+"automatic"). What the client DOES get, the moment auto-renewal actually
+approves their receipt, is the exact same "✅ Ваша подписка продлена..."
+text a manual approval sends -- no delay, no different timing (see
+_apply_and_request_review). In every other case -- auto-renewal wasn't
+applicable, or it was attempted and fell back to manual for any reason
+including the anti-abuse lock below -- the client gets the normal
+"Отправлено администратору. Ждите подтверждения." acknowledgement, same
+as if auto-renewal didn't exist (see bot/auto_renewal_hook.py's
+try_auto_renewal for the exact dispatch). The client is never left with
+literal silence.
 
 Anti-abuse: auto-renewal may apply at most once per AUTO_RENEWAL_LOCK_DAYS
 per user (see _is_locked / process_pending_request_with_ai). The first
 receipt in that window is handled automatically; every next one during
 the lock falls straight to manual review with a "possible replay/abuse"
-warning card. The lock also clears early the moment a human actually
-verifies the account (any manual admin approval/extension, or a rollback
-via "🚫 Отключить"), and clears itself automatically once
+warning card for the admin (the client-facing side is unaffected -- they
+just get the normal acknowledgement above, nothing that hints at why).
+The lock also clears early the moment a human actually verifies the
+account (any manual admin approval/extension, or a rollback via
+"🚫 Отключить"), and clears itself automatically once
 AUTO_RENEWAL_LOCK_DAYS have passed since the last auto-renewal, even if
 no admin touched it.
 """
@@ -481,15 +484,13 @@ def _process_pending_request_with_ai_inner(username: str, trigger: str) -> bool:
     # on it. See _is_locked() for exactly when this clears.
     locked, unlock_date = _is_locked(user)
     if locked:
-        unlock_line = f" (снимется {unlock_date})" if unlock_date else ""
         _fallback_to_manual(
             username,
-            "Автопродление для этого пользователя уже было применено недавно и "
-            f"повторно сработать не может{unlock_line} — похоже на попытку "
-            "повторно использовать чек ради ещё одного автопродления. "
-            "Нужна ручная проверка.",
+            "Защита от накрутки: автопродление уже применялось этому "
+            "пользователю недавно, повторно сработать не могло.",
             trigger,
             anti_abuse=True,
+            unlock_date=unlock_date,
         )
         return False
 
@@ -538,7 +539,7 @@ def _fallback_admin_kb(username: str) -> dict:
     }
 
 
-def _fallback_to_manual(username, reason, trigger, file_id=None, is_photo=True, extraction=None, anti_abuse=False):
+def _fallback_to_manual(username, reason, trigger, file_id=None, is_photo=True, extraction=None, anti_abuse=False, unlock_date=None):
     user = get_user(username)
     pending = (user or {}).get("pending_request") or {}
     pending["ai_result"] = "fallback"
@@ -556,17 +557,16 @@ def _fallback_to_manual(username, reason, trigger, file_id=None, is_photo=True, 
         # Deliberately a different, louder header than the generic
         # fallback below -- this is not "Gemini couldn't read it", it's
         # "someone may be trying to replay a receipt for a second
-        # auto-renewal". Client gets nothing at all for this case (see
-        # module docstring) -- only the admin sees this card.
+        # auto-renewal". The client is NOT told any of this -- they just
+        # get the normal "Отправлено администратору. Ждите
+        # подтверждения." acknowledgement (see bot/handlers/receipt.py /
+        # feedback.py) -- only the admin sees this card.
+        unlock_line = f" (снимется {unlock_date})" if unlock_date else ""
         caption = (
             f"🚨 ЗАЩИТА ОТ НАКРУТКИ ({_trigger_label(trigger)})\n"
             f"👤 {username}\n"
-            f"Автопродление уже применялось недавно этому пользователю — "
-            f"повторное сработать не могло.\n"
-            f"{reason}\n\n"
-            f"Клиенту ничего не отправлено. Проверьте чек внимательно "
-            f"(возможен повтор/подделка) — одобрить вручную, повторить "
-            f"автопроверку позже или отклонить:"
+            f"Попытка повторного автопродления, сработала защита{unlock_line}\n"
+            f"Чек на проверку, пожалуйста, обработайте заявку вручную."
         )
     else:
         caption = (
