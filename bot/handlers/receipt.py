@@ -12,10 +12,14 @@ different states and different confirm-button callback_data. Both hook
 into the AI auto-renewal pipeline (core/auto_renewal.py) the same way —
 see receipt_yes below.
 
-Client-invisibility rule: receipt_yes's acknowledgement text is IDENTICAL
-whether auto-renewal claims the receipt or not — the client is never told
-their receipt is being (or was) handled automatically. See
-core/auto_renewal.py's module docstring for the full rationale.
+Client-facing behaviour: if auto-renewal actually applies, the client
+gets the standard renewal text immediately (sent from inside
+core/auto_renewal.py, not from here) and nothing else. Otherwise — auto-
+renewal wasn't applicable, or was attempted and fell back to manual — the
+client gets the normal "Отправлено администратору. Ждите подтверждения."
+acknowledgement, same as if auto-renewal didn't exist. See
+bot/auto_renewal_hook.py's try_auto_renewal() docstring for the exact
+three-way outcome this dispatches on.
 """
 import logging
 from datetime import datetime
@@ -99,10 +103,19 @@ async def receipt_yes(call: CallbackQuery, state: FSMContext):
 
     await state.clear()
 
-    # Whether or not auto-renewal actually claims this receipt, the
-    # client sees the exact same acknowledgement below — auto-renewal is
-    # purely an admin-side thing, invisible from the client's side.
-    if await auto_renewal_hook.try_auto_renewal(username, file_id, is_photo):
+    # Three possible outcomes -- see bot/auto_renewal_hook.py's docstring:
+    #   "approved" -> client already notified, admin already has a card. Do nothing more.
+    #   "fallback" -> admin already has a card (from the pipeline itself, possibly
+    #                 the anti-abuse warning). Do NOT send a second one -- just
+    #                 acknowledge the client, who hasn't heard anything yet.
+    #   "skipped"  -> auto-renewal didn't run at all. Full normal manual flow.
+    result = await auto_renewal_hook.try_auto_renewal(username, file_id, is_photo)
+
+    if result == "approved":
+        await call.answer()
+        return
+
+    if result == "fallback":
         await call.message.answer("✅ Отправлено администратору. Ждите подтверждения.")
         await call.answer()
         return

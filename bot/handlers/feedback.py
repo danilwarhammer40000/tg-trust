@@ -80,9 +80,14 @@ async def feedback_media_as_receipt(call: CallbackQuery, state: FSMContext):
     """Same handling as the general receipt flow (receipt:yes in
     handlers/receipt.py) — routes into the renewal approval queue with the
     ➕1мес/➕2мес/✍️/❌ admin buttons, unless AI auto-renewal claims it
-    first (see bot/auto_renewal_hook.py). The client-facing acknowledgement
-    is identical either way -- see core/auto_renewal.py's module docstring
-    on why the client is never told about auto-renewal."""
+    first (see bot/auto_renewal_hook.py). If auto-renewal applies, the
+    client was already sent the standard "✅ Ваша подписка продлена..."
+    text synchronously inside try_auto_renewal (see
+    core/auto_renewal.py's _apply_and_request_review) -- this handler
+    must NOT send a second acknowledgement on top of that. The
+    "Отправлено администратору" line below only fires for the manual/
+    fallback path, where it's still the client's only signal that
+    anything happened."""
     data = await state.get_data()
     file_id = data.get("media_file_id")
     username = data.get("media_username")
@@ -106,11 +111,14 @@ async def feedback_media_as_receipt(call: CallbackQuery, state: FSMContext):
 
     log_to_channel(caption, file_id=file_id, is_photo=is_photo)
 
-    if await auto_renewal_hook.try_auto_renewal(username, file_id, is_photo):
-        await call.message.answer(
-            "✅ Отправлено администратору на проверку чека.",
-            reply_markup=client_menu
-        )
+    result = await auto_renewal_hook.try_auto_renewal(username, file_id, is_photo)
+
+    if result == "approved":
+        await call.answer()
+        return
+
+    if result == "fallback":
+        await call.message.answer("✅ Отправлено администратору на проверку чека.", reply_markup=client_menu)
         await call.answer()
         return
 
