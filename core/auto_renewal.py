@@ -382,6 +382,24 @@ def evaluate_receipt_extraction(extraction: dict):
 
 # ---------------- FILE RETRIEVAL ----------------
 
+def _pending_file_ref(pending: dict):
+    """
+    Returns (file_id, is_photo) straight from the pending_request record
+    — no network call, no bytes downloaded. Used purely to attach the
+    original receipt image to an admin card (e.g. the anti-abuse fallback
+    card, see _process_pending_request_with_ai_inner) at a point in the
+    pipeline that may bail out before ever needing the actual file
+    contents. Contrast with _fetch_receipt_file() below, which downloads
+    real bytes for handing to Gemini and is the source of truth for
+    whether the file can actually be retrieved at all.
+    """
+    if pending.get("source") == "max":
+        # Mirrors _fetch_receipt_file()'s handling: MAX-origin receipts
+        # don't keep a re-fetchable file reference today.
+        return None, True
+    return pending.get("receipt_file_id"), pending.get("receipt_is_photo", True)
+
+
 def _fetch_receipt_file(pending: dict):
     """Returns (bytes, mime_type, file_id, is_photo) or (None, None, None, None)."""
     if pending.get("source") == "max":
@@ -475,6 +493,9 @@ def _process_pending_request_with_ai_inner(username: str, trigger: str) -> bool:
     if not user:
         return False
 
+    pending = user.get("pending_request") or {}
+    display_file_id, display_is_photo = _pending_file_ref(pending)
+
     # ---- anti-abuse: auto-renewal can apply at most once per lock window ----
     # Without this, a client could resubmit the same (or a slightly
     # doctored) receipt repeatedly and have auto-renewal extend their
@@ -482,6 +503,14 @@ def _process_pending_request_with_ai_inner(username: str, trigger: str) -> bool:
     # is handled automatically; every next one falls straight to manual
     # review with a clearly marked warning card -- no Gemini call spent
     # on it. See _is_locked() for exactly when this clears.
+    #
+    # Uses display_file_id/display_is_photo (read straight from the
+    # pending record, no network call) rather than _fetch_receipt_file()
+    # below -- this exits before ever needing the actual bytes, but the
+    # admin still needs to SEE the receipt on this card to judge whether
+    # it's a genuine replay attempt, so the file reference has to be
+    # resolved up front, not after the point where the pipeline would
+    # normally bail out.
     locked, unlock_date = _is_locked(user)
     if locked:
         _fallback_to_manual(
@@ -489,12 +518,12 @@ def _process_pending_request_with_ai_inner(username: str, trigger: str) -> bool:
             "Защита от накрутки: автопродление уже применялось этому "
             "пользователю недавно, повторно сработать не могло.",
             trigger,
+            file_id=display_file_id,
+            is_photo=display_is_photo,
             anti_abuse=True,
             unlock_date=unlock_date,
         )
         return False
-
-    pending = user.get("pending_request") or {}
 
     file_bytes, mime_type, file_id, is_photo = _fetch_receipt_file(pending)
     if file_bytes is None:
