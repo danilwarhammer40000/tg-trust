@@ -30,7 +30,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot import auto_renewal_hook
-from bot.access import admin_only, run_sync
+from bot.access import admin_only, notify_bg, run_sync
 from bot.config import ADMIN_ID, bot
 from bot.keyboards import cancel_kb, main_menu, renewal_admin_kb
 from bot.states import ReceiptConfirm, RenewalApproval
@@ -99,7 +99,7 @@ async def receipt_yes(call: CallbackQuery, state: FSMContext):
 
     # Every receipt submission gets logged with the file, regardless of
     # whether auto-renewal ends up handling it — rule "логируем всё".
-    log_to_channel(caption, file_id=file_id, is_photo=is_photo)
+    await notify_bg(log_to_channel, caption, file_id=file_id, is_photo=is_photo)
 
     await state.clear()
 
@@ -197,7 +197,7 @@ async def approve_renewal(call: CallbackQuery, state: FSMContext):
     if action == "reject":
         update_user(username, pending_request=None)
         await call.message.edit_caption(caption=f"❌ Заявка {username} отклонена")
-        log_to_channel(f"❌ Заявка {username} отклонена администратором (вручную).")
+        await notify_bg(log_to_channel, f"❌ Заявка {username} отклонена администратором (вручную).")
 
         if user.get("telegram_id"):
             await bot.send_message(
@@ -249,7 +249,7 @@ async def approve_renewal(call: CallbackQuery, state: FSMContext):
         await run_sync()
 
     await call.message.edit_caption(caption=f"✅ {username} продлён до {new_expires}")
-    log_to_channel(f"✅ {username} продлён вручную администратором до {new_expires} ({months} мес.).")
+    await notify_bg(log_to_channel, f"✅ {username} продлён вручную администратором до {new_expires} ({months} мес.).")
 
     if user.get("telegram_id"):
         await bot.send_message(
@@ -300,7 +300,7 @@ async def approve_renewal_manual_date(msg: Message, state: FSMContext):
     if was_expired_or_inactive:
         await run_sync()
 
-    log_to_channel(f"✅ {username} продлён вручную администратором до {new_expires} (ручная дата).")
+    await notify_bg(log_to_channel, f"✅ {username} продлён вручную администратором до {new_expires} (ручная дата).")
 
     if user.get("telegram_id"):
         await bot.send_message(

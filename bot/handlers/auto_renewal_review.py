@@ -44,7 +44,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import core.auto_renewal as auto_renewal
-from bot.access import admin_only, run_sync
+from bot.access import admin_only, notify_bg, run_sync
 from bot.keyboards import main_menu
 from bot.states import AutoRenewalSettings
 from core.db import claim_pending_request_for_ai, get_user, update_user
@@ -368,7 +368,7 @@ async def auto_renewal_review(call: CallbackQuery):
         # Client was already notified the moment auto-renewal applied
         # (see core/auto_renewal.py's _apply_and_request_review) --
         # "Подтвердить" just closes this review card, nothing more to send.
-        log_to_channel(f"✅ Автопродление {username} подтверждено администратором (доп. действий не требуется).")
+        await notify_bg(log_to_channel, f"✅ Автопродление {username} подтверждено администратором (доп. действий не требуется).")
         try:
             await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n✅ Подтверждено администратором.")
         except Exception:
@@ -400,13 +400,14 @@ async def auto_renewal_review(call: CallbackQuery):
         # told it's off again. Generic wording, same as any other manual
         # rejection: never mentions "automatic" so the client learns
         # nothing about how auto-renewal works.
-        notify_user(
+        await notify_bg(
+            notify_user,
             user,
             "❌ Продление отменено администратором после проверки. "
             "Если это ошибка — напишите администратору."
         )
-
-        log_to_channel(
+        await notify_bg(
+            log_to_channel,
             f"🚫 Автопродление {username} отклонено администратором — "
             f"откат: статус inactive, дата вернулась на {previous_expires_at or '∞'}, "
             f"защита от повторной накрутки снята."

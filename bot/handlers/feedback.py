@@ -14,7 +14,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot import auto_renewal_hook
-from bot.access import admin_only, is_admin
+from bot.access import admin_only, is_admin, notify_bg
 from bot.config import ADMIN_ID, bot
 from bot.keyboards import cancel_kb, client_menu, main_menu, renewal_admin_kb
 from bot.states import AdminMessage, Feedback
@@ -109,7 +109,7 @@ async def feedback_media_as_receipt(call: CallbackQuery, state: FSMContext):
 
     caption = f"📥 Заявка на продление от {username}\n⏳ Текущая дата истечения: {expiry_line}"
 
-    log_to_channel(caption, file_id=file_id, is_photo=is_photo)
+    await notify_bg(log_to_channel, caption, file_id=file_id, is_photo=is_photo)
 
     result = await auto_renewal_hook.try_auto_renewal(username, file_id, is_photo)
 
