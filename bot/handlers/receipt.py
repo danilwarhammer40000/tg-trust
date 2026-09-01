@@ -30,7 +30,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot import auto_renewal_hook
-from bot.access import admin_only, notify_bg, run_sync
+from bot.access import admin_only, notify_bg, notify_client, run_sync
 from bot.config import ADMIN_ID, bot
 from bot.keyboards import cancel_kb, main_menu, renewal_admin_kb
 from bot.states import ReceiptConfirm, RenewalApproval
@@ -200,9 +200,14 @@ async def approve_renewal(call: CallbackQuery, state: FSMContext):
         await notify_bg(log_to_channel, f"❌ Заявка {username} отклонена администратором (вручную).")
 
         if user.get("telegram_id"):
-            await bot.send_message(
-                user["telegram_id"],
-                "❌ Чек не подтверждён администратором. Свяжитесь для уточнения."
+            # notify_client swallows "chat not found"/"bot blocked" instead
+            # of crashing this handler before it reaches call.answer() —
+            # a stale telegram_id here used to leave the admin's button
+            # spinning until the callback-query timeout.
+            await notify_client(
+                bot, user["telegram_id"],
+                "❌ Чек не подтверждён администратором. Свяжитесь для уточнения.",
+            clear_username=username
             )
 
         await call.answer()
@@ -252,9 +257,10 @@ async def approve_renewal(call: CallbackQuery, state: FSMContext):
     await notify_bg(log_to_channel, f"✅ {username} продлён вручную администратором до {new_expires} ({months} мес.).")
 
     if user.get("telegram_id"):
-        await bot.send_message(
-            user["telegram_id"],
-            f"✅ Ваша подписка продлена до {new_expires}. Спасибо!"
+        await notify_client(
+            bot, user["telegram_id"],
+            f"✅ Ваша подписка продлена до {new_expires}. Спасибо!",
+            clear_username=username
         )
 
     await call.answer("Готово")
@@ -303,9 +309,10 @@ async def approve_renewal_manual_date(msg: Message, state: FSMContext):
     await notify_bg(log_to_channel, f"✅ {username} продлён вручную администратором до {new_expires} (ручная дата).")
 
     if user.get("telegram_id"):
-        await bot.send_message(
-            user["telegram_id"],
-            f"✅ Ваша подписка продлена до {new_expires}. Спасибо!"
+        await notify_client(
+            bot, user["telegram_id"],
+            f"✅ Ваша подписка продлена до {new_expires}. Спасибо!",
+            clear_username=username
         )
 
     await msg.answer(f"✅ {username} продлён до {new_expires}", reply_markup=main_menu)
