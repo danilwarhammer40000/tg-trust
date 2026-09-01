@@ -165,24 +165,39 @@ async def user_actions_menu(call: CallbackQuery):
         await call.message.answer(card_text, reply_markup=kb)
     except TelegramBadRequest as e:
         # Second line of defense: the tg_id passed the int-and-positive
-        # check above but Telegram STILL refused to resolve it into a
-        # button (BUTTON_USER_INVALID has other causes too — e.g. an
-        # account Telegram has no username-cache for). Rather than the
-        # whole card silently failing to open (the original bug report:
-        # "не могу открыть карточку клиента"), drop just that one button
-        # and resend everything else.
-        if "BUTTON_USER_INVALID" in str(e):
-            kb_without_chat_button = InlineKeyboardMarkup(
-                inline_keyboard=[row for row in rows if "tg://user?id=" not in (row[0].url or "")]
-            )
-            await call.message.answer(
-                card_text + "\n\n⚠️ Кнопка «Открыть чат в Telegram» скрыта — "
+        # check above, but Telegram still refused to turn it into a
+        # working button. Two known causes, both about THIS ONE button,
+        # not the card as a whole — dropping just the button and
+        # resending everything else is the right fix either way:
+        #   - BUTTON_USER_INVALID: the id itself doesn't resolve (e.g. an
+        #     account Telegram has no username-cache for).
+        #   - BUTTON_USER_PRIVACY_RESTRICTED: the id is perfectly valid,
+        #     but that account's OWN privacy settings block bots from
+        #     creating tg://user?id= mention links to it. Nothing wrong
+        #     with the stored id in this case — it's the client's privacy
+        #     choice, not a data problem, so the message below is
+        #     deliberately different from the "ID недействителен" one.
+        error_text = str(e)
+
+        if "BUTTON_USER_INVALID" in error_text:
+            note = (
+                "\n\n⚠️ Кнопка «Открыть чат в Telegram» скрыта — "
                 "сохранённый Telegram ID недействителен, перезапишите его через "
-                "«🆔 Записать/перезаписать ID».",
-                reply_markup=kb_without_chat_button
+                "«🆔 Записать/перезаписать ID»."
+            )
+        elif "BUTTON_USER_PRIVACY_RESTRICTED" in error_text:
+            note = (
+                "\n\n⚠️ Кнопка «Открыть чат в Telegram» скрыта — у клиента в настройках "
+                "приватности запрещены ссылки-упоминания на его аккаунт. ID корректен, "
+                "это не ошибка данных — просто напишите ему через «✉️ Написать»."
             )
         else:
             raise
+
+        kb_without_chat_button = InlineKeyboardMarkup(
+            inline_keyboard=[row for row in rows if "tg://user?id=" not in (row[0].url or "")]
+        )
+        await call.message.answer(card_text + note, reply_markup=kb_without_chat_button)
 
     await call.answer()
 
