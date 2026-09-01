@@ -11,7 +11,7 @@ from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from bot.access import admin_only, run_sync
+from bot.access import admin_only, notify_client, run_sync
 from bot.config import bot
 from bot.states import ExtendUser
 from core.dates import calc_new_expiry, calc_new_expiry_months, is_expired
@@ -76,9 +76,15 @@ async def extend_handler(call: CallbackQuery, state: FSMContext):
 
     if user.get("telegram_id"):
         expiry_line = "бессрочно" if not new_expires_at else new_expires_at
-        await bot.send_message(
-            user["telegram_id"],
-            f"✅ Ваша подписка продлена. Доступ действует до: {expiry_line}"
+        # notify_client swallows "chat not found" / "bot blocked" instead
+        # of raising -- previously a stale telegram_id here crashed the
+        # WHOLE handler before it reached call.answer() below, so the
+        # button just spun until Telegram's callback timeout even though
+        # the extension itself (update_user above) had already succeeded.
+        await notify_client(
+            bot, user["telegram_id"],
+            f"✅ Ваша подписка продлена. Доступ действует до: {expiry_line}",
+            clear_username=username
         )
 
     await state.clear()
@@ -109,9 +115,10 @@ async def manual_date(msg: Message, state: FSMContext):
     was_expired_or_inactive = user.get("status") != "active" or is_expired(user.get("expires_at"))
     new_expires_at = msg.text.strip()
 
-    update_user(username, expires_at=new_expires_at, status="active")
     update_user(
         username,
+        expires_at=new_expires_at,
+        status="active",
         notified_days=[],
         post_disable_notified=[],
         auto_renewal_applied=False,
@@ -122,9 +129,10 @@ async def manual_date(msg: Message, state: FSMContext):
         await run_sync()
 
     if user.get("telegram_id"):
-        await bot.send_message(
-            user["telegram_id"],
-            f"✅ Ваша подписка продлена. Доступ действует до: {new_expires_at}"
+        await notify_client(
+            bot, user["telegram_id"],
+            f"✅ Ваша подписка продлена. Доступ действует до: {new_expires_at}",
+            clear_username=username
         )
 
     await state.clear()
