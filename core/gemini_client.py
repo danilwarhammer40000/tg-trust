@@ -37,6 +37,20 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
+# Google's Generative Language API rejects requests by the caller's
+# apparent geographic location (HTTP 400 FAILED_PRECONDITION, "User
+# location is not supported for the API use") -- unrelated to the API
+# key itself, and can differ between two servers even at the "same"
+# host/location if they sit on different subnets/ASNs. If that happens,
+# set GEMINI_PROXY_URL in .env (e.g. "http://user:pass@proxy-host:port"
+# or "socks5://host:port") to route ONLY the Gemini call through an exit
+# point in a supported region -- deliberately NOT the generic
+# HTTP_PROXY/HTTPS_PROXY env vars, since those would silently redirect
+# every other outbound call this bot makes too (Telegram Bot API, MAX Bot
+# API, etc.), which almost certainly isn't wanted.
+GEMINI_PROXY_URL = os.getenv("GEMINI_PROXY_URL")
+GEMINI_PROXIES = {"http": GEMINI_PROXY_URL, "https": GEMINI_PROXY_URL} if GEMINI_PROXY_URL else None
+
 # Keep this in Russian: the receipts themselves are Russian bank transfer
 # screenshots, and error/notes fields written in Russian are what end up
 # quoted straight into the admin's log-channel messages.
@@ -92,11 +106,23 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str) -> dict:
     }
 
     try:
-        r = requests.post(GEMINI_API_URL, params={"key": GEMINI_API_KEY}, json=payload, timeout=30)
+        r = requests.post(
+            GEMINI_API_URL,
+            params={"key": GEMINI_API_KEY},
+            json=payload,
+            timeout=60,
+            proxies=GEMINI_PROXIES,
+        )
     except requests.RequestException as e:
         raise GeminiError(f"network error: {e}") from e
 
     if not r.ok:
+        if r.status_code == 400 and "location is not supported" in r.text.lower():
+            raise GeminiError(
+                "Google заблокировал запрос по геолокации сервера (не по ключу API). "
+                "Настройте GEMINI_PROXY_URL в .env на прокси в поддерживаемом регионе — "
+                f"см. комментарий в core/gemini_client.py. Исходный ответ: {r.text[:200]}"
+            )
         raise GeminiError(f"HTTP {r.status_code}: {r.text[:300]}")
 
     try:
