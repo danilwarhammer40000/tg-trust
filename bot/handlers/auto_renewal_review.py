@@ -44,6 +44,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import core.auto_renewal as auto_renewal
+import core.gemini_client as gemini_client
 from bot.access import admin_only, notify_bg, run_sync
 from bot.keyboards import main_menu
 from bot.states import AutoRenewalSettings
@@ -60,7 +61,7 @@ def auto_renewal_menu_kb() -> InlineKeyboardMarkup:
     enabled = auto_renewal.is_auto_renewal_enabled()
     fully_auto = auto_renewal.is_fully_automatic_enabled()
 
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(
             text=f"{'✅ Включено' if enabled else '⬜ Выключено'} — переключить",
             callback_data="autoren:toggle"
@@ -71,7 +72,21 @@ def auto_renewal_menu_kb() -> InlineKeyboardMarkup:
         )],
         [InlineKeyboardButton(text="⚙️ Настроить условия", callback_data="autoren:settings")],
         [InlineKeyboardButton(text="🔍 Диагностика лога", callback_data="autoren:diag")],
-    ])
+    ]
+
+    # Only shown when GEMINI_PROXY_URL is actually set in .env -- nothing
+    # to toggle otherwise. Lets the admin switch between "route the
+    # Gemini call through the proxy" and "connect directly" live, without
+    # touching .env or restarting the bot -- e.g. to check whether a
+    # currently-down proxy server is the actual cause of a failure.
+    if gemini_client.proxy_configured():
+        proxy_on = gemini_client.is_proxy_enabled()
+        rows.append([InlineKeyboardButton(
+            text=f"{'🌐 Прокси для Gemini: Включен' if proxy_on else '🔌 Прокси для Gemini: Выключен'} — переключить",
+            callback_data="autoren:toggle_proxy"
+        )])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _status_text() -> str:
@@ -92,6 +107,13 @@ def _status_text() -> str:
         "",
         f"Статус: {'✅ включено' if enabled else '⬜ выключено'}",
         f"Канал лога: {'✅ настроен' if log_ok else '❌ НЕ настроен (LOG_CHANNEL_ID в .env)'}",
+    ]
+
+    if gemini_client.proxy_configured():
+        proxy_line = "✅ включен" if gemini_client.is_proxy_enabled() else "🔌 выключен (прямое подключение)"
+        lines.append(f"Прокси для Gemini: {proxy_line}")
+
+    lines += [
         "",
         "Условия срабатывания:",
         window_line,
@@ -163,6 +185,30 @@ async def auto_renewal_toggle_full(call: CallbackQuery):
         pass
     await call.answer(
         "Теперь работает круглосуточно" if now_full else "Теперь только в ночном окне"
+    )
+
+
+@router.callback_query(F.data == "autoren:toggle_proxy")
+async def auto_renewal_toggle_proxy(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    if not gemini_client.proxy_configured():
+        # Shouldn't normally be reachable (the button only renders when a
+        # proxy IS configured), but .env could have changed without a
+        # bot restart reflecting it yet -- fail safely rather than throw.
+        await call.answer("GEMINI_PROXY_URL не задан в .env — нечего переключать.", show_alert=True)
+        return
+
+    now_on = gemini_client.toggle_proxy_enabled()
+
+    try:
+        await call.message.edit_text(_status_text(), reply_markup=auto_renewal_menu_kb())
+    except Exception:
+        pass
+    await call.answer(
+        "Прокси включен — Gemini идёт через него" if now_on
+        else "Прокси выключен — прямое подключение к Gemini"
     )
 
 
