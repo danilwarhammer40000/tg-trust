@@ -4,3 +4,4 @@ toml==0.10.2
 filelock==3.13.1
 requests==2.31.0
 tzdata==2024.1
+PySocks==1.7.1
