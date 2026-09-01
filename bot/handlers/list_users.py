@@ -9,6 +9,7 @@ bot/states.py's docstring on why that's fine. action_unlink and
 action_follow_start (also in leader_link.py) are one-shot/stateless.
 """
 from aiogram import Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -120,7 +121,23 @@ async def user_actions_menu(call: CallbackQuery):
         # Desktop/mobile as long as the app can resolve the numeric id
         # (it generally can once the account has messaged the bot, which
         # is exactly when telegram_id gets set in the first place).
-        rows.append([InlineKeyboardButton(text="💬 Открыть чат в Telegram", url=f"tg://user?id={tg_id}")])
+        #
+        # GUARD: Telegram rejects this button with BUTTON_USER_INVALID —
+        # which crashes the ENTIRE card, not just this button — if tg_id
+        # isn't a valid positive user id (e.g. a negative group/channel id
+        # got saved here by mistake via "🆔 Записать/перезаписать ID", or
+        # the id belongs to an account Telegram can't resolve for some
+        # other reason). Only add the button when tg_id at least LOOKS
+        # like a real user id; the try/except around the final send below
+        # is the second line of defense in case Telegram still refuses a
+        # well-formed-looking id.
+        try:
+            tg_id_looks_valid = int(tg_id) > 0
+        except (TypeError, ValueError):
+            tg_id_looks_valid = False
+
+        if tg_id_looks_valid:
+            rows.append([InlineKeyboardButton(text="💬 Открыть чат в Telegram", url=f"tg://user?id={tg_id}")])
 
     # A follower's own expiry/status is redirected to its leader anyway (see
     # core.db.update_user), so it can't become a leader itself — offer only
@@ -142,8 +159,31 @@ async def user_actions_menu(call: CallbackQuery):
             rows.append([InlineKeyboardButton(text="🔗 Сделать ведомым", callback_data=f"act_follow:{username}")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    card_text = f"👤 {username}\n{sub_status}{link_status}\n\nChoose action:"
 
-    await call.message.answer(f"👤 {username}\n{sub_status}{link_status}\n\nChoose action:", reply_markup=kb)
+    try:
+        await call.message.answer(card_text, reply_markup=kb)
+    except TelegramBadRequest as e:
+        # Second line of defense: the tg_id passed the int-and-positive
+        # check above but Telegram STILL refused to resolve it into a
+        # button (BUTTON_USER_INVALID has other causes too — e.g. an
+        # account Telegram has no username-cache for). Rather than the
+        # whole card silently failing to open (the original bug report:
+        # "не могу открыть карточку клиента"), drop just that one button
+        # and resend everything else.
+        if "BUTTON_USER_INVALID" in str(e):
+            kb_without_chat_button = InlineKeyboardMarkup(
+                inline_keyboard=[row for row in rows if "tg://user?id=" not in (row[0].url or "")]
+            )
+            await call.message.answer(
+                card_text + "\n\n⚠️ Кнопка «Открыть чат в Telegram» скрыта — "
+                "сохранённый Telegram ID недействителен, перезапишите его через "
+                "«🆔 Записать/перезаписать ID».",
+                reply_markup=kb_without_chat_button
+            )
+        else:
+            raise
+
     await call.answer()
 
 
@@ -300,6 +340,20 @@ async def action_set_id_apply(msg: Message, state: FSMContext):
         await msg.answer(
             "Не смог распознать ID. Пришлите число, либо перешлите сообщение от клиента "
             "(не сработает, если у него в приватности скрыта пересылка).",
+            reply_markup=main_menu
+        )
+        return
+
+    # GUARD: reject negative/zero ids here too (e.g. a forwarded message
+    # from a CHANNEL or GROUP has a chat id, not a user id, and those are
+    # negative) -- catches the mistake at entry time instead of only
+    # surfacing it later as a BUTTON_USER_INVALID crash when the card is
+    # opened.
+    if tg_id <= 0:
+        await msg.answer(
+            f"⚠️ Это похоже на ID группы/канала (число {tg_id}), а не пользователя — "
+            f"личные аккаунты Telegram имеют положительный ID. Не сохранил, "
+            f"пришлите корректный ID клиента.",
             reply_markup=main_menu
         )
         return
