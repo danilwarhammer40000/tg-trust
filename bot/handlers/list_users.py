@@ -109,8 +109,8 @@ async def user_actions_menu(call: CallbackQuery):
         [InlineKeyboardButton(text="❌ Delete", callback_data=f"act_del:{username}")],
         [InlineKeyboardButton(text="✉️ Написать", callback_data=f"act_call:{username}")],
         [InlineKeyboardButton(
-            text="🆔 Записать/перезаписать ID",
-            callback_data=f"act_setid:{username}"
+            text="🆔 Telegram ID",
+            callback_data=f"act_setid_menu:{username}"
         )],
     ]
 
@@ -320,6 +320,44 @@ async def action_call(call: CallbackQuery, state: FSMContext):
 
     await call.message.answer(f"Введите сообщение для {username}:", reply_markup=cancel_kb)
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("act_setid_menu:"))
+async def action_set_id_menu(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    username = call.data.split(":", 1)[1]
+    user = get_user(username) or {}
+    tg_id = user.get("telegram_id")
+
+    current_line = f"Сейчас записан: {tg_id}" if tg_id else "Сейчас не записан."
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Записать/перезаписать", callback_data=f"act_setid:{username}")],
+        [InlineKeyboardButton(text="🗑 Очистить значение", callback_data=f"act_setid_clear:{username}")],
+    ])
+
+    await call.message.answer(f"🆔 Telegram ID для {username}\n{current_line}", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("act_setid_clear:"))
+async def action_set_id_clear(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    username = call.data.split(":", 1)[1]
+    user = get_user(username)
+
+    if not user or not user.get("telegram_id"):
+        await call.answer("Уже не записан.", show_alert=True)
+        return
+
+    update_user(username, telegram_id=None)
+
+    await call.message.answer(f"🗑 Telegram ID для {username} очищен.", reply_markup=main_menu)
+    await call.answer("Очищено")
 
 
 @router.callback_query(F.data.startswith("act_setid:"))
