@@ -23,7 +23,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from bot.access import admin_only, notify_bg, notify_client, run_sync
 from bot.config import ADMIN_ID, bot
-from follower_issuance import issue_follower, leader_is_active
+from follower_issuance import build_connection_card, issue_follower, leader_is_active
 from core.dates import utcnow_naive
 from core.db import get_followers, get_user, get_user_by_telegram_id, update_user
 from core.notify import log_to_channel
@@ -133,17 +133,25 @@ async def extra_links_review(call: CallbackQuery):
     # action == "approve"
     was_active = leader_is_active(user)
 
-    created = []
+    # STEP 1: create every new sub-account in the DB. Deliberately no card
+    # generation yet — see follower_issuance.py's module docstring for why
+    # generate_link() must not run before the resync below.
+    created_usernames = []
     followers_snapshot = get_followers(username)
     for _ in range(count):
-        new_username, card = issue_follower(username, existing_followers=followers_snapshot)
+        new_username = issue_follower(username, existing_followers=followers_snapshot)
         if not new_username:
             break
-        created.append((new_username, card))
+        created_usernames.append(new_username)
         followers_snapshot = followers_snapshot + [{"username": new_username}]
 
-    if was_active and created:
+    # STEP 2: resync so the trusttunnel binary actually knows about the
+    # new usernames -- MUST happen before any generate_link() call below.
+    if was_active and created_usernames:
         await run_sync()
+
+    # STEP 3: only now is it safe to build the actual connection cards.
+    created = [(u, build_connection_card(u)) for u in created_usernames]
 
     try:
         await call.message.edit_text((call.message.text or "") + f"\n\n✅ Выдано {len(created)} из {count}")

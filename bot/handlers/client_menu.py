@@ -58,12 +58,18 @@ async def client_payment_info(msg: Message):
 # ("🔗 Моя ссылка") — a client's Telegram app may have the old label cached
 # on its reply keyboard until it re-renders, and both must keep working.
 #
+# Deliberately never sends a connection card straight away, even when the
+# client only has one account (their own): the link is only generated
+# (generate_link() shells out to the trusttunnel binary — not free) once
+# they actually tap a specific connection. This message is always just a
+# picker.
+#
 # A client normally has exactly one connection (their own account). If an
 # admin issued extra device-links for them (handlers/leader_link.py's
 # "➕ Выпустить нового ведомого") or they requested some themselves
 # (handlers/extra_links.py) and got approved, they become a "leader" of
-# their own "-2"/"-3"/... sub-accounts (see follower_issuance.py) — in that
-# case this shows a picker instead of going straight to a single card.
+# their own "-2"/"-3"/... sub-accounts (see follower_issuance.py) and see
+# more than one button here.
 
 @router.message(F.text.in_({"🔗 Мои подключения", "🔗 Моя ссылка"}))
 async def client_my_link(msg: Message):
@@ -78,33 +84,17 @@ async def client_my_link(msg: Message):
 
     username = user.get("username")
     followers = get_followers(username)
-
-    extra_devices_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📱 Подключить ещё устройства", callback_data="extralinks:start")]
-    ])
-
-    if not followers:
-        link = generate_link(username, DOMAIN)
-        await msg.answer(
-            format_connection_message(username, user.get("password"), user.get("expires_at"), link)
-        )
-        await msg.answer(
-            "ℹ️ Одна ссылка подключает до 2 устройств одновременно.\n\n"
-            "Нужно больше — жмите кнопку ниже, администратор рассмотрит запрос.",
-            reply_markup=extra_devices_kb
-        )
-        return
-
     accounts = [user] + followers
+
     rows = [
         [InlineKeyboardButton(text=f"🔌 {a.get('username')}", callback_data=f"myconn:{a.get('username')}")]
         for a in accounts if a.get("username")
     ]
     rows.append([InlineKeyboardButton(text="📱 Подключить ещё устройства", callback_data="extralinks:start")])
 
+    note = "\n\nℹ️ Одна ссылка подключает до 2 устройств одновременно." if len(accounts) == 1 else ""
     await msg.answer(
-        f"У вас {len(accounts)} подключени{'е' if len(accounts) == 1 else 'я/й'}. "
-        f"Выберите, чтобы получить карточку:",
+        f"Ваши подключения ({len(accounts)}):{note}\n\nНажмите на нужное, чтобы получить карточку:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
 

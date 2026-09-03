@@ -2,18 +2,18 @@
 Owns: LeaderLink.select.
 
 All the leader/follower group-management UI lives here:
-- act_leader:   (list_users.py button) -> manage a leader's group: general
-                candidate list (free users + this leader's own current
-                followers only -- see _eligible_candidates), existing
+- act_leader:   (list_users.py button) -> a small 2-button choice first:
+                "➕ Выпустить нового ведомого" (issue a brand-new "-2"/"-3"
+                sub-account, no state needed, done in one tap) or
+                "📋 Выбрать из списка существующих" (-> leaderpick:, which
+                is what actually opens the checkbox multi-select screen:
+                general candidate list, this leader's own current
                 followers pre-checked, checking/unchecking both adds and
-                removes -- one screen for both, PLUS an "➕ Выпустить
-                нового ведомого" button that creates a brand-new "-2"/"-3"
-                sub-account instead of linking an existing user (see
-                issue_new_follower below) — available even when there are
-                zero existing candidates to link.
+                removes -- one screen for both).
 - act_ungroup:  (list_users.py button, only shown for existing leaders) ->
-                same mechanics, but scoped to ONLY the current group (not
-                the general list), plus a one-tap "unlink everyone" button.
+                same checkbox mechanics, but scoped to ONLY the current
+                group (not the general list), plus a one-tap "unlink
+                everyone" button.
 - act_follow:   (list_users.py button, only shown for independent users)
                 -> the reverse direction: pick who this user should
                 follow. Starts on a list scoped to existing leaders, with
@@ -26,6 +26,11 @@ All the leader/follower group-management UI lives here:
 
 See bot/states.py's docstring on why a different file (list_users.py)
 owning the buttons that transition into LeaderLink.select is fine.
+
+ORDERING RULE for issuing a brand-new sub-account (issue_new_follower
+below): create the DB record, THEN run_sync() (if the leader is active),
+THEN build the connection card. Building the card before the resync would
+hand back a broken link — see follower_issuance.py's module docstring.
 """
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -36,7 +41,7 @@ from bot.display import sorted_users_for_display, user_button_label
 from bot.keyboards import main_menu
 from bot.pagination import paginate, pagination_nav_row
 from bot.states import LeaderLink
-from follower_issuance import issue_follower, leader_is_active
+from follower_issuance import build_connection_card, issue_follower, leader_is_active
 from core.dates import is_expired
 from core.db import get_followers, get_leaders, get_unlinked_users, get_user, link_user, list_users, unlink_user
 
@@ -89,15 +94,6 @@ def build_leader_link_kb(leader_username: str, users: list, selected: set, page:
     if mode == "ungroup" and users:
         rows.append([InlineKeyboardButton(text="🔨 Отвязать всех сразу", callback_data="leadersel:unlink_all")])
 
-    if mode == "manage":
-        # Always reachable, even with zero linkable candidates below --
-        # issuing a brand-new sub-account doesn't depend on anyone else
-        # existing in the DB.
-        rows.append([InlineKeyboardButton(
-            text="➕ Выпустить нового ведомого",
-            callback_data=f"issuefollow:{leader_username}"
-        )])
-
     rows += [
         [InlineKeyboardButton(
             text=_candidate_label(u, selected),
@@ -124,16 +120,12 @@ def leader_link_label(leader_username: str, total: int, page: int, total_pages: 
         )
 
     if total == 0:
-        return (
-            f"👑 Ведомые {leader_username}: подходящих существующих пользователей для привязки нет.\n"
-            f"Можно выпустить новое устройство для самого {leader_username} кнопкой ниже."
-        )
+        return f"👑 Ведомые {leader_username}: подходящих существующих пользователей для привязки нет."
 
     return (
         f"👑 Ведомые {leader_username} ({total} доступно{suffix}).\n"
         f"☑️ отмечены уже ведомые. Отметьте новых, чтобы добавить, снимите "
-        f"галочку, чтобы отвязать — им сразу проставится текущая дата/статус {leader_username}.\n"
-        f"Либо выпустите совсем новое устройство кнопкой ниже."
+        f"галочку, чтобы отвязать — им сразу проставится текущая дата/статус {leader_username}."
     )
 
 
@@ -174,9 +166,6 @@ async def _start(call: CallbackQuery, state: FSMContext, leader_username: str, m
             return
         preselected = {u["username"] for u in candidates}
     else:
-        # NOTE: no early-return on an empty candidate list here anymore --
-        # "➕ Выпустить нового ведомого" must stay reachable even when there
-        # is nobody existing left to link (see build_leader_link_kb).
         candidates = sorted_users_for_display(_eligible_candidates(leader_username))
         preselected = {u["username"] for u in get_followers(leader_username)}
 
@@ -193,8 +182,30 @@ async def _start(call: CallbackQuery, state: FSMContext, leader_username: str, m
     await call.answer()
 
 
+# ---------------- ENTRY POINT: choose issue-new vs pick-existing ----------------
+
 @router.callback_query(F.data.startswith("act_leader:"))
-async def action_leader_start(call: CallbackQuery, state: FSMContext):
+async def action_leader_start(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    leader_username = call.data.split(":", 1)[1]
+    leader = get_user(leader_username)
+    if not leader:
+        await call.answer("Пользователь не найден", show_alert=True)
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Выпустить нового ведомого", callback_data=f"issuefollow:{leader_username}")],
+        [InlineKeyboardButton(text="📋 Выбрать из списка существующих", callback_data=f"leaderpick:{leader_username}")],
+    ])
+
+    await call.message.answer(f"👑 {leader_username} — что сделать?", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("leaderpick:"))
+async def action_leader_pick_start(call: CallbackQuery, state: FSMContext):
     if not await admin_only(call):
         return
     await _start(call, state, call.data.split(":", 1)[1], mode="manage")
@@ -319,9 +330,12 @@ async def confirm_leader_link(call: CallbackQuery, state: FSMContext):
 
 
 # ---------------- ISSUE A BRAND-NEW SUB-ACCOUNT ("-2", "-3", ...) ----------------
+#
+# No FSM state involved -- reachable straight from the act_leader: entry
+# menu above, in one tap.
 
-@router.callback_query(F.data.startswith("issuefollow:"), LeaderLink.select)
-async def issue_new_follower(call: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("issuefollow:"))
+async def issue_new_follower(call: CallbackQuery):
     if not await admin_only(call):
         return
 
@@ -333,15 +347,19 @@ async def issue_new_follower(call: CallbackQuery, state: FSMContext):
 
     was_active = leader_is_active(leader)
 
-    new_username, card = issue_follower(leader_username)
+    # STEP 1: DB only, no card/link generation yet.
+    new_username = issue_follower(leader_username)
     if not new_username:
         await call.answer("Не удалось выпустить нового ведомого.", show_alert=True)
         return
 
+    # STEP 2: resync BEFORE building the card — see follower_issuance.py's
+    # module docstring for why this order matters.
     if was_active:
         await run_sync()
 
-    await state.clear()
+    # STEP 3: now it's safe to generate the actual connection link.
+    card = build_connection_card(new_username)
 
     await call.message.answer(f"✅ Выпущен новый ведомый: {new_username}")
     await call.message.answer(card)
