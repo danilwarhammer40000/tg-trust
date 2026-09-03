@@ -1,21 +1,31 @@
 """
 Owns: LeaderLink.select.
 
-Two entry points from handlers/list_users.py's user_actions_menu share this
-one state/router:
-  - action_leader_start ("👑 Назначить ведущим" / "👑 Управление ведомыми")
-    → mode="manage": multi-select which existing users follow this leader.
-  - action_ungroup_start ("💔 Разгруппировать") → mode="ungroup": pick which
-    of this leader's current followers to detach.
-action_unlink (unlinking a single follower from ITS card, not the leader's)
-and action_follow_start ("🔗 Сделать ведомым" from a non-leader's own card,
-letting them pick which existing leader to join) are one-shot / their own
-small stateless flows, not FSM.
+All the leader/follower group-management UI lives here:
+- act_leader:   (list_users.py button) -> manage a leader's group: general
+                candidate list (free users + this leader's own current
+                followers only -- see _eligible_candidates), existing
+                followers pre-checked, checking/unchecking both adds and
+                removes -- one screen for both, PLUS an "➕ Выпустить
+                нового ведомого" button that creates a brand-new "-2"/"-3"
+                sub-account instead of linking an existing user (see
+                issue_new_follower below) — available even when there are
+                zero existing candidates to link.
+- act_ungroup:  (list_users.py button, only shown for existing leaders) ->
+                same mechanics, but scoped to ONLY the current group (not
+                the general list), plus a one-tap "unlink everyone" button.
+- act_follow:   (list_users.py button, only shown for independent users)
+                -> the reverse direction: pick who this user should
+                follow. Starts on a list scoped to existing leaders, with
+                a "📋 Показать всех свободных" button to switch to a
+                second list of genuinely unattached users (for starting a
+                brand new group instead of joining an existing one). No
+                FSM needed -- it's a single pick, so the follower's
+                username (and current list mode) is threaded directly
+                through each button's own callback_data.
 
-"➕ Выпустить нового ведомого" (mode="manage" only) is deliberately NOT
-gated on there being any existing candidates to link — it creates a brand
-new account from scratch (see bot/follower_issuance.py), so "nobody else
-to link" is not a reason to hide it.
+See bot/states.py's docstring on why a different file (list_users.py)
+owning the buttons that transition into LeaderLink.select is fine.
 """
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -23,142 +33,197 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from bot.access import admin_only, run_sync
 from bot.display import sorted_users_for_display, user_button_label
-from bot.follower_issuance import issue_follower, leader_is_active
 from bot.keyboards import main_menu
+from bot.pagination import paginate, pagination_nav_row
 from bot.states import LeaderLink
-from core.db import get_followers, get_unlinked_users, get_user, link_user, list_users, unlink_user
+from follower_issuance import issue_follower, leader_is_active
+from core.dates import is_expired
+from core.db import get_followers, get_leaders, get_unlinked_users, get_user, link_user, list_users, unlink_user
 
 router = Router()
 
 
+# ---------------- SHARED: candidate list + keyboard building ----------------
+#
+# NOTE: uses sorted_users_for_display(), NOT prepare_users_for_display() --
+# the hide_unlimited/hide_expired/hide_followers toggles are for general
+# browsing lists and must not hide anyone from a screen whose whole job is
+# to show/manage links. See bot/display.py's prepare_users_for_display()
+# docstring for the same note from the other side.
+
+def _candidate_label(u: dict, selected: set) -> str:
+    username = u.get("username", "?")
+    mark = "☑️" if username in selected else "⬜"
+    return f"{mark} {user_button_label(u)}"
+
+
 def _eligible_candidates(leader_username: str) -> list:
     """
-    Anyone who could become a follower of this leader: not the leader
-    itself, not already following someone else, and not itself a leader
-    of other followers (no nested groups — keeps the sync logic in
-    core.db.update_user, which only follows one hop, correct).
-    """
-    all_users = list_users()
-    leader_usernames = {u.get("linked_to") for u in all_users if u.get("linked_to")}
+    Only genuinely free users (not the leader itself, not themselves a
+    leader elsewhere, not already someone ELSE's follower) — PLUS this
+    leader's own current followers, so they still show up pre-checked and
+    can be unchecked to remove.
 
+    Deliberately excludes followers of OTHER leaders now (previously they
+    were included, letting the general list double as a "re-parent"
+    picker — but that cluttered the general "who can I add" list with
+    people already spoken for elsewhere. Re-parenting is still possible,
+    just not from this general list — unlink them from their current
+    leader first via that leader's "💔 Разгруппировать", then they show up
+    here as free.
+    """
+    current_followers = {f["username"] for f in get_followers(leader_username)}
+    users = list_users() or []
     return [
-        u for u in all_users
-        if u.get("username") != leader_username
-        and not u.get("linked_to")
-        and u.get("username") not in leader_usernames
+        u for u in users
+        if u.get("username") and u.get("username") != leader_username
+        and not get_followers(u["username"])  # not themselves a leader
+        and (u["username"] in current_followers or not u.get("linked_to"))  # free, or already in THIS group
     ]
 
 
-def _build_select_kb(leader_username: str, candidates: list, selected: set, mode: str) -> InlineKeyboardMarkup:
+def build_leader_link_kb(leader_username: str, users: list, selected: set, page: int, mode: str) -> tuple:
+    page_users, total_pages, page = paginate(users, page)
+
     rows = []
+    if mode == "ungroup" and users:
+        rows.append([InlineKeyboardButton(text="🔨 Отвязать всех сразу", callback_data="leadersel:unlink_all")])
 
     if mode == "manage":
-        rows.append([InlineKeyboardButton(text="➕ Выпустить нового ведомого", callback_data="leadersel:issue")])
-
-    for u in candidates:
-        username = u.get("username")
-        mark = "✅ " if username in selected else "⬜ "
+        # Always reachable, even with zero linkable candidates below --
+        # issuing a brand-new sub-account doesn't depend on anyone else
+        # existing in the DB.
         rows.append([InlineKeyboardButton(
-            text=f"{mark}{user_button_label(u)}",
-            callback_data=f"leadersel:toggle:{username}"
+            text="➕ Выпустить нового ведомого",
+            callback_data=f"issuefollow:{leader_username}"
         )])
 
+    rows += [
+        [InlineKeyboardButton(
+            text=_candidate_label(u, selected),
+            callback_data=f"leadertoggle:{u['username']}"
+        )]
+        for u in page_users
+    ]
+    rows += pagination_nav_row(page, total_pages, "leaderpage")
     rows.append([
-        InlineKeyboardButton(text="✅ Готово", callback_data="leadersel:done"),
+        InlineKeyboardButton(text=f"✅ Готово ({len(selected)})", callback_data="leadersel:done"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="leadersel:cancel"),
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows), total_pages, page
 
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def leader_link_label(leader_username: str, total: int, page: int, total_pages: int, mode: str) -> str:
+    suffix = f", стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
+
+    if mode == "ungroup":
+        return (
+            f"💔 Группа {leader_username} ({total} чел{suffix}).\n"
+            f"Снимите ☑️ у тех, кого нужно отвязать, затем «Готово» — "
+            f"или «Отвязать всех сразу» одним тапом."
+        )
+
+    if total == 0:
+        return (
+            f"👑 Ведомые {leader_username}: подходящих существующих пользователей для привязки нет.\n"
+            f"Можно выпустить новое устройство для самого {leader_username} кнопкой ниже."
+        )
+
+    return (
+        f"👑 Ведомые {leader_username} ({total} доступно{suffix}).\n"
+        f"☑️ отмечены уже ведомые. Отметьте новых, чтобы добавить, снимите "
+        f"галочку, чтобы отвязать — им сразу проставится текущая дата/статус {leader_username}.\n"
+        f"Либо выпустите совсем новое устройство кнопкой ниже."
+    )
 
 
-async def _render(call: CallbackQuery, state: FSMContext):
+async def _render(call: CallbackQuery, state: FSMContext, edit: bool):
     data = await state.get_data()
     leader_username = data.get("leader")
     mode = data.get("mode", "manage")
     selected = set(data.get("selected", []))
+    page = data.get("page", 0)
 
-    if mode == "manage":
-        candidates = sorted_users_for_display(_eligible_candidates(leader_username))
-        if candidates:
-            header = f"👑 Управление ведомыми для {leader_username}\n\nОтметьте, кто присоединяется, либо выпустите нового:"
-        else:
-            header = (
-                f"👑 Управление ведомыми для {leader_username}\n\n"
-                f"Нет свободных существующих пользователей для привязки — "
-                f"но можно выпустить нового:"
-            )
-    else:
+    if mode == "ungroup":
         candidates = sorted_users_for_display(get_followers(leader_username))
-        header = f"💔 Разгруппировать — ведомые {leader_username}\n\nОтметьте, кого отвязать:"
+    else:
+        candidates = sorted_users_for_display(_eligible_candidates(leader_username))
 
-    kb = _build_select_kb(leader_username, candidates, selected, mode)
+    kb, total_pages, page = build_leader_link_kb(leader_username, candidates, selected, page, mode)
+    label = leader_link_label(leader_username, len(candidates), page, total_pages, mode)
 
-    try:
-        await call.message.edit_text(header, reply_markup=kb)
-    except Exception:
-        await call.message.answer(header, reply_markup=kb)
+    if edit:
+        try:
+            await call.message.edit_text(label, reply_markup=kb)
+        except Exception:
+            pass
+    else:
+        await call.message.answer(label, reply_markup=kb)
 
 
-async def _start(call: CallbackQuery, state: FSMContext, mode: str):
-    if not await admin_only(call):
+async def _start(call: CallbackQuery, state: FSMContext, leader_username: str, mode: str):
+    leader = get_user(leader_username)
+    if not leader:
+        await call.answer("Пользователь не найден", show_alert=True)
         return
 
-    leader_username = call.data.split(":", 1)[1]
-
-    if mode == "ungroup" and not get_followers(leader_username):
-        await call.answer("У этого пользователя нет ведомых.", show_alert=True)
-        return
-
-    preselected = {u["username"] for u in get_followers(leader_username)} if mode == "manage" else set()
+    if mode == "ungroup":
+        candidates = sorted_users_for_display(get_followers(leader_username))
+        if not candidates:
+            await call.answer("У этого пользователя пока нет ведомых.", show_alert=True)
+            return
+        preselected = {u["username"] for u in candidates}
+    else:
+        # NOTE: no early-return on an empty candidate list here anymore --
+        # "➕ Выпустить нового ведомого" must stay reachable even when there
+        # is nobody existing left to link (see build_leader_link_kb).
+        candidates = sorted_users_for_display(_eligible_candidates(leader_username))
+        preselected = {u["username"] for u in get_followers(leader_username)}
 
     await state.set_state(LeaderLink.select)
-    await state.update_data(leader=leader_username, mode=mode, selected=list(preselected))
+    await state.update_data(
+        leader=leader_username,
+        mode=mode,
+        selected=list(preselected),
+        original_followers=list(preselected),
+        page=0,
+    )
 
-    await _render(call, state)
+    await _render(call, state, edit=False)
     await call.answer()
 
 
 @router.callback_query(F.data.startswith("act_leader:"))
 async def action_leader_start(call: CallbackQuery, state: FSMContext):
-    await _start(call, state, mode="manage")
+    if not await admin_only(call):
+        return
+    await _start(call, state, call.data.split(":", 1)[1], mode="manage")
 
 
 @router.callback_query(F.data.startswith("act_ungroup:"))
 async def action_ungroup_start(call: CallbackQuery, state: FSMContext):
-    await _start(call, state, mode="ungroup")
+    if not await admin_only(call):
+        return
+    await _start(call, state, call.data.split(":", 1)[1], mode="ungroup")
 
 
-@router.callback_query(F.data == "leadersel:issue", LeaderLink.select)
-async def leadersel_issue(call: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("leaderpage:"), LeaderLink.select)
+async def leader_link_page(call: CallbackQuery, state: FSMContext):
     if not await admin_only(call):
         return
 
-    data = await state.get_data()
-    leader_username = data.get("leader")
-
-    leader = get_user(leader_username)
-    if not leader:
-        await call.answer("Ведущий не найден.", show_alert=True)
-        return
-
-    new_username, card = issue_follower(leader_username)
-
-    if leader_is_active(leader):
-        await run_sync()
-
-    await state.clear()
-
-    await call.message.answer(f"✅ Выпущен новый ведомый: {new_username}")
-    await call.message.answer(card, reply_markup=main_menu)
+    page = int(call.data.split(":", 1)[1])
+    await state.update_data(page=page)
+    await _render(call, state, edit=True)
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("leadersel:toggle:"), LeaderLink.select)
-async def leadersel_toggle(call: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("leadertoggle:"), LeaderLink.select)
+async def toggle_leader_candidate(call: CallbackQuery, state: FSMContext):
     if not await admin_only(call):
         return
 
-    username = call.data.split(":", 2)[2]
+    username = call.data.split(":", 1)[1]
 
     data = await state.get_data()
     selected = set(data.get("selected", []))
@@ -169,12 +234,12 @@ async def leadersel_toggle(call: CallbackQuery, state: FSMContext):
         selected.add(username)
 
     await state.update_data(selected=list(selected))
-    await _render(call, state)
+    await _render(call, state, edit=True)
     await call.answer()
 
 
 @router.callback_query(F.data == "leadersel:cancel", LeaderLink.select)
-async def leadersel_cancel(call: CallbackQuery, state: FSMContext):
+async def cancel_leader_link(call: CallbackQuery, state: FSMContext):
     if not await admin_only(call):
         return
 
@@ -183,95 +248,244 @@ async def leadersel_cancel(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.callback_query(F.data == "leadersel:done", LeaderLink.select)
-async def leadersel_done(call: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "leadersel:unlink_all", LeaderLink.select)
+async def unlink_all_now(call: CallbackQuery, state: FSMContext):
     if not await admin_only(call):
         return
 
     data = await state.get_data()
     leader_username = data.get("leader")
-    mode = data.get("mode", "manage")
-    selected = set(data.get("selected", []))
     await state.clear()
 
-    if mode == "manage":
-        current = {u["username"] for u in get_followers(leader_username)}
-        to_link = selected - current
-        to_unlink = current - selected
+    followers = get_followers(leader_username)
+    for u in followers:
+        unlink_user(u["username"])
 
-        for username in to_link:
-            link_user(username, leader_username)
-        for username in to_unlink:
-            unlink_user(username)
+    # Unlinking never changes credentials.toml membership (each follower
+    # keeps exactly the status/expiry it already had, just as an
+    # independent record now) -- no run_sync() needed here.
 
-        await call.message.answer(
-            f"✅ Готово. Ведомых у {leader_username}: {len(selected)}.",
-            reply_markup=main_menu
-        )
-    else:
-        for username in selected:
-            unlink_user(username)
-
-        await call.message.answer(
-            f"💔 Отвязано: {len(selected)}.",
-            reply_markup=main_menu
-        )
-
+    names = ", ".join(u["username"] for u in followers) or "(никого)"
+    await call.message.answer(f"💔 Группа {leader_username} расформирована: {names}", reply_markup=main_menu)
     await call.answer()
 
 
-# ---------------- FOLLOW: from a non-leader's own card ----------------
+@router.callback_query(F.data == "leadersel:done", LeaderLink.select)
+async def confirm_leader_link(call: CallbackQuery, state: FSMContext):
+    if not await admin_only(call):
+        return
+
+    data = await state.get_data()
+    leader_username = data.get("leader")
+    selected = set(data.get("selected", []))
+    original_followers = set(data.get("original_followers", []))
+    await state.clear()
+
+    leader = get_user(leader_username)
+    if not leader:
+        await call.message.answer("Ведущий не найден (был удалён?), отменено.", reply_markup=main_menu)
+        await call.answer()
+        return
+
+    to_link = selected - original_followers
+    to_unlink = original_followers - selected
+
+    if not to_link and not to_unlink:
+        await call.message.answer("Без изменений.", reply_markup=main_menu)
+        await call.answer()
+        return
+
+    # If the leader was expired/inactive, linking a NEW follower flips it
+    # from "null-expiry, always in credentials.toml" to "expired/inactive,
+    # gets excluded" -- that's the one case that actually changes
+    # trusttunnel membership and needs a resync. Unlinking never needs one
+    # (see unlink_all_now's comment above) — only check the link half.
+    was_expired_or_inactive = leader.get("status") != "active" or is_expired(leader.get("expires_at"))
+
+    linked = [username for username in to_link if link_user(username, leader_username)]
+    unlinked = [username for username in to_unlink if unlink_user(username)]
+
+    if linked and was_expired_or_inactive:
+        await run_sync()
+
+    lines = [f"👑 Группа {leader_username} обновлена."]
+    if linked:
+        lines.append(f"➕ Добавлены: {', '.join(linked)}")
+    if unlinked:
+        lines.append(f"➖ Отвязаны: {', '.join(unlinked)}")
+
+    await call.message.answer("\n".join(lines), reply_markup=main_menu)
+    await call.answer()
+
+
+# ---------------- ISSUE A BRAND-NEW SUB-ACCOUNT ("-2", "-3", ...) ----------------
+
+@router.callback_query(F.data.startswith("issuefollow:"), LeaderLink.select)
+async def issue_new_follower(call: CallbackQuery, state: FSMContext):
+    if not await admin_only(call):
+        return
+
+    leader_username = call.data.split(":", 1)[1]
+    leader = get_user(leader_username)
+    if not leader:
+        await call.answer("Пользователь не найден", show_alert=True)
+        return
+
+    was_active = leader_is_active(leader)
+
+    new_username, card = issue_follower(leader_username)
+    if not new_username:
+        await call.answer("Не удалось выпустить нового ведомого.", show_alert=True)
+        return
+
+    if was_active:
+        await run_sync()
+
+    await state.clear()
+
+    await call.message.answer(f"✅ Выпущен новый ведомый: {new_username}")
+    await call.message.answer(card)
+    await call.message.answer("Готово.", reply_markup=main_menu)
+    await call.answer()
+
+
+# ---------------- REVERSE DIRECTION: "🔗 Сделать ведомым" ----------------
+#
+# No FSM needed -- it's a single pick, so the follower's own username (and
+# now the current list mode) is threaded directly through each button's
+# callback_data instead of being stored in state.
+#
+# Two modes:
+# - "leaders": the common case -- attach to an EXISTING group.
+# - "free": fallback for when the leader you want isn't a leader yet --
+#   scoped to users who are neither a leader nor a follower of anyone.
+#   Picking one there makes them a first-time leader (link_user() doesn't
+#   care whether the target already had followers or not).
+
+def build_follow_picker_kb(follower_username: str, users: list, page: int, mode: str) -> tuple:
+    page_users, total_pages, page = paginate(users, page)
+
+    rows = []
+    if mode == "leaders":
+        rows.append([InlineKeyboardButton(text="📋 Показать всех свободных", callback_data=f"followall:{follower_username}")])
+    else:
+        rows.append([InlineKeyboardButton(text="👑 Показать только ведущих", callback_data=f"act_follow:{follower_username}")])
+
+    rows += [
+        [InlineKeyboardButton(
+            text=user_button_label(u),
+            callback_data=f"followto:{follower_username}:{u['username']}"
+        )]
+        for u in page_users
+    ]
+    rows += pagination_nav_row(page, total_pages, f"followpage:{follower_username}:{mode}")
+    return InlineKeyboardMarkup(inline_keyboard=rows), total_pages, page
+
+
+def follow_picker_label(follower_username: str, total: int, page: int, total_pages: int, mode: str) -> str:
+    suffix = f", стр. {page + 1}/{total_pages}" if total_pages > 1 else ""
+
+    if mode == "free":
+        return (
+            f"К кому привязать {follower_username}? Свободные пользователи "
+            f"({total}{suffix}) — выбор станет новым ведущим:"
+        )
+    return f"К кому привязать {follower_username} как ведомого — существующие ведущие ({total}{suffix})?"
+
+
+def _follow_candidates(follower_username: str, mode: str) -> list:
+    if mode == "free":
+        users = [u for u in get_unlinked_users() if u.get("username") != follower_username]
+    else:
+        users = get_leaders()
+    return sorted_users_for_display(users)
+
+
+async def _render_follow_picker(call: CallbackQuery, follower_username: str, mode: str, page: int, edit: bool):
+    candidates = _follow_candidates(follower_username, mode)
+
+    if not candidates:
+        text = (
+            "У этого пользователя пока нет ведомых."
+            if mode == "leaders"
+            else "Нет свободных пользователей для привязки."
+        )
+        await call.answer(text, show_alert=True)
+        return
+
+    kb, total_pages, page = build_follow_picker_kb(follower_username, candidates, page, mode)
+    label = follow_picker_label(follower_username, len(candidates), page, total_pages, mode)
+
+    if edit:
+        try:
+            await call.message.edit_text(label, reply_markup=kb)
+        except Exception:
+            pass
+    else:
+        await call.message.answer(label, reply_markup=kb)
+
 
 @router.callback_query(F.data.startswith("act_follow:"))
-async def action_follow_start(call: CallbackQuery, state: FSMContext):
+async def action_follow_start(call: CallbackQuery):
     if not await admin_only(call):
         return
 
-    username = call.data.split(":", 1)[1]
+    follower_username = call.data.split(":", 1)[1]
 
-    from core.db import get_leaders
-    leaders = sorted_users_for_display(get_leaders())
-    leaders = [u for u in leaders if u.get("username") != username]
+    # If there are no leaders at all yet, skip straight to "free" mode --
+    # showing an empty leaders list with nothing to do but tap through to
+    # "free" anyway would just be an extra step for no reason.
+    mode = "leaders" if get_leaders() else "free"
 
-    pool = leaders if leaders else sorted_users_for_display(
-        [u for u in get_unlinked_users() if u.get("username") != username]
-    )
-    note = "Выберите ведущего:" if leaders else "Пока нет ни одной группы — выберите, к кому присоединить (станет ведущим):"
-
-    if not pool:
-        await call.answer("Нет доступных пользователей, чтобы сделать ведомым.", show_alert=True)
-        return
-
-    rows = [
-        [InlineKeyboardButton(text=user_button_label(u), callback_data=f"followsel:{username}:{u['username']}")]
-        for u in pool
-    ]
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="followsel:cancel")])
-
-    await call.message.answer(note, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await _render_follow_picker(call, follower_username, mode=mode, page=0, edit=False)
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("followsel:") & ~F.data.contains("cancel"))
-async def action_follow_pick(call: CallbackQuery):
+@router.callback_query(F.data.startswith("followall:"))
+async def action_follow_show_all(call: CallbackQuery):
     if not await admin_only(call):
         return
 
-    _, follower_username, leader_username = call.data.split(":")
+    follower_username = call.data.split(":", 1)[1]
+    await _render_follow_picker(call, follower_username, mode="free", page=0, edit=True)
+    await call.answer()
 
-    ok = link_user(follower_username, leader_username)
-    if not ok:
+
+@router.callback_query(F.data.startswith("followpage:"))
+async def follow_picker_page(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    _, follower_username, mode, page_str = call.data.split(":", 3)
+    await _render_follow_picker(call, follower_username, mode=mode, page=int(page_str), edit=True)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("followto:"))
+async def follow_leader_confirm(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    _, follower_username, leader_username = call.data.split(":", 2)
+
+    leader = get_user(leader_username)
+    if not leader:
+        await call.answer("Пользователь не найден", show_alert=True)
+        return
+
+    was_expired_or_inactive = leader.get("status") != "active" or is_expired(leader.get("expires_at"))
+
+    if not link_user(follower_username, leader_username):
         await call.answer("Не удалось привязать.", show_alert=True)
         return
 
+    if was_expired_or_inactive:
+        await run_sync()
+
+    expiry_label = leader.get("expires_at") or "∞"
     await call.message.answer(
-        f"🔗 {follower_username} теперь ведомый у {leader_username}.",
+        f"🔗 {follower_username} теперь ведомый {leader_username} "
+        f"(текущая дата/статус: {expiry_label}).",
         reply_markup=main_menu
     )
-    await call.answer()
-
-
-@router.callback_query(F.data == "followsel:cancel")
-async def action_follow_cancel(call: CallbackQuery):
-    await call.message.answer("Отменено.", reply_markup=main_menu)
     await call.answer()

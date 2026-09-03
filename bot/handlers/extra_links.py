@@ -23,7 +23,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from bot.access import admin_only, notify_bg, notify_client, run_sync
 from bot.config import ADMIN_ID, bot
-from bot.follower_issuance import issue_follower, leader_is_active
+from follower_issuance import issue_follower, leader_is_active
 from core.dates import utcnow_naive
 from core.db import get_followers, get_user, get_user_by_telegram_id, update_user
 from core.notify import log_to_channel

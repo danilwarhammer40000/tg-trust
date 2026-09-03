@@ -2,17 +2,6 @@
 The client-facing informational buttons: status, "my connections", payment
 info, and the instructions submenu (app install steps + RU-sites
 routing/bypass lists). None of these use FSM state.
-
-client_my_connections ("🔗 Мои подключения", renamed from "🔗 Моя ссылка")
-now branches on whether this client has any issued sub-accounts (followers,
-see bot/follower_issuance.py): with none, it behaves exactly like the old
-"🔗 Моя ссылка" did — straight to the connection card, plus a note that one
-link covers 2 devices and a button to request more. With followers, it
-shows a picker instead — one button per account, own included — and reuses
-the same "request more" button underneath. The actual request flow
-(picking a count, notifying the admin, admin approve/reject) lives in
-handlers/extra_links.py — this file only renders the entry-point button and
-the "which of MY accounts" picker.
 """
 import html
 
@@ -36,8 +25,6 @@ from core.instructions import (
 from core.payment import ACCESS_EXPIRED_MESSAGE, PAYMENT_INFO
 
 router = Router()
-
-MORE_DEVICES_NOTE = "ℹ️ Одна ссылка подключает до 2 устройств одновременно."
 
 
 @router.message(F.text == "ℹ️ Мой статус")
@@ -65,14 +52,21 @@ async def client_payment_info(msg: Message):
     await msg.answer(PAYMENT_INFO)
 
 
-def _more_devices_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📱 Подключить ещё устройства", callback_data="extralinks:start")]
-    ])
+# ---------------- MY CONNECTIONS ----------------
+#
+# Listens for both the current label ("🔗 Мои подключения") and the old one
+# ("🔗 Моя ссылка") — a client's Telegram app may have the old label cached
+# on its reply keyboard until it re-renders, and both must keep working.
+#
+# A client normally has exactly one connection (their own account). If an
+# admin issued extra device-links for them (handlers/leader_link.py's
+# "➕ Выпустить нового ведомого") or they requested some themselves
+# (handlers/extra_links.py) and got approved, they become a "leader" of
+# their own "-2"/"-3"/... sub-accounts (see follower_issuance.py) — in that
+# case this shows a picker instead of going straight to a single card.
 
-
-@router.message(F.text == "🔗 Мои подключения")
-async def client_my_connections(msg: Message):
+@router.message(F.text.in_({"🔗 Мои подключения", "🔗 Моя ссылка"}))
+async def client_my_link(msg: Message):
     user = get_user_by_telegram_id(msg.from_user.id)
     if not user:
         await msg.answer("Вы ещё не привязаны. Пришлите вашу карточку подключения (Username/Password).")
@@ -85,44 +79,54 @@ async def client_my_connections(msg: Message):
     username = user.get("username")
     followers = get_followers(username)
 
+    extra_devices_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📱 Подключить ещё устройства", callback_data="extralinks:start")]
+    ])
+
     if not followers:
         link = generate_link(username, DOMAIN)
         await msg.answer(
             format_connection_message(username, user.get("password"), user.get("expires_at"), link)
-            + f"\n\n{MORE_DEVICES_NOTE} Нужно больше — жмите ниже.",
-            reply_markup=_more_devices_kb()
+        )
+        await msg.answer(
+            "ℹ️ Одна ссылка подключает до 2 устройств одновременно.\n\n"
+            "Нужно больше — жмите кнопку ниже, администратор рассмотрит запрос.",
+            reply_markup=extra_devices_kb
         )
         return
 
-    rows = [[InlineKeyboardButton(text=f"👤 {username} (основное)", callback_data=f"myconn:{username}")]]
-    for f in followers:
-        rows.append([InlineKeyboardButton(text=f"📱 {f.get('username')}", callback_data=f"myconn:{f.get('username')}")])
+    accounts = [user] + followers
+    rows = [
+        [InlineKeyboardButton(text=f"🔌 {a.get('username')}", callback_data=f"myconn:{a.get('username')}")]
+        for a in accounts if a.get("username")
+    ]
     rows.append([InlineKeyboardButton(text="📱 Подключить ещё устройства", callback_data="extralinks:start")])
 
     await msg.answer(
-        f"{MORE_DEVICES_NOTE}\n\nУ вас {1 + len(followers)} подключения. Выберите, какое показать:",
+        f"У вас {len(accounts)} подключени{'е' if len(accounts) == 1 else 'я/й'}. "
+        f"Выберите, чтобы получить карточку:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
 
 
 @router.callback_query(F.data.startswith("myconn:"))
 async def client_my_connection_card(call: CallbackQuery):
-    requester = get_user_by_telegram_id(call.from_user.id)
-    if not requester:
+    user = get_user_by_telegram_id(call.from_user.id)
+    if not user:
         await call.answer("Не удалось определить ваш аккаунт.", show_alert=True)
         return
 
+    own_username = user.get("username")
     target_username = call.data.split(":", 1)[1]
 
-    # SECURITY: only the client's own account or one of THEIR OWN
-    # followers is reachable here — never trust the callback_data alone,
-    # since a crafted callback could otherwise ask for anyone's
-    # credentials.
-    own_username = requester.get("username")
+    # SECURITY: only the caller's own account or their own followers are
+    # reachable here — target_username comes from callback_data, which a
+    # client could in principle tamper with, so this is re-checked
+    # server-side rather than trusting that the button they were shown was
+    # the only one they could tap.
     allowed = {own_username} | {f.get("username") for f in get_followers(own_username)}
-
     if target_username not in allowed:
-        await call.answer("Недоступно.", show_alert=True)
+        await call.answer("Доступ запрещён.", show_alert=True)
         return
 
     target = get_user(target_username)
