@@ -10,6 +10,16 @@ Deliberately NOT in core/db.py: this needs core.generator.generate_link()
 which core/db.py has no business depending on. core/db.py itself is left
 completely untouched by this feature — every DB operation here goes
 through its existing add_user()/link_user()/get_followers() functions.
+
+IMPORTANT ORDERING RULE (see build_connection_card()'s docstring):
+issue_follower() only touches the DB. It deliberately does NOT build a
+connection card / call generate_link(). generate_link() shells out to the
+trusttunnel_endpoint binary, which reads its user list from
+vpn.toml/hosts.toml — files that only get rebuilt by
+bot.access.run_sync(). Callers MUST call run_sync() (when
+leader_is_active()) BEFORE calling build_connection_card(), or the binary
+won't know about the brand-new username yet and generate_link() silently
+falls back to a non-functional placeholder URL.
 """
 import re
 
@@ -54,10 +64,10 @@ def next_follower_username(leader_username: str, existing_followers: list) -> st
 
 def issue_follower(leader_username: str, existing_followers: list = None):
     """
-    Creates one new sub-account linked to leader_username: SAME password
-    as the leader (by design — these are the same person's extra
-    devices, not separate clients), expires_at/status synced from the
-    leader via link_user() (identical to manually linking an existing
+    Creates one new sub-account linked to leader_username in the DB only:
+    SAME password as the leader (by design — these are the same person's
+    extra devices, not separate clients), expires_at/status synced from
+    the leader via link_user() (identical to manually linking an existing
     account).
 
     existing_followers can be passed in to avoid a redundant
@@ -66,12 +76,16 @@ def issue_follower(leader_username: str, existing_followers: list = None):
     each new one before picking the next slot number) — the CALLER is
     responsible for keeping that list current between calls in that case.
 
-    Returns (new_username, connection_card_text) on success, or
-    (None, None) if leader_username doesn't exist.
+    Returns the new username on success, or None if leader_username
+    doesn't exist.
+
+    Does NOT generate a connection link/card — see this module's
+    docstring for why that has to happen separately, after a resync. Call
+    build_connection_card() for that, once run_sync() (if needed) has run.
     """
     leader = get_user(leader_username)
     if not leader:
-        return None, None
+        return None
 
     if existing_followers is None:
         existing_followers = get_followers(leader_username)
@@ -92,10 +106,31 @@ def issue_follower(leader_username: str, existing_followers: list = None):
 
     link_user(new_username, leader_username)
 
-    link = generate_link(new_username, DOMAIN)
-    card = format_full_instructions_message(new_username, leader.get("password"), leader.get("expires_at"), link)
+    return new_username
 
-    return new_username, card
+
+def build_connection_card(username: str) -> str:
+    """
+    Generates the actual connection link (via generate_link(), which
+    shells out to the trusttunnel_endpoint binary) and formats the full
+    instructions message for `username`.
+
+    MUST be called AFTER a run_sync() that included this user — i.e. never
+    call this in the same breath as issue_follower() without a run_sync()
+    in between (when the leader is active; see leader_is_active() below).
+    Calling it too early hands back a broken fallback link because the
+    binary hasn't been told about `username` yet. See this module's
+    docstring for the full explanation.
+
+    Returns "" if username somehow doesn't exist (shouldn't happen if
+    called right after issue_follower() succeeded).
+    """
+    user = get_user(username)
+    if not user:
+        return ""
+
+    link = generate_link(username, DOMAIN)
+    return format_full_instructions_message(username, user.get("password"), user.get("expires_at"), link)
 
 
 def leader_is_active(leader: dict) -> bool:
