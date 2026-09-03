@@ -1,16 +1,16 @@
 """
-Who's allowed to do what, and the shared "resync + restart trusttunnel"
-helper. Split out on its own because almost every handlers/ file needs at
-least one of these three functions.
+Who's allowed to do what, the shared "resync + restart trusttunnel"
+helper, and two small async notification wrappers. Split out on its own
+because almost every handlers/ file needs at least one of these.
 """
 import asyncio
-import functools
 import logging
 
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import CallbackQuery
 
 from bot.config import ADMIN_ID
+from core.db import update_user
 from core.service import safe_sync
 
 log = logging.getLogger(__name__)
@@ -41,72 +41,33 @@ async def run_sync():
 
 async def notify_bg(func, *args, **kwargs):
     """
-    Runs a blocking, network-bound core.notify.* call (log_to_channel,
-    notify_admin, notify_user, send_photo_by_file_id,
-    send_document_by_file_id, ...) off the event loop -- same pattern as
-    run_sync() above, for the same reason.
-
-    Every core.notify function uses plain `requests` under the hood, not
-    aiohttp. Calling one directly from an aiogram handler blocks the
-    ENTIRE bot process -- every user's messages and button taps, not just
-    the one who triggered it -- for as long as that HTTP round-trip
-    takes. This was most visible right when a client taps "✅ Да,
-    отправить" on a receipt: log_to_channel() used to upload the photo to
-    the log channel synchronously before anything else could run,
-    stalling the whole bot for that upload's duration -- which looks
-    exactly like Telegram showing a "connecting..." hiccup to everyone
-    using the bot at that moment.
-
-    Usage: await notify_bg(log_to_channel, caption, file_id=file_id)
+    Runs a synchronous notifier (e.g. core.notify.log_to_channel, which
+    does a blocking `requests` call) in a background thread so it never
+    blocks the event loop. Fire-and-forget: callers that don't care about
+    the return value just `await notify_bg(some_sync_func, ...)`.
     """
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
+    return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
 
-async def notify_client(bot, chat_id, text: str, *, clear_username: str = None) -> bool:
+async def notify_client(bot, telegram_id: int, text: str, clear_username: str = None) -> bool:
     """
-    Sends a plain text message to a CLIENT's chat_id via the aiogram Bot
-    object, swallowing the two errors that mean "this id doesn't actually
-    reach a live chat" (a stale/wrong telegram_id -- Telegram raises
-    "chat not found" -- or the client blocked the bot) instead of letting
-    them crash the whole handler.
+    Sends `text` to a client via aiogram's async Bot (as opposed to
+    core.notify's synchronous raw-HTTP senders, which are for the
+    no-event-loop services/ scripts). Returns True if delivered.
 
-    Without this, e.g. tapping an "Extend" button for a user whose stored
-    telegram_id is stale raises TelegramBadRequest INSIDE the handler,
-    BEFORE it ever reaches call.answer(). Telegram then shows a spinning
-    button on the admin's side for the full callback-query timeout --
-    which looks exactly like "buttons react very slowly", even though the
-    underlying change (e.g. the extension itself) already went through to
-    the database fine, since that update happens before this notify call.
-
-    If clear_username is given AND the failure is TelegramBadRequest (the
-    id itself is invalid -- "chat not found" and similar -- a permanent,
-    not-fixing-itself problem), telegram_id is wiped from that user's
-    record automatically. This is what stops the SAME bad id from
-    repeatedly causing this exact failure on every future notification,
-    and from tripping up other places that build UI around telegram_id
-    (e.g. bot/handlers/list_users.py's "💬 Открыть чат" button, which has
-    its own separate guard for the same underlying problem).
-
-    Deliberately NOT cleared on TelegramForbiddenError (the client
-    blocked the bot) -- that's reversible if they unblock it later, so
-    the id is still worth keeping around; only a confirmed-bad id gets
-    wiped.
-
-    Returns True if the message was actually delivered, False otherwise
-    -- most callers don't need to check this (the point is just "don't
-    crash"), but can use it to tell the admin the id turned out stale.
+    If delivery fails because the client blocked the bot / deleted the
+    chat (TelegramForbiddenError) or the chat_id is no longer valid
+    (TelegramBadRequest), and `clear_username` is given, this also clears
+    the dangling telegram_id on that user's record -- otherwise every
+    future notification to them would keep silently failing against a
+    chat that no longer exists.
     """
     try:
-        await bot.send_message(chat_id, text)
+        await bot.send_message(telegram_id, text)
         return True
-    except TelegramForbiddenError as e:
-        log.warning("client chat_id=%s has blocked the bot (telegram_id kept): %s", chat_id, e)
-        return False
-    except TelegramBadRequest as e:
-        log.warning("could not notify client chat_id=%s (invalid id): %s", chat_id, e)
+    except (TelegramForbiddenError, TelegramBadRequest) as e:
+        log.warning("notify_client: could not deliver to %s: %s", telegram_id, e)
         if clear_username:
-            from core.db import update_user
             update_user(clear_username, telegram_id=None)
-            log.warning("cleared invalid telegram_id for user %r", clear_username)
         return False

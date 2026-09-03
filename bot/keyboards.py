@@ -27,10 +27,17 @@ main_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# NOTE: label changed from "🔗 Моя ссылка" to "🔗 Мои подключения" — a
+# client can now have more than one active connection (their own account
+# plus any "-2"/"-3" extra-device sub-accounts issued via
+# handlers/extra_links.py or the admin's "➕ Выпустить нового" button), and
+# handlers/client_menu.py's client_my_link() branches on that. Old clients
+# whose Telegram client cached the previous button label still match —
+# client_my_link() listens for BOTH texts, see its F.text.in_({...}) filter.
 client_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="ℹ️ Мой статус")],
-        [KeyboardButton(text="🔗 Моя ссылка")],
+        [KeyboardButton(text="🔗 Мои подключения")],
         [KeyboardButton(text="📖 Инструкция")],
         [KeyboardButton(text="💳 Реквизиты для оплаты")],
         [KeyboardButton(text="✉️ Написать администратору")],
