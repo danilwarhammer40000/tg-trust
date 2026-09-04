@@ -90,7 +90,23 @@ def toggle_sort_soonest_first() -> bool:
     return settings["sort_soonest_first"]
 
 
-def user_button_label(u: dict) -> str:
+def build_follower_counts(all_users: list) -> dict:
+    """
+    {leader_username: number_of_followers}, built once from a full
+    (unfiltered) user list — pass this into user_button_label()'s
+    follower_count= so the "👑×N" badge is accurate even when some of that
+    leader's followers are hidden from the current view by the
+    hide_followers toggle (see prepare_users_for_display()'s docstring).
+    """
+    counts = {}
+    for u in all_users:
+        linked_to = u.get("linked_to")
+        if linked_to:
+            counts[linked_to] = counts.get(linked_to, 0) + 1
+    return counts
+
+
+def user_button_label(u: dict, follower_count: int = 0) -> str:
     username = u.get("username", "?")
     expires_at = u.get("expires_at")
     label = f"{username} ({expires_at or '∞'})"
@@ -100,6 +116,14 @@ def user_button_label(u: dict) -> str:
 
     if u.get("linked_to"):
         label = f"🔗 {label}"
+    elif follower_count:
+        # "👑×N" -- N extra sub-accounts (device links) issued for this
+        # person, whether by an admin ("➕ Выпустить нового ведомого") or
+        # via their own approved "📱 Подключить ещё устройства" request.
+        # Only shown for a leader/independent user, never alongside 🔗 --
+        # a follower can't itself have followers (see
+        # leader_link.py's _eligible_candidates()).
+        label = f"👑×{follower_count} {label}"
 
     return f"🔸 {label}" if is_expired(expires_at) else label
 
