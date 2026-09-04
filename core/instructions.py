@@ -12,7 +12,7 @@ def render_android_instructions(link: str = None) -> str:
     """
     Interactive (in-bot) version. If `link` is given, it's embedded directly
     at the "open your link" step — used right after trial registration or
-    after "Моя ссылка", where the card with the link may not be repeated
+    after "Моя ссылка", где карточка со ссылкой may not be repeated
     in the same message.
     """
     link_line = link if link else FALLBACK_LINK_NOTE
@@ -168,6 +168,10 @@ ru.vk.store
 ru.rutube.app
 com.vkontakte.android"""
 
+# NOTE: этот список специально короче/без Google-строк в конце (google.com,
+# googleapis.com, gstatic.com, android.clients.google.com,
+# play.googleapis.com) — это Android-специфичные системные адреса, на iOS
+# им тут не место.
 IOS_BYPASS_DOMAINS = """vk.com
 vk.ru
 vkontakte.ru
@@ -245,10 +249,4 @@ o3.ru
 ozon-dostavka.ru
 
 rutube.ru
-rutube.app
-
-google.com
-googleapis.com
-gstatic.com
-android.clients.google.com
-play.googleapis.com"""
+rutube.app"""
