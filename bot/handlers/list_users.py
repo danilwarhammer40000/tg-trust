@@ -99,12 +99,18 @@ async def _send_user_card(call: CallbackQuery, text: str, base_rows: list, tg_id
     Telegram can only resolve that scheme for some accounts (depends on
     the target's privacy settings / whether Telegram has a resolvable
     access hash for them from the bot's side, which the Bot API doesn't
-    expose and can't be checked in advance), and rejects it with
-    "Bad Request: BUTTON_USER_INVALID" for the rest. On that specific
-    error, retries once with the same card but without that one button,
-    instead of the whole card failing to send. Any OTHER TelegramBadRequest
-    is re-raised — this only swallows the one error it knows how to
-    recover from.
+    expose and can't be checked in advance), and rejects it for the rest
+    with one of at least two different errors seen in practice:
+    "Bad Request: BUTTON_USER_INVALID" (Telegram can't resolve the id at
+    all) and "Bad Request: BUTTON_USER_PRIVACY_RESTRICTED" (id resolves,
+    but that account's privacy settings block it). Both mean the same
+    thing for us — this specific button can't work for this specific
+    person — so both trigger the same fallback: retry once with the same
+    card but without that one button, instead of the whole card failing
+    to send. Any OTHER TelegramBadRequest is re-raised — this only
+    swallows errors it knows are about this button, matched by the
+    "BUTTON_USER_" prefix both known variants share (rather than an exact
+    list, in case Telegram has further such variants we haven't hit yet).
     """
     rows = list(base_rows)
     if tg_id:
@@ -113,8 +119,8 @@ async def _send_user_card(call: CallbackQuery, text: str, base_rows: list, tg_id
     try:
         await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     except TelegramBadRequest as e:
-        if tg_id and "BUTTON_USER_INVALID" in str(e):
-            log.info("tg://user deep link invalid for telegram_id=%s, resending without it", tg_id)
+        if tg_id and "BUTTON_USER_" in str(e):
+            log.info("tg://user deep link rejected for telegram_id=%s (%s), resending without it", tg_id, e)
             await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=base_rows))
         else:
             raise
