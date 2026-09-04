@@ -69,7 +69,9 @@ async def client_payment_info(msg: Message):
 # "➕ Выпустить нового ведомого") or they requested some themselves
 # (handlers/extra_links.py) and got approved, they become a "leader" of
 # their own "-2"/"-3"/... sub-accounts (see follower_issuance.py) and see
-# more than one button here.
+# more than one button here — the header spells out how many of those are
+# extra (this mirrors the admin-side "👑 Доп. ссылок выпущено: N" counter
+# in handlers/list_users.py's user_actions_menu()).
 
 @router.message(F.text.in_({"🔗 Мои подключения", "🔗 Моя ссылка"}))
 async def client_my_link(msg: Message):
@@ -92,9 +94,13 @@ async def client_my_link(msg: Message):
     ]
     rows.append([InlineKeyboardButton(text="📱 Подключить ещё устройства", callback_data="extralinks:start")])
 
-    note = "\n\nℹ️ Одна ссылка подключает до 2 устройств одновременно." if len(accounts) == 1 else ""
+    if followers:
+        header = f"Ваши подключения: {len(accounts)} всего (основное + {len(followers)} доп.)."
+    else:
+        header = "Ваши подключения: 1.\n\nℹ️ Одна ссылка подключает до 2 устройств одновременно."
+
     await msg.answer(
-        f"Ваши подключения ({len(accounts)}):{note}\n\nНажмите на нужное, чтобы получить карточку:",
+        f"{header}\n\nНажмите на нужное, чтобы получить карточку:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
 
