@@ -52,12 +52,42 @@ async def deploy_button(msg: Message):
         proc = await asyncio.create_subprocess_exec(
             "systemd-run",
             "--unit=trustpanel-deploy-manual",
+            # CHANGED: added --collect. Without it, a FINISHED transient
+            # unit (success or failure) stays registered with systemd
+            # indefinitely. The next time this button is pressed,
+            # systemd-run then refuses to reuse the same --unit= name
+            # ("Unit trustpanel-deploy-manual.service already exists")
+            # and exits immediately WITHOUT ever running deploy.sh —
+            # previously nothing checked that failure (see the
+            # returncode check below, which is the other half of this
+            # fix), so it looked like the deploy button silently did
+            # nothing on the 2nd+ press.
+            "--collect",
             "--description=Manual deploy triggered from bot",
             "bash", "/opt/trustpanel/deploy.sh",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        await proc.wait()
+        stdout, _ = await proc.communicate()
     except OSError as e:
         log.exception("failed to launch deploy")
         await msg.answer(f"❌ Не удалось запустить деплой: {e}")
+        return
+
+    # NOTE: this only reports whether systemd-run managed to SCHEDULE the
+    # job (bad unit name, missing systemd-run binary, permissions, ...).
+    # It does NOT wait for deploy.sh itself to finish — deploy.sh restarts
+    # THIS bot process partway through (step 4/6), which kills this very
+    # handler, so waiting for deploy.sh's real completion from here is
+    # never reliable by design. deploy.sh's actual outcome (success /
+    # failure at any step / "bot didn't come back up") is reported
+    # separately, straight from deploy.sh via curl to the Bot API — see
+    # deploy.sh's notify()/on_error() — since that's the only
+    # notification path that survives this process being restarted
+    # mid-script.
+    if proc.returncode != 0:
+        output = (stdout or b"").decode(errors="replace").strip()
+        await msg.answer(
+            f"❌ Не удалось запустить деплой (systemd-run завершился с кодом {proc.returncode}):\n"
+            f"{output[-1500:] or '(пусто)'}"
+        )
