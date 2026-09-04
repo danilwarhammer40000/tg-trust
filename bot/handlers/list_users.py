@@ -8,7 +8,10 @@ transition into LeaderLink.select (owned by handlers/leader_link.py) — see
 bot/states.py's docstring on why that's fine. action_unlink and
 action_follow_start (also in leader_link.py) are one-shot/stateless.
 """
+import logging
+
 from aiogram import Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -24,6 +27,7 @@ from core.db import delete_user, get_followers, get_user, list_users, unlink_use
 from core.generator import generate_link
 
 router = Router()
+log = logging.getLogger(__name__)
 
 
 # ---------------- LIST USERS ----------------
@@ -88,6 +92,34 @@ async def menu_list_page(call: CallbackQuery):
 
 # ---------------- USER ACTIONS MENU ----------------
 
+async def _send_user_card(call: CallbackQuery, text: str, base_rows: list, tg_id) -> None:
+    """
+    Sends the user-actions card. If tg_id is set, tries to include a
+    "💬 Открыть чат в Telegram" tg://user?id=... deep-link button first —
+    Telegram can only resolve that scheme for some accounts (depends on
+    the target's privacy settings / whether Telegram has a resolvable
+    access hash for them from the bot's side, which the Bot API doesn't
+    expose and can't be checked in advance), and rejects it with
+    "Bad Request: BUTTON_USER_INVALID" for the rest. On that specific
+    error, retries once with the same card but without that one button,
+    instead of the whole card failing to send. Any OTHER TelegramBadRequest
+    is re-raised — this only swallows the one error it knows how to
+    recover from.
+    """
+    rows = list(base_rows)
+    if tg_id:
+        rows = rows + [[InlineKeyboardButton(text="💬 Открыть чат в Telegram", url=f"tg://user?id={tg_id}")]]
+
+    try:
+        await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except TelegramBadRequest as e:
+        if tg_id and "BUTTON_USER_INVALID" in str(e):
+            log.info("tg://user deep link invalid for telegram_id=%s, resending without it", tg_id)
+            await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=base_rows))
+        else:
+            raise
+
+
 @router.callback_query(F.data.startswith("user:"))
 async def user_actions_menu(call: CallbackQuery):
     if not await admin_only(call):
@@ -122,19 +154,10 @@ async def user_actions_menu(call: CallbackQuery):
         )],
     ]
 
-    if tg_id:
-        # tg://user?id=... opens a direct 1:1 chat with that Telegram
-        # account in the client app — a real chat window, not routed
-        # through the bot like "✉️ Написать" above. Works in Telegram
-        # Desktop/mobile as long as the app can resolve the numeric id
-        # (it generally can once the account has messaged the bot, which
-        # is exactly when telegram_id gets set in the first place).
-        rows.append([InlineKeyboardButton(text="💬 Открыть чат в Telegram", url=f"tg://user?id={tg_id}")])
-
-    # A follower's own expiry/status is redirected to its leader anyway (see
-    # core.db.update_user), so it can't become a leader itself — offer only
-    # "unlink" for it.
     if linked_to:
+        # A follower's own expiry/status is redirected to its leader
+        # anyway (see core.db.update_user), so it can't become a leader
+        # itself — offer only "unlink" for it.
         rows.append([InlineKeyboardButton(text="🔓 Отвязать", callback_data=f"act_unlink:{username}")])
     else:
         is_leader = bool(followers)
@@ -150,9 +173,7 @@ async def user_actions_menu(call: CallbackQuery):
             # no need to gate this button on get_leaders() anymore.
             rows.append([InlineKeyboardButton(text="🔗 Сделать ведомым", callback_data=f"act_follow:{username}")])
 
-    kb = InlineKeyboardMarkup(inline_keyboard=rows)
-
-    await call.message.answer(f"👤 {username}\n{sub_status}{link_status}\n\nChoose action:", reply_markup=kb)
+    await _send_user_card(call, f"👤 {username}\n{sub_status}{link_status}\n\nChoose action:", rows, tg_id)
     await call.answer()
 
 
