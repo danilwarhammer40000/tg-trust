@@ -14,7 +14,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from bot.access import admin_only, run_sync
 from bot.config import DOMAIN
-from bot.display import prepare_users_for_display, user_button_label
+from bot.display import build_follower_counts, prepare_users_for_display, user_button_label
 from bot.formatting import extract_telegram_id_from_message, format_full_instructions_message
 from bot.keyboards import cancel_kb, main_menu
 from bot.pagination import paginate, pagination_nav_row
@@ -28,13 +28,16 @@ router = Router()
 
 # ---------------- LIST USERS ----------------
 
-def build_list_users_kb(users: list, page: int) -> tuple:
-    """Returns (keyboard, total_pages, page)."""
+def build_list_users_kb(users: list, page: int, follower_counts: dict) -> tuple:
+    """Returns (keyboard, total_pages, page). follower_counts comes from
+    bot.display.build_follower_counts() over the FULL (unfiltered) user
+    list — see that function's docstring for why it can't just be derived
+    from `users` (this page's already-filtered/paginated slice)."""
     page_users, total_pages, page = paginate(users, page)
 
     rows = [
         [InlineKeyboardButton(
-            text=user_button_label(u),
+            text=user_button_label(u, follower_counts.get(u.get("username"), 0)),
             callback_data=f"user:{u.get('username')}"
         )]
         for u in page_users if u.get("username")
@@ -49,13 +52,15 @@ async def menu_list(msg: Message):
     if not await admin_only(msg):
         return
 
-    users = prepare_users_for_display(list_users() or [])
+    all_users = list_users() or []
+    follower_counts = build_follower_counts(all_users)
+    users = prepare_users_for_display(all_users)
 
     if not users:
         await msg.answer("No users")
         return
 
-    kb, total_pages, page = build_list_users_kb(users, 0)
+    kb, total_pages, page = build_list_users_kb(users, 0, follower_counts)
     label = f"Select user ({len(users)} всего" + (f", стр. {page + 1}/{total_pages}" if total_pages > 1 else "") + "):"
 
     await msg.answer(label, reply_markup=kb)
@@ -67,9 +72,11 @@ async def menu_list_page(call: CallbackQuery):
         return
 
     page = int(call.data.split(":", 1)[1])
-    users = prepare_users_for_display(list_users() or [])
+    all_users = list_users() or []
+    follower_counts = build_follower_counts(all_users)
+    users = prepare_users_for_display(all_users)
 
-    kb, total_pages, page = build_list_users_kb(users, page)
+    kb, total_pages, page = build_list_users_kb(users, page, follower_counts)
     label = f"Select user ({len(users)} всего" + (f", стр. {page + 1}/{total_pages}" if total_pages > 1 else "") + "):"
 
     try:
@@ -99,7 +106,9 @@ async def user_actions_menu(call: CallbackQuery):
         link_lines.append(f"🔗 Ведомый у: {linked_to}")
     elif followers:
         names = ", ".join(f.get("username", "?") for f in followers)
-        link_lines.append(f"👑 Ведущий для: {names}")
+        # Explicit count, not just implied by the name list — this is the
+        # "сколько дополнительных ссылок выпущено для человека" figure.
+        link_lines.append(f"👑 Доп. ссылок выпущено: {len(followers)} ({names})")
     link_status = ("\n" + "\n".join(link_lines)) if link_lines else ""
 
     rows = [
