@@ -9,6 +9,43 @@ echo "=== TrustPanel Deploy / Update ==="
 DEFAULT_DIR="/opt/trustpanel"
 PROJECT_DIR="${PROJECT_DIR:-$DEFAULT_DIR}"
 
+# Mirror everything this script prints into a log file too, so on_error()
+# below can attach the last few lines of real context to its Telegram
+# notification instead of just "something failed, go check journalctl".
+LOG_FILE="$(mktemp)"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# Best-effort Telegram notification. A silent no-op until .env has been
+# sourced (BOT_TOKEN/ADMIN_ID unset) — i.e. the two checks below, before
+# cd/source .env, can't notify on failure; everything from "1) PULL LATEST
+# CODE" onward can.
+notify() {
+    if [ -n "${BOT_TOKEN:-}" ] && [ -n "${ADMIN_ID:-}" ]; then
+        curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${ADMIN_ID}" \
+            --data-urlencode "text=$1" > /dev/null || true
+    fi
+}
+
+# CHANGED: previously this script only ever notified Telegram at the very
+# end (final success, or the step-6 health-check failure) — any failure in
+# steps 1-3/5 (git pull rejected, pip install error, permission issue
+# copying a unit file, ...) died silently thanks to `set -euo pipefail`:
+# the admin saw nothing in the bot at all, only the "🚀 Запускаю деплой..."
+# message and then silence, even though the script (and the log it left in
+# journalctl) had the real reason the whole time. This trap now fires on
+# ANY command that fails under `set -e` (commands intentionally allowed to
+# fail already use `|| true` throughout this script, so they don't trigger
+# it) and reports where + why immediately.
+on_error() {
+    local exit_code=$? line_no=$1
+    notify "❌ Деплой упал (строка ${line_no}, код ${exit_code}).
+
+Последние строки лога:
+$(tail -n 25 "$LOG_FILE")"
+}
+trap 'on_error $LINENO' ERR
+
 if [ ! -d "$PROJECT_DIR/.git" ]; then
     echo "[ERROR] $PROJECT_DIR is not a git checkout."
     echo "        This looks like a fresh machine — run install.sh instead."
@@ -98,8 +135,8 @@ install_unit_if_changed () {
     fi
 }
 
-# CHANGED: trustpanel-bot.service is now also managed from the repo, same
-# as the cleanup/backup units — previously it was only ever written once by
+# trustpanel-bot.service is also managed from the repo, same as the
+# cleanup/backup units — previously it was only ever written once by
 # install.sh's heredoc, so any later hardening change to the unit file
 # never reached already-installed servers without a manual edit.
 install_unit_if_changed "trustpanel-bot.service"
@@ -169,12 +206,13 @@ else
     echo "Recent logs:"
     journalctl -u trustpanel-bot.service -n 40 --no-pager || true
 
-    if [ -n "${BOT_TOKEN:-}" ] && [ -n "${ADMIN_ID:-}" ]; then
-        curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d chat_id="${ADMIN_ID}" \
-            -d text="❌ Деплой прошёл, но бот не запустился. Проверьте journalctl -u trustpanel-bot.service" > /dev/null || true
-    fi
+    notify "❌ Деплой прошёл, но бот не запустился. Проверьте journalctl -u trustpanel-bot.service"
 
+    # Disarm the ERR trap before exiting on purpose here -- we already
+    # sent the specific, more useful "bot failed to start" message above;
+    # letting the trap ALSO fire on this `exit 1` would send a second,
+    # redundant "deploy failed at line N" message right after it.
+    trap - ERR
     exit 1
 fi
 
@@ -194,11 +232,7 @@ if [ -n "${MAX_BOT_TOKEN:-}" ]; then
     fi
 fi
 
-if [ -n "${BOT_TOKEN:-}" ] && [ -n "${ADMIN_ID:-}" ]; then
-    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-        -d chat_id="${ADMIN_ID}" \
-        -d text="✅ Деплой завершён, бот работает." > /dev/null || true
-fi
+notify "✅ Деплой завершён, бот работает."
 
 echo ""
 echo "DONE"
