@@ -3,36 +3,37 @@ Synchronous wrapper around the Gemini API's generateContent endpoint,
 used to extract structured data from a payment receipt screenshot/PDF.
 
 Deliberately does NOT ask Gemini to decide whether to auto-renew — it
-only extracts what's on the image (amount, date, who/what bank). The
-actual approve/reject decision is core/auto_renewal.py's business-rule
-logic, in plain Python, so a bad extraction or hallucination can't
-directly grant VPN access — see evaluate_receipt_extraction() there.
+only extracts what's on the image (amount). The actual approve/reject
+decision is core/auto_renewal.py's business-rule logic, in plain Python,
+so a bad extraction or hallucination can't directly grant VPN access.
 
 Synchronous by design (plain `requests`, no aiohttp) so this can be called
-identically from an async bot handler (via run_in_executor, same pattern
-already used for core.service.safe_sync) and from the standalone
-services/auto_renewal_overdue_check.py script, which has no event loop.
+identically from an async bot handler (via run_in_executor) and from the
+standalone services/auto_renewal_overdue_check.py script, which has no
+event loop.
 
-PROXY SUPPORT: outbound calls to Gemini can be routed through an
-admin-configurable proxy (the "🌐 Прокси для Gemini API" field under
-"🤖 Автопродление -> ⚙️ Настроить условия" in the bot, or GEMINI_PROXY in
-.env as the initial seed — see core.auto_renewal.DEFAULT_SETTINGS). This
-exists because generativelanguage.googleapis.com enforces a region
+PROXY (Cloudflare Worker / any HTTPS reverse-proxy) — three-state, not
+two, on purpose:
+  1. Not configured at all (GEMINI_PROXY_URL unset in .env) ->
+     proxy_configured() is False, bot/handlers/auto_renewal_review.py
+     doesn't even show the toggle button, always calls Google directly.
+  2. Configured AND enabled (the normal case once set up) ->
+     is_proxy_enabled() True, calls go through GEMINI_PROXY_URL.
+  3. Configured but temporarily DISABLED via the bot's live toggle
+     (autoren:toggle_proxy) -> lets the admin fall back to a direct
+     connection without touching .env or restarting the bot, e.g. to
+     check whether a currently-down proxy is the actual cause of a
+     Gemini failure. This ON/OFF state is separate from whether a URL is
+     even set, and is persisted the same way every other auto-renewal
+     setting is — see core.auto_renewal.toggle_gemini_proxy_enabled().
+
+This exists because generativelanguage.googleapis.com enforces a region
 allowlist that a Russian-hosted VPS IP typically fails
 (FAILED_PRECONDITION "User location is not supported"), independent of
-whether the API key itself is valid. Two proxy forms are accepted:
-
-  - Worker / HTTPS reverse-proxy (e.g. a Cloudflare Worker forwarding to
-    Google and injecting its own key): the whole googleapis.com host is
-    replaced by the given base URL. requests.post gets no proxies= at
-    all -- the redirection IS the proxy.
-  - socks5:// / socks5h:// : the real Google endpoint is used unchanged,
-    but the TCP connection goes through the given SOCKS5 proxy. Needs
-    the `requests[socks]` (PySocks) extra installed -- see
-    requirements.txt.
-
-Empty/unset -> behaves exactly as before this feature existed (direct
-call, no proxy).
+whether the API key itself is valid. The worker is expected to forward
+whatever path+query it receives straight to Google (and may inject its
+own key, in which case our own ?key= is simply redundant/ignored — either
+way works).
 """
 import json
 import logging
@@ -41,17 +42,24 @@ import base64
 
 import requests
 
-from core.auto_renewal import get_setting
-
 log = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# gemini-2.5-flash was retired (Gemini API now returns 404 for it,
-# telling callers to switch to gemini-3.6-flash). Google's flash-tier
-# models seem to get retired every few months (2.0 -> 2.5 -> 3.x already),
-# so this is deliberately read from GEMINI_MODEL first — if this breaks
-# again, set GEMINI_MODEL in .env instead of needing a code change.
+# gemini-2.5-flash was retired (Gemini API now returns 404 for it, telling
+# callers to switch to gemini-3.6-flash). Google's flash-tier models seem
+# to get retired every few months, so this is deliberately read from
+# GEMINI_MODEL first — if this breaks again, set GEMINI_MODEL in .env
+# instead of needing a code change.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+
+# Cloudflare Worker (or any HTTPS reverse-proxy) base URL, e.g.
+# https://your-worker.workers.dev — set in .env, changeable live via the
+# bot's proxy toggle (see module docstring) but the URL itself is only
+# read from .env (changing the URL, as opposed to on/off, still needs a
+# .env edit + bot restart — only the enable/disable state is live).
+GEMINI_PROXY_URL = os.getenv("GEMINI_PROXY_URL", "").strip()
+
+DIRECT_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # Keep this in Russian: the receipts themselves are Russian bank transfer
 # screenshots, and error/notes fields written in Russian are what end up
@@ -86,52 +94,50 @@ class GeminiError(Exception):
 
 
 def proxy_configured() -> bool:
-    """Whether a Gemini proxy (Worker/HTTPS or SOCKS5) is currently set —
-    used by bot/handlers/auto_renewal_review.py's status screen to show
-    whether outbound Gemini calls are being routed through one right now."""
-    return bool((get_setting("gemini_proxy") or "").strip())
+    """Whether GEMINI_PROXY_URL is set in .env at all — the bot only shows
+    the live enable/disable toggle when this is True (nothing to toggle
+    otherwise)."""
+    return bool(GEMINI_PROXY_URL)
 
 
-def _resolve_endpoint_and_proxies():
-    """
-    Reads the "gemini_proxy" setting and returns (url, proxies) ready for
-    requests.post(url, ..., proxies=proxies).
-    """
-    proxy = (get_setting("gemini_proxy") or "").strip()
-    direct_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+def is_proxy_enabled() -> bool:
+    """Whether outbound Gemini calls actually go through the configured
+    proxy RIGHT NOW. Only meaningful when proxy_configured() is True —
+    delegates the persisted on/off state to core.auto_renewal, which
+    already owns every other auto-renewal setting's storage."""
+    if not proxy_configured():
+        return False
+    from core.auto_renewal import get_setting
+    return bool(get_setting("gemini_proxy_enabled"))
 
-    if not proxy:
-        return direct_url, None
 
-    if proxy.startswith("http://") or proxy.startswith("https://"):
-        # Worker / HTTPS reverse-proxy: replace the host entirely. The
-        # worker is expected to forward path+query to Google itself (and
-        # may inject its own key), so the ?key= we still send below is
-        # harmless even if the worker ignores or overwrites it.
-        return f"{proxy.rstrip('/')}/v1beta/models/{GEMINI_MODEL}:generateContent", None
+def toggle_proxy_enabled() -> bool:
+    """Flips the live on/off state and returns the new value. Callers
+    (bot/handlers/auto_renewal_review.py) are responsible for checking
+    proxy_configured() first — this doesn't refuse to toggle an unset
+    proxy, it just wouldn't have any visible effect (is_proxy_enabled()
+    stays False regardless per the check above)."""
+    from core.auto_renewal import toggle_gemini_proxy_enabled
+    return toggle_gemini_proxy_enabled()
 
-    if proxy.startswith("socks5://") or proxy.startswith("socks5h://"):
-        # Real Google endpoint, routed through the SOCKS5 proxy.
-        return direct_url, {"http": proxy, "https": proxy}
 
-    raise GeminiError(
-        f"Неизвестный формат gemini_proxy: {proxy!r} "
-        "(ожидается http(s):// или socks5(h)://)"
-    )
+def _resolve_endpoint() -> str:
+    if proxy_configured() and is_proxy_enabled():
+        return f"{GEMINI_PROXY_URL.rstrip('/')}/v1beta/models/{GEMINI_MODEL}:generateContent"
+    return DIRECT_URL
 
 
 def extract_receipt_data(file_bytes: bytes, mime_type: str) -> dict:
     """
     Returns a dict matching EXTRACTION_PROMPT's schema. Raises GeminiError
-    on any failure (missing API key, network error, malformed response,
-    unrecognized proxy setting) — callers (core/auto_renewal.py) treat
-    that the same as "couldn't read the receipt" and fall back to the
-    normal manual-approval queue.
+    on any failure (missing API key, network error, malformed response) —
+    callers (core/auto_renewal.py) treat that the same as "couldn't read
+    the receipt" and fall back to the normal manual-approval queue.
     """
     if not GEMINI_API_KEY:
         raise GeminiError("GEMINI_API_KEY missing")
 
-    url, proxies = _resolve_endpoint_and_proxies()
+    url = _resolve_endpoint()
 
     payload = {
         "contents": [{
@@ -147,9 +153,9 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str) -> dict:
     }
 
     try:
-        r = requests.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=30, proxies=proxies)
+        r = requests.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=30)
     except requests.RequestException as e:
-        raise GeminiError(f"network error: {e}") from e
+        raise GeminiError(f"network error ({'proxy' if url != DIRECT_URL else 'direct'}): {e}") from e
 
     if not r.ok:
         raise GeminiError(f"HTTP {r.status_code}: {r.text[:300]}")
