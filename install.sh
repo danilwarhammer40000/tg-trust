@@ -87,26 +87,21 @@ GEMINI_API_KEY=$(echo "$GEMINI_API_KEY" | tr -d '\r')
 read -r -p "LOG_CHANNEL_ID (numeric channel id, needed for auto-renewal, Enter to skip): " LOG_CHANNEL_ID
 LOG_CHANNEL_ID=$(echo "$LOG_CHANNEL_ID" | tr -d '\r')
 
-# Optional — only relevant if GEMINI_API_KEY was given above. Google's
-# Generative Language API rejects requests from some server locations
-# with HTTP 400 "User location is not supported for the API use" —
-# unrelated to the API key itself, just where the request physically
-# comes from. If that happens (see core/gemini_client.py's error message
-# for the exact symptom), route ONLY the Gemini call through a SOCKS5/HTTP
-# proxy sitting in a supported region (any EU country works) — deliberately
-# NOT the generic HTTP_PROXY/HTTPS_PROXY env vars, since those would also
-# silently redirect Telegram/MAX Bot API traffic through the same proxy.
-if [ -n "$GEMINI_API_KEY" ]; then
-    echo ""
-    echo "If Gemini rejects requests from this server's location (HTTP 400"
-    echo "'User location is not supported'), set a proxy here — e.g. a"
-    echo "SOCKS5 proxy on a cheap VM in any supported country (EU works)."
-    echo "Format: socks5h://user:pass@host:port  or  http://user:pass@host:port"
-    read -r -p "GEMINI_PROXY_URL (Enter to skip, use direct connection): " GEMINI_PROXY_URL
-    GEMINI_PROXY_URL=$(echo "$GEMINI_PROXY_URL" | tr -d '\r')
-else
-    GEMINI_PROXY_URL=""
-fi
+# Optional — proxy for outbound Gemini API calls. Google's Gemini API
+# enforces a region allowlist independent of API-key validity; a
+# Russian-hosted VPS IP typically gets FAILED_PRECONDITION ("User
+# location is not supported") even with a valid key. Two forms accepted,
+# same as the in-bot "🌐 Прокси для Gemini API" setting (which can
+# override this later without touching .env or restarting anything):
+#   - a Worker / HTTPS reverse-proxy base URL, e.g.
+#     https://your-worker.workers.dev
+#   - a SOCKS5 endpoint, e.g. socks5h://user:pass@host:port
+# Leave blank for a direct connection (no proxy).
+echo ""
+echo "Прокси для Gemini API (опционально, можно поменять позже в боте) —"
+echo "Worker/HTTPS URL (https://...) или SOCKS5 (socks5h://user:pass@host:port)."
+read -r -p "GEMINI_PROXY (Enter чтобы пропустить): " GEMINI_PROXY
+GEMINI_PROXY=$(echo "$GEMINI_PROXY" | tr -d '\r')
 
 # -------------------------
 # ENV
@@ -119,8 +114,8 @@ ADMIN_ID=$ADMIN_ID
 TRUSTTUNNEL_DOMAIN=$DOMAIN
 MAX_BOT_TOKEN=$MAX_BOT_TOKEN
 GEMINI_API_KEY=$GEMINI_API_KEY
+GEMINI_PROXY=$GEMINI_PROXY
 LOG_CHANNEL_ID=$LOG_CHANNEL_ID
-GEMINI_PROXY_URL=$GEMINI_PROXY_URL
 PYTHONPATH=$PROJECT_DIR
 EOF
 
