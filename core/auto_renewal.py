@@ -8,8 +8,7 @@ via core.db.claim_pending_request_for_ai() first, to prevent double
 processing):
   1. Real-time, from bot/handlers/receipt.py and feedback.py, when a
      receipt arrives while auto-renewal is ON and it's currently within
-     the night window (22:00-06:00 Krasnoyarsk) -- or any time of day at
-     all if "fully automatic" mode is on (see should_attempt_now()).
+     the night window (22:00-06:00 Krasnoyarsk).
   2. services/auto_renewal_overdue_check.py's periodic timer, for any
      receipt still unprocessed by the admin 3+ hours after submission —
      independent of time of day, but still gated on the master ON/OFF
@@ -19,32 +18,6 @@ Everything here is synchronous (plain function calls, no async/await) so
 it works identically called from an aiogram handler via
 loop.run_in_executor(...) and from the standalone periodic script, which
 has no event loop at all.
-
-The client is never told THAT a renewal happened automatically -- see
-bot/handlers/receipt.py / feedback.py and bot/handlers/auto_renewal_review.py
-(the disable/rollback message uses generic wording, never the word
-"automatic"). What the client DOES get, the moment auto-renewal actually
-approves their receipt, is the exact same "✅ Ваша подписка продлена..."
-text a manual approval sends -- no delay, no different timing (see
-_apply_and_request_review). In every other case -- auto-renewal wasn't
-applicable, or it was attempted and fell back to manual for any reason
-including the anti-abuse lock below -- the client gets the normal
-"Отправлено администратору. Ждите подтверждения." acknowledgement, same
-as if auto-renewal didn't exist (see bot/auto_renewal_hook.py's
-try_auto_renewal for the exact dispatch). The client is never left with
-literal silence.
-
-Anti-abuse: auto-renewal may apply at most once per AUTO_RENEWAL_LOCK_DAYS
-per user (see _is_locked / process_pending_request_with_ai). The first
-receipt in that window is handled automatically; every next one during
-the lock falls straight to manual review with a "possible replay/abuse"
-warning card for the admin (the client-facing side is unaffected -- they
-just get the normal acknowledgement above, nothing that hints at why).
-The lock also clears early the moment a human actually verifies the
-account (any manual admin approval/extension, or a rollback via
-"🚫 Отключить"), and clears itself automatically once
-AUTO_RENEWAL_LOCK_DAYS have passed since the last auto-renewal, even if
-no admin touched it.
 """
 import json
 import logging
@@ -52,7 +25,7 @@ import os
 from datetime import datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 
-from core.dates import calc_new_expiry_months, is_expired, utcnow_naive
+from core.dates import calc_new_expiry_months, is_expired, parse_expiry, utcnow_naive
 from core.db import get_user, update_user
 from core.notify import get_file_bytes, log_to_channel, notify_admin, notify_user, send_photo_by_file_id
 from core.paths import AUTO_RENEWAL_SETTINGS_PATH
@@ -70,16 +43,19 @@ DEFAULT_SETTINGS = {
     "overdue_hours": 3,
     "min_amount": 100,
     "min_confidence": 0.75,
-    "abuse_lock_days": 7,   # see _is_locked() -- how long one auto-renewal blocks the next
+    "date_tolerance_days": 1,   # accept "today" or N days back (Krasnoyarsk-local)
+    # Optional proxy for outbound Gemini API calls -- either a Worker/HTTPS
+    # reverse-proxy base URL or a socks5(h):// endpoint. See
+    # core.gemini_client._resolve_endpoint_and_proxies() for how this is
+    # interpreted. Seeded from .env on first run (install.sh may write
+    # GEMINI_PROXY), but editable afterwards via "🤖 Автопродление -> ⚙️
+    # Настроить условия" without touching .env or restarting the service.
+    "gemini_proxy": os.getenv("GEMINI_PROXY", ""),
 }
 
 # Human-readable metadata for the bot's "⚙️ Настроить условия" screen — one
 # place that both the settings menu and the input-validation logic below
 # read from, so a new field only needs to be added here once.
-#
-# NOTE: there is deliberately no date-related field here. Auto-renewal only
-# ever needs to know how much money came in -- it does not check the date
-# printed on the receipt at all (see evaluate_receipt_extraction below).
 FIELD_META = {
     "night_start": {
         "label": "🌙 Начало ночного окна",
@@ -101,10 +77,20 @@ FIELD_META = {
         "label": "🎯 Мин. уверенность Gemini",
         "prompt": "Минимальная уверенность распознавания чека, от 0 до 1 (например 0.75):",
     },
-    "abuse_lock_days": {
-        "label": "🔒 Блокировка повтора (дней)",
-        "prompt": "Сколько дней после одного автопродления блокировать следующее для того же "
-                  "пользователя (защита от накрутки)? Целое число, например 7:",
+    "date_tolerance_days": {
+        "label": "📅 Допуск по дате платежа (дней назад)",
+        "prompt": "На сколько дней назад от сегодня (по Красноярску) допускается дата платежа на чеке? 0 = только сегодня, 1 = сегодня или вчера:",
+    },
+    "gemini_proxy": {
+        "label": "🌐 Прокси для Gemini API",
+        "prompt": (
+            "Отправьте адрес прокси для запросов к Gemini. Поддерживаются два формата:\n\n"
+            "• Cloudflare Worker / любой HTTPS-реверс-прокси:\n"
+            "https://your-worker.workers.dev\n\n"
+            "• SOCKS5:\n"
+            "socks5h://user:pass@host:port\n\n"
+            "Отправьте «-», чтобы отключить прокси и ходить напрямую."
+        ),
     },
 }
 
@@ -220,13 +206,23 @@ def set_setting_validated(key: str, raw_value: str):
         except ValueError:
             return False, "Введите число от 0 до 1, например 0.75"
 
-    elif key == "abuse_lock_days":
+    elif key == "date_tolerance_days":
         try:
             value = int(raw_value)
-            if value <= 0:
+            if value < 0:
                 raise ValueError
         except ValueError:
-            return False, "Введите положительное целое число дней, например 7"
+            return False, "Введите целое число ≥ 0, например 1"
+
+    elif key == "gemini_proxy":
+        value = raw_value
+        if value in ("-", "", "off", "выкл"):
+            value = ""
+        elif not value.startswith(("http://", "https://", "socks5://", "socks5h://")):
+            return False, (
+                "Укажите адрес воркера (https://...) или SOCKS5-прокси "
+                "(socks5h://user:pass@host:port), либо «-» чтобы отключить."
+            )
 
     else:
         return False, f"Неизвестный параметр: {key}"
@@ -300,44 +296,6 @@ def is_request_overdue(requested_at_iso: str, now: datetime = None) -> bool:
     return (reference - requested_at) >= threshold
 
 
-# ---------------- ANTI-ABUSE LOCK ----------------
-
-def _is_locked(user: dict):
-    """
-    Returns (locked: bool, unlock_date: date_or_None). A user is locked
-    out of auto-renewal if their last auto-renewal (auto_renewal_applied)
-    happened less than `abuse_lock_days` ago. Missing/unparseable
-    timestamp on an otherwise-set flag is treated as locked (fail safe --
-    better to fall back to manual once than to accidentally let a replay
-    through).
-
-    Cleared early (see callers of update_user(..., auto_renewal_applied=False)
-    in bot/handlers/receipt.py, extend.py, auto_renewal_review.py's
-    aircheck:disable, and services/cleanup.py) the moment a human actually
-    verifies the account, or automatically once the window above has
-    simply passed.
-    """
-    if not user.get("auto_renewal_applied"):
-        return False, None
-
-    applied_at = user.get("auto_renewal_applied_at")
-    lock_days = get_setting("abuse_lock_days")
-
-    if not applied_at:
-        return True, None
-
-    try:
-        applied_dt = datetime.fromisoformat(applied_at)
-    except ValueError:
-        return True, None
-
-    unlock_dt = applied_dt + timedelta(days=lock_days)
-    if utcnow_naive() >= unlock_dt:
-        return False, None
-
-    return True, unlock_dt.date()
-
-
 # ---------------- BUSINESS RULES ----------------
 
 def evaluate_receipt_extraction(extraction: dict):
@@ -350,19 +308,10 @@ def evaluate_receipt_extraction(extraction: dict):
     of these checks and falls back to the normal manual queue instead of
     granting access. Thresholds are all admin-editable (see
     set_setting_validated / bot/handlers/auto_renewal_review.py).
-
-    By design this only cares about how much money came in (and how
-    confidently that amount was read) -- it deliberately does NOT check
-    the date printed on the receipt. A screenshot of an old payment still
-    represents real money that was transferred, and requiring "today or
-    yesterday" caused legitimate receipts to bounce to manual review for
-    no reason other than a delay in sending it. The one-shot anti-abuse
-    lock below (see process_pending_request_with_ai / auto_renewal_applied)
-    is what actually prevents the same receipt being replayed for repeat
-    auto-renewals, not the date.
     """
     min_amount = get_setting("min_amount")
     min_confidence = get_setting("min_confidence")
+    date_tolerance_days = get_setting("date_tolerance_days")
 
     if not isinstance(extraction, dict) or not extraction.get("readable"):
         notes = (extraction or {}).get("notes") if isinstance(extraction, dict) else None
@@ -376,29 +325,20 @@ def evaluate_receipt_extraction(extraction: dict):
     if not isinstance(amount, (int, float)) or amount < min_amount or amount % min_amount != 0:
         return False, 0, f"Сумма не кратна {min_amount}₽ или не распознана: {amount!r}"
 
+    payment_date = parse_expiry(extraction.get("payment_date") or "")
+    if payment_date is None:
+        return False, 0, f"Не удалось определить дату платежа: {extraction.get('payment_date')!r}"
+
+    today_kra = krasnoyarsk_now().date()
+    delta_days = (today_kra - payment_date.date()).days
+    if delta_days < 0 or delta_days > date_tolerance_days:
+        return False, 0, f"Дата платежа не сегодня/вчера (Красноярск): {payment_date.date()}"
+
     months = int(amount) // min_amount
     return True, months, "OK"
 
 
 # ---------------- FILE RETRIEVAL ----------------
-
-def _pending_file_ref(pending: dict):
-    """
-    Returns (file_id, is_photo) straight from the pending_request record
-    — no network call, no bytes downloaded. Used purely to attach the
-    original receipt image to an admin card (e.g. the anti-abuse fallback
-    card, see _process_pending_request_with_ai_inner) at a point in the
-    pipeline that may bail out before ever needing the actual file
-    contents. Contrast with _fetch_receipt_file() below, which downloads
-    real bytes for handing to Gemini and is the source of truth for
-    whether the file can actually be retrieved at all.
-    """
-    if pending.get("source") == "max":
-        # Mirrors _fetch_receipt_file()'s handling: MAX-origin receipts
-        # don't keep a re-fetchable file reference today.
-        return None, True
-    return pending.get("receipt_file_id"), pending.get("receipt_is_photo", True)
-
 
 def _fetch_receipt_file(pending: dict):
     """Returns (bytes, mime_type, file_id, is_photo) or (None, None, None, None)."""
@@ -448,11 +388,6 @@ def _log_or_warn(caption: str, file_id: str = None, is_photo: bool = True) -> No
     the single most common cause) failed completely silently: the admin
     would keep getting the normal Telegram notifications and never notice
     the audit trail simply wasn't being written anywhere.
-
-    See also core.notify.diagnose_log_channel() / the "🔍 Диагностика"
-    button in the "🤖 Автопродление" menu — that runs live Bot API checks
-    (getMe / getChat / getChatMember / a real test send) and reports back
-    Telegram's own error text instead of this function's best guess.
     """
     ok = log_to_channel(caption, file_id=file_id, is_photo=is_photo)
     if not ok and log_channel_configured():
@@ -463,19 +398,18 @@ def _log_or_warn(caption: str, file_id: str = None, is_photo: bool = True) -> No
             "право «Публикация сообщений» — зайдите в настройки канала → "
             "Администраторы → права бота, и включите его.\n"
             "Также проверьте, что LOG_CHANNEL_ID в .env указан верно "
-            "(для приватных каналов обычно начинается с -100).\n\n"
-            "Точную причину можно посмотреть в «🤖 Автопродление» → «🔍 Диагностика»."
+            "(для приватных каналов обычно начинается с -100)."
         )
 
 
 def process_pending_request_with_ai(username: str, trigger: str) -> bool:
     """
     MUST be called only after core.db.claim_pending_request_for_ai(username)
-    returned True. Returns True if auto-approved (client's access already
-    extended, admin sent a review card) — False if it fell back to the
-    normal manual queue (the fallback card itself already has the usual
-    ➕1мес/➕2мес/✍️/❌ buttons attached, plus a 🔄 retry button — see
-    _fallback_to_manual).
+    returned True. Returns True if auto-approved (client already notified,
+    access already extended, admin sent a review card) — False if it fell
+    back to the normal manual queue (the fallback card itself already has
+    the usual ➕1мес/➕2мес/✍️/❌ buttons attached, plus a 🔄 retry button —
+    see _fallback_to_manual).
     """
     try:
         return _process_pending_request_with_ai_inner(username, trigger)
@@ -494,36 +428,6 @@ def _process_pending_request_with_ai_inner(username: str, trigger: str) -> bool:
         return False
 
     pending = user.get("pending_request") or {}
-    display_file_id, display_is_photo = _pending_file_ref(pending)
-
-    # ---- anti-abuse: auto-renewal can apply at most once per lock window ----
-    # Without this, a client could resubmit the same (or a slightly
-    # doctored) receipt repeatedly and have auto-renewal extend their
-    # access again and again, unattended. The first receipt in a window
-    # is handled automatically; every next one falls straight to manual
-    # review with a clearly marked warning card -- no Gemini call spent
-    # on it. See _is_locked() for exactly when this clears.
-    #
-    # Uses display_file_id/display_is_photo (read straight from the
-    # pending record, no network call) rather than _fetch_receipt_file()
-    # below -- this exits before ever needing the actual bytes, but the
-    # admin still needs to SEE the receipt on this card to judge whether
-    # it's a genuine replay attempt, so the file reference has to be
-    # resolved up front, not after the point where the pipeline would
-    # normally bail out.
-    locked, unlock_date = _is_locked(user)
-    if locked:
-        _fallback_to_manual(
-            username,
-            "Защита от накрутки: автопродление уже применялось этому "
-            "пользователю недавно, повторно сработать не могло.",
-            trigger,
-            file_id=display_file_id,
-            is_photo=display_is_photo,
-            anti_abuse=True,
-            unlock_date=unlock_date,
-        )
-        return False
 
     file_bytes, mime_type, file_id, is_photo = _fetch_receipt_file(pending)
     if file_bytes is None:
@@ -568,43 +472,23 @@ def _fallback_admin_kb(username: str) -> dict:
     }
 
 
-def _fallback_to_manual(username, reason, trigger, file_id=None, is_photo=True, extraction=None, anti_abuse=False, unlock_date=None):
+def _fallback_to_manual(username, reason, trigger, file_id=None, is_photo=True, extraction=None):
     user = get_user(username)
     pending = (user or {}).get("pending_request") or {}
     pending["ai_result"] = "fallback"
     pending["ai_fallback_reason"] = reason
     pending["ai_trigger"] = trigger
-    pending["ai_anti_abuse"] = anti_abuse
     update_user(username, pending_request=pending)
 
-    log.info(
-        "auto-renewal fallback for %s (%s)%s: %s",
-        username, trigger, " [ANTI-ABUSE]" if anti_abuse else "", reason,
-    )
+    log.info("auto-renewal fallback for %s (%s): %s", username, trigger, reason)
 
-    if anti_abuse:
-        # Deliberately a different, louder header than the generic
-        # fallback below -- this is not "Gemini couldn't read it", it's
-        # "someone may be trying to replay a receipt for a second
-        # auto-renewal". The client is NOT told any of this -- they just
-        # get the normal "Отправлено администратору. Ждите
-        # подтверждения." acknowledgement (see bot/handlers/receipt.py /
-        # feedback.py) -- only the admin sees this card.
-        unlock_line = f" (снимется {unlock_date})" if unlock_date else ""
-        caption = (
-            f"🚨 ЗАЩИТА ОТ НАКРУТКИ ({_trigger_label(trigger)})\n"
-            f"👤 {username}\n"
-            f"Попытка повторного автопродления, сработала защита{unlock_line}\n"
-            f"Чек на проверку, пожалуйста, обработайте заявку вручную."
-        )
-    else:
-        caption = (
-            f"⚠️ Автопродление не сработало ({_trigger_label(trigger)})\n"
-            f"👤 {username}\n"
-            f"Причина: {reason}\n\n"
-            f"Можно одобрить вручную, повторить автопроверку (например, если "
-            f"причина — временная ошибка Gemini) или отклонить:"
-        )
+    caption = (
+        f"⚠️ Автопродление не сработало ({_trigger_label(trigger)})\n"
+        f"👤 {username}\n"
+        f"Причина: {reason}\n\n"
+        f"Можно одобрить вручную, повторить автопроверку (например, если "
+        f"причина — временная ошибка Gemini) или отклонить:"
+    )
 
     kb = _fallback_admin_kb(username)
 
@@ -625,23 +509,12 @@ def _fallback_to_manual(username, reason, trigger, file_id=None, is_photo=True, 
 
 
 def _apply_and_request_review(username, months, extraction, trigger, file_id=None, is_photo=True):
-    """
-    Applies the renewal immediately AND notifies the client immediately —
-    the exact same "✅ Ваша подписка продлена..." text a manual approval
-    sends, no delay. The admin still gets a post-hoc review card
-    ("✅ Подтвердить" / "🚫 Отключить") so a wrong auto-approval can be
-    caught and rolled back after the fact, but that review no longer
-    gates when the client hears about it — see the module docstring for
-    why (the anti-abuse fallback is the case that stays silent, not this
-    one).
-    """
     user = get_user(username)
     previous_expires_at = user.get("expires_at")
     previous_status = user.get("status")
     was_expired_or_inactive = previous_status != "active" or is_expired(previous_expires_at)
 
     new_expires_at = calc_new_expiry_months(previous_expires_at, months)
-    applied_at = utcnow_naive().isoformat()
 
     pending = user.get("pending_request") or {}
     pending["ai_result"] = "approved"
@@ -652,32 +525,21 @@ def _apply_and_request_review(username, months, extraction, trigger, file_id=Non
         "new_expires_at": new_expires_at,
         "extraction": extraction,
         "trigger": trigger,
-        "decided_at": applied_at,
+        "decided_at": utcnow_naive().isoformat(),
     }
 
-    # Two separate update_user() calls, deliberately: core.db.update_user()
-    # redirects a call onto the leader (and fans out to the whole group)
-    # whenever expires_at/status are among the kwargs -- if pending_request/
-    # auto_renewal_applied were bundled into that same call, they'd land on
-    # the leader's record instead of this specific account's, for any user
-    # who happens to be a follower. Splitting keeps expires_at/status going
-    # through the leader-sync path while pending_request/auto_renewal_*
-    # always land on `username` itself, exactly as intended.
-    update_user(username, expires_at=new_expires_at, status="active")
     update_user(
         username,
+        expires_at=new_expires_at,
+        status="active",
         notified_days=[],
         post_disable_notified=[],
         pending_request=pending,
-        auto_renewal_applied=True,        # anti-abuse lock, see _is_locked()
-        auto_renewal_applied_at=applied_at,
     )
 
     if was_expired_or_inactive:
         safe_sync()
 
-    # The client's only signal, ever, that anything happened -- same
-    # wording bot/handlers/receipt.py's manual approval uses.
     notify_user(user, f"✅ Ваша подписка продлена до {new_expires_at}. Спасибо!")
 
     amount = extraction.get("amount")
@@ -688,9 +550,7 @@ def _apply_and_request_review(username, months, extraction, trigger, file_id=Non
         f"💰 Сумма по чеку: {amount}₽ → {months} мес.\n"
         f"📅 {previous_expires_at or '∞'} → {new_expires_at}\n"
         f"🎯 Уверенность распознавания: {confidence}\n\n"
-        f"Клиент уже уведомлён о продлении. Проверьте чек — если что-то не так, "
-        f"«🚫 Отключить» откатит и статус, и дату, и отправит клиенту сообщение "
-        f"об отмене. «✅ Подтвердить» просто закрывает карточку без доп. действий:"
+        f"Проверьте чек и подтвердите, либо отключите с откатом даты:"
     )
 
     review_kb = {
