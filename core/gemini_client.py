@@ -85,6 +85,13 @@ class GeminiError(Exception):
     pass
 
 
+def proxy_configured() -> bool:
+    """Whether a Gemini proxy (Worker/HTTPS or SOCKS5) is currently set —
+    used by bot/handlers/auto_renewal_review.py's status screen to show
+    whether outbound Gemini calls are being routed through one right now."""
+    return bool((get_setting("gemini_proxy") or "").strip())
+
+
 def _resolve_endpoint_and_proxies():
     """
     Reads the "gemini_proxy" setting and returns (url, proxies) ready for
