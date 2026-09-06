@@ -1,745 +1,514 @@
 """
-AI-assisted auto-renewal: settings, trigger conditions, business-rule
-evaluation, and the pipeline that ties Gemini extraction + core.db + the
-Telegram log channel + admin review together.
+Owns: AutoRenewalSettings.waiting_value.
 
-Two independent triggers call process_pending_request_with_ai() (always
-via core.db.claim_pending_request_for_ai() first, to prevent double
-processing):
-  1. Real-time, from bot/handlers/receipt.py and feedback.py, when a
-     receipt arrives while auto-renewal is ON and it's currently within
-     the night window (22:00-06:00 Krasnoyarsk) -- or any time of day at
-     all if "fully automatic" mode is on (see should_attempt_now()).
-  2. services/auto_renewal_overdue_check.py's periodic timer, for any
-     receipt still unprocessed by the admin 3+ hours after submission —
-     independent of time of day, but still gated on the master ON/OFF
-     toggle (see is_overdue_trigger_active()).
+Four things live in this file:
 
-Everything here is synchronous (plain function calls, no async/await) so
-it works identically called from an aiogram handler via
-loop.run_in_executor(...) and from the standalone periodic script, which
-has no event loop at all.
+1. "🤖 Автопродление" admin menu — ON/OFF toggle, "🚀 Полностью
+   автоматический режим" toggle, "⚙️ Настроить условия" (opens the
+   trigger-tuning submenu), and "🔍 Диагностика" (live Bot API checks for
+   why the log channel might not be receiving posts). Turning the master
+   toggle ON is refused if LOG_CHANNEL_ID isn't configured (see
+   core.auto_renewal.log_channel_configured) — rule 4 was "everything
+   gets logged", so the feature simply can't run without somewhere to
+   log to.
 
-The client is never told THAT a renewal happened automatically -- see
-bot/handlers/receipt.py / feedback.py and bot/handlers/auto_renewal_review.py
-(the disable/rollback message uses generic wording, never the word
-"automatic"). What the client DOES get, the moment auto-renewal actually
-approves their receipt, is the exact same "✅ Ваша подписка продлена..."
-text a manual approval sends -- no delay, no different timing (see
-_apply_and_request_review). In every other case -- auto-renewal wasn't
-applicable, or it was attempted and fell back to manual for any reason
-including the anti-abuse lock below -- the client gets the normal
-"Отправлено администратору. Ждите подтверждения." acknowledgement, same
-as if auto-renewal didn't exist (see bot/auto_renewal_hook.py's
-try_auto_renewal for the exact dispatch). The client is never left with
-literal silence.
+2. The settings submenu — one "✏️ field: value" row per editable trigger
+   parameter (night window bounds, overdue threshold, min amount, min
+   confidence). Tapping one asks for a new value as plain text;
+   core.auto_renewal.set_setting_validated() does all the bounds
+   checking, this file just relays its ok/error result.
 
-Anti-abuse: auto-renewal may apply at most once per AUTO_RENEWAL_LOCK_DAYS
-per user (see _is_locked / process_pending_request_with_ai). The first
-receipt in that window is handled automatically; every next one during
-the lock falls straight to manual review with a "possible replay/abuse"
-warning card for the admin (the client-facing side is unaffected -- they
-just get the normal acknowledgement above, nothing that hints at why).
-The lock also clears early the moment a human actually verifies the
-account (any manual admin approval/extension, or a rollback via
-"🚫 Отключить"), and clears itself automatically once
-AUTO_RENEWAL_LOCK_DAYS have passed since the last auto-renewal, even if
-no admin touched it.
+3. aircheck:{username}:confirm / aircheck:{username}:disable — the
+   post-hoc review buttons attached to every auto-renewal decision card
+   (core/auto_renewal.py's _apply_and_request_review). "Подтвердить"
+   sends the client the SAME renewal message a manual approval would
+   (bot/handlers/receipt.py) — this is the only point the client learns
+   their subscription was renewed at all; nothing is sent earlier.
+   "Отключить" is a full undo (status AND expiry both roll back to what
+   they were before the auto-renewal, and the one-shot anti-abuse lock is
+   released so a genuine future payment can auto-renew again) — the
+   message the client gets never mentions "automatic", by the same rule.
+   airretry:{username} (attached to *fallback* cards instead) re-runs the
+   AI pipeline on demand — useful when the fallback reason was a
+   transient problem (e.g. an outdated Gemini model name) rather than a
+   genuinely bad receipt.
 
-PROXY (Cloudflare Worker / any HTTPS reverse-proxy for outbound Gemini
-calls): the URL itself (GEMINI_PROXY_URL) only ever comes from .env — not
-editable here, since changing the destination host is a deployment
-decision, not a trigger-tuning one. What IS live-editable, without
-touching .env or restarting the bot, is whether that configured proxy is
-actually USED right now — see gemini_proxy_enabled below and
-core.gemini_client.is_proxy_enabled()/proxy_configured(), and the
-"🌐 Прокси для Gemini" toggle in bot/handlers/auto_renewal_review.py's
-main menu (only shown at all when a URL is actually set).
+Client-invisibility rule: nowhere in this file (or in
+bot/handlers/receipt.py / feedback.py) does any client-facing message
+mention "автоматически" / auto-renewal. As far as the client is concerned
+every renewal is "the admin checked it, eventually" — see each message's
+wording below.
 """
-import json
+import asyncio
 import logging
-import os
-from datetime import datetime, time as dt_time, timedelta
-from zoneinfo import ZoneInfo
 
-from core.dates import calc_new_expiry_months, is_expired, utcnow_naive
-from core.db import get_user, update_user
-from core.notify import get_file_bytes, log_to_channel, notify_admin, notify_user, send_photo_by_file_id
-from core.paths import AUTO_RENEWAL_SETTINGS_PATH
-from core.service import safe_sync
+from aiogram import Router, F
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+import core.auto_renewal as auto_renewal
+import core.gemini_client as gemini_client
+from bot.access import admin_only, notify_bg, run_sync
+from bot.keyboards import main_menu
+from bot.states import AutoRenewalSettings
+from core.db import claim_pending_request_for_ai, get_user, update_user
+from core.notify import diagnose_log_channel, log_to_channel, notify_user
+
+router = Router()
 log = logging.getLogger(__name__)
 
-KRASNOYARSK_TZ = ZoneInfo("Asia/Krasnoyarsk")
 
-DEFAULT_SETTINGS = {
-    "enabled": False,
-    "fully_automatic": False,   # bypasses the night window entirely -- see should_attempt_now()
-    "night_start": "22:00",
-    "night_end": "06:00",
-    "overdue_hours": 3,
-    "min_amount": 100,
-    "min_confidence": 0.75,
-    "abuse_lock_days": 7,   # see _is_locked() -- how long one auto-renewal blocks the next
-    # Live on/off for the Gemini proxy (see module docstring). Defaults to
-    # True so that simply setting GEMINI_PROXY_URL in .env and restarting
-    # is enough to start using it -- no extra step required the first time.
-    "gemini_proxy_enabled": True,
-}
+# ---------------- MAIN MENU ----------------
 
-# Human-readable metadata for the bot's "⚙️ Настроить условия" screen — one
-# place that both the settings menu and the input-validation logic below
-# read from, so a new field only needs to be added here once.
-#
-# NOTE: there is deliberately no date-related field here. Auto-renewal only
-# ever needs to know how much money came in -- it does not check the date
-# printed on the receipt at all (see evaluate_receipt_extraction below).
-#
-# NOTE: gemini_proxy_enabled is deliberately NOT listed here -- it's not a
-# typed value the admin enters, it's a toggle button of its own in the
-# main menu (see bot/handlers/auto_renewal_review.py's
-# auto_renewal_menu_kb), shown only when GEMINI_PROXY_URL is set in .env.
-FIELD_META = {
-    "night_start": {
-        "label": "🌙 Начало ночного окна",
-        "prompt": "Введите время начала ночного окна в формате ЧЧ:ММ (например 22:00):",
-    },
-    "night_end": {
-        "label": "🌅 Конец ночного окна",
-        "prompt": "Введите время конца ночного окна в формате ЧЧ:ММ (например 06:00):",
-    },
-    "overdue_hours": {
-        "label": "⏳ Порог просрочки (часов)",
-        "prompt": "Через сколько часов без ответа администратора считать заявку просроченной? Число, можно дробное (например 3 или 2.5):",
-    },
-    "min_amount": {
-        "label": "💰 Мин. сумма / кратность (₽)",
-        "prompt": "Минимальная сумма и шаг кратности в рублях (например 100 = сумма должна быть кратна 100₽):",
-    },
-    "min_confidence": {
-        "label": "🎯 Мин. уверенность Gemini",
-        "prompt": "Минимальная уверенность распознавания чека, от 0 до 1 (например 0.75):",
-    },
-    "abuse_lock_days": {
-        "label": "🔒 Блокировка повтора (дней)",
-        "prompt": "Сколько дней после одного автопродления блокировать следующее для того же "
-                  "пользователя (защита от накрутки)? Целое число, например 7:",
-    },
-}
+def auto_renewal_menu_kb() -> InlineKeyboardMarkup:
+    enabled = auto_renewal.is_auto_renewal_enabled()
+    fully_auto = auto_renewal.is_fully_automatic_enabled()
+
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{'✅  Включено' if enabled else '⬜  Выключено'} — переключить",
+            callback_data="autoren:toggle"
+        )],
+        [InlineKeyboardButton(
+            text=f"{'🚀 Полностью автоматически' if fully_auto else '🌙 Только в ночном окне'} — переключить",
+            callback_data="autoren:toggle_full"
+        )],
+        [InlineKeyboardButton(text="⚙️ Настроить условия", callback_data="autoren:settings")],
+        [InlineKeyboardButton(text="🔍 Диагностика лога", callback_data="autoren:diag")],
+    ]
+
+    # Only shown when GEMINI_PROXY_URL is actually set in .env -- nothing
+    # to toggle otherwise. Lets the admin switch between "route the
+    # Gemini call through the proxy" and "connect directly" live, without
+    # touching .env or restarting the bot -- e.g. to check whether a
+    # currently-down proxy server is the actual cause of a failure.
+    if gemini_client.proxy_configured():
+        proxy_on = gemini_client.is_proxy_enabled()
+        rows.append([InlineKeyboardButton(
+            text=f"{'🌐 Прокси для Gemini: Включен' if proxy_on else '🔌 Прокси для Gemini: Выключен'} — переключить",
+            callback_data="autoren:toggle_proxy"
+        )])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# ---------------- SETTINGS ----------------
+def _status_text() -> str:
+    enabled = auto_renewal.is_auto_renewal_enabled()
+    fully_auto = auto_renewal.is_fully_automatic_enabled()
+    log_ok = auto_renewal.log_channel_configured()
 
-def _load_settings() -> dict:
-    try:
-        with open(AUTO_RENEWAL_SETTINGS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return {**DEFAULT_SETTINGS, **data}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return dict(DEFAULT_SETTINGS)
-
-
-def _save_settings(settings: dict) -> None:
-    os.makedirs(os.path.dirname(AUTO_RENEWAL_SETTINGS_PATH), exist_ok=True)
-    with open(AUTO_RENEWAL_SETTINGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(settings, f)
-
-
-def get_setting(key: str):
-    return _load_settings().get(key, DEFAULT_SETTINGS.get(key))
-
-
-def is_auto_renewal_enabled() -> bool:
-    return _load_settings().get("enabled", False)
-
-
-def set_auto_renewal_enabled(value: bool) -> None:
-    settings = _load_settings()
-    settings["enabled"] = value
-    _save_settings(settings)
-
-
-def toggle_auto_renewal() -> bool:
-    """Flips the setting and returns the new value. Callers (the bot
-    handler) are responsible for checking log_channel_configured() first —
-    this function doesn't refuse to turn on without a log channel, so it
-    stays usable from a script/console too."""
-    new_value = not is_auto_renewal_enabled()
-    set_auto_renewal_enabled(new_value)
-    return new_value
-
-
-def is_fully_automatic_enabled() -> bool:
-    return _load_settings().get("fully_automatic", False)
-
-
-def toggle_fully_automatic() -> bool:
-    """Fully-automatic mode makes should_attempt_now() ignore the night
-    window entirely — every receipt gets an immediate AI attempt, any time
-    of day, as long as the master toggle is also ON."""
-    settings = _load_settings()
-    settings["fully_automatic"] = not settings.get("fully_automatic", False)
-    _save_settings(settings)
-    return settings["fully_automatic"]
-
-
-def toggle_gemini_proxy_enabled() -> bool:
-    """Flips whether outbound Gemini calls actually use the configured
-    GEMINI_PROXY_URL (see core.gemini_client.is_proxy_enabled) — lets the
-    admin fall back to a direct connection without touching .env or
-    restarting the bot, e.g. to check whether a currently-down proxy is
-    the actual cause of a Gemini failure. Callers (the bot handler) are
-    responsible for checking core.gemini_client.proxy_configured() first —
-    toggling this with no URL set in .env has no visible effect either
-    way."""
-    settings = _load_settings()
-    settings["gemini_proxy_enabled"] = not settings.get("gemini_proxy_enabled", True)
-    _save_settings(settings)
-    return settings["gemini_proxy_enabled"]
-
-
-def log_channel_configured() -> bool:
-    from core.notify import LOG_CHANNEL_ID
-    return bool(LOG_CHANNEL_ID)
-
-
-def _parse_hhmm(raw: str) -> dt_time:
-    h, m = raw.strip().split(":")
-    h, m = int(h), int(m)
-    if not (0 <= h <= 23 and 0 <= m <= 59):
-        raise ValueError("out of range")
-    return dt_time(h, m)
-
-
-def set_setting_validated(key: str, raw_value: str):
-    """
-    Validates and saves one editable trigger setting from admin-typed text.
-    Returns (ok: bool, error_message_or_none: str) — used by
-    bot/handlers/auto_renewal_review.py so the bot can show a specific
-    "что не так" message instead of silently accepting garbage. This is
-    the one place all editable fields get bounds-checked, since a bad
-    value here (e.g. confidence > 1, negative hours) could otherwise let
-    the wrong receipts through automatically.
-    """
-    raw_value = (raw_value or "").strip()
-
-    if key in ("night_start", "night_end"):
-        try:
-            _parse_hhmm(raw_value)
-        except (ValueError, IndexError):
-            return False, "Формат должен быть ЧЧ:ММ, например 22:00"
-        value = raw_value
-
-    elif key == "overdue_hours":
-        try:
-            value = float(raw_value.replace(",", "."))
-            if value <= 0:
-                raise ValueError
-        except ValueError:
-            return False, "Введите положительное число часов, например 3 или 2.5"
-
-    elif key == "min_amount":
-        try:
-            value = int(raw_value)
-            if value <= 0:
-                raise ValueError
-        except ValueError:
-            return False, "Введите положительное целое число рублей, например 100"
-
-    elif key == "min_confidence":
-        try:
-            value = float(raw_value.replace(",", "."))
-            if not (0 <= value <= 1):
-                raise ValueError
-        except ValueError:
-            return False, "Введите число от 0 до 1, например 0.75"
-
-    elif key == "abuse_lock_days":
-        try:
-            value = int(raw_value)
-            if value <= 0:
-                raise ValueError
-        except ValueError:
-            return False, "Введите положительное целое число дней, например 7"
-
+    if fully_auto:
+        window_line = "• Круглосуточно, при поступлении любого чека (полностью автоматический режим)"
     else:
-        return False, f"Неизвестный параметр: {key}"
-
-    settings = _load_settings()
-    settings[key] = value
-    _save_settings(settings)
-    return True, None
-
-
-def reset_settings_to_defaults() -> None:
-    settings = _load_settings()
-    enabled = settings.get("enabled", False)  # keep ON/OFF as-is, only reset the trigger tuning
-    _save_settings({**DEFAULT_SETTINGS, "enabled": enabled})
-
-
-# ---------------- TIME WINDOW ----------------
-
-def krasnoyarsk_now() -> datetime:
-    return datetime.now(KRASNOYARSK_TZ)
-
-
-def is_in_night_window(now: datetime = None) -> bool:
-    """Night window bounds are configurable (default 22:00-06:00
-    Krasnoyarsk) — handles both a wrapping window (start > end, e.g.
-    22:00-06:00) and a same-day window (start < end, e.g. 09:00-18:00, in
-    case an admin ever wants to invert the idea and only auto-renew during
-    the day) the same way."""
-    now = now or krasnoyarsk_now()
-    t = now.time()
-
-    start = _parse_hhmm(get_setting("night_start"))
-    end = _parse_hhmm(get_setting("night_end"))
-
-    if start <= end:
-        return start <= t < end
-    return t >= start or t < end
-
-
-def should_attempt_now() -> bool:
-    """The real-time trigger's condition: master toggle ON, and either
-    fully-automatic mode is on (any time of day) or it's currently in the
-    night window."""
-    if not is_auto_renewal_enabled():
-        return False
-    if is_fully_automatic_enabled():
-        return True
-    return is_in_night_window()
-
-
-def is_overdue_trigger_active() -> bool:
-    """The periodic checker only fires the overdue rule while the master
-    toggle is ON — flipping auto-renewal off should actually turn it off,
-    not leave the overdue safety net silently running."""
-    return is_auto_renewal_enabled()
-
-
-def is_request_overdue(requested_at_iso: str, now: datetime = None) -> bool:
-    if not requested_at_iso:
-        return False
-    try:
-        requested_at = datetime.fromisoformat(requested_at_iso)
-    except ValueError:
-        return False
-
-    reference = now or utcnow_naive()
-    if requested_at.tzinfo is not None:
-        requested_at = requested_at.astimezone().replace(tzinfo=None)
-
-    threshold = timedelta(hours=get_setting("overdue_hours"))
-    return (reference - requested_at) >= threshold
-
-
-# ---------------- ANTI-ABUSE LOCK ----------------
-
-def _is_locked(user: dict):
-    """
-    Returns (locked: bool, unlock_date: date_or_None). A user is locked
-    out of auto-renewal if their last auto-renewal (auto_renewal_applied)
-    happened less than `abuse_lock_days` ago. Missing/unparseable
-    timestamp on an otherwise-set flag is treated as locked (fail safe --
-    better to fall back to manual once than to accidentally let a replay
-    through).
-
-    Cleared early (see callers of update_user(..., auto_renewal_applied=False)
-    in bot/handlers/receipt.py, extend.py, auto_renewal_review.py's
-    aircheck:disable, and services/cleanup.py) the moment a human actually
-    verifies the account, or automatically once the window above has
-    simply passed.
-    """
-    if not user.get("auto_renewal_applied"):
-        return False, None
-
-    applied_at = user.get("auto_renewal_applied_at")
-    lock_days = get_setting("abuse_lock_days")
-
-    if not applied_at:
-        return True, None
-
-    try:
-        applied_dt = datetime.fromisoformat(applied_at)
-    except ValueError:
-        return True, None
-
-    unlock_dt = applied_dt + timedelta(days=lock_days)
-    if utcnow_naive() >= unlock_dt:
-        return False, None
-    return True, unlock_dt.date()
-
-
-# ---------------- BUSINESS RULES ----------------
-
-def evaluate_receipt_extraction(extraction: dict):
-    """
-    Pure decision function — never calls Gemini or touches the DB. Given
-    what Gemini extracted, returns (approved: bool, months: int, reason: str).
-
-    This is the actual gate on who gets auto-renewed — Gemini only reads
-    the image, it never decides. A forged or unreadable receipt fails one
-    of these checks and falls back to the normal manual queue instead of
-    granting access. Thresholds are all admin-editable (see
-    set_setting_validated / bot/handlers/auto_renewal_review.py).
-
-    By design this only cares about how much money came in (and how
-    confidently that amount was read) -- it deliberately does NOT check
-    the date printed on the receipt. A screenshot of an old payment still
-    represents real money that was transferred, and requiring "today or
-    yesterday" caused legitimate receipts to bounce to manual review for
-    no reason other than a delay in sending it. The one-shot anti-abuse
-    lock below (see process_pending_request_with_ai / auto_renewal_applied)
-    is what actually prevents the same receipt being replayed for repeat
-    auto-renewals, not the date.
-    """
-    min_amount = get_setting("min_amount")
-    min_confidence = get_setting("min_confidence")
-
-    if not isinstance(extraction, dict) or not extraction.get("readable"):
-        notes = (extraction or {}).get("notes") if isinstance(extraction, dict) else None
-        return False, 0, f"Чек не распознан как читаемый платёжный документ: {notes or 'нет деталей'}"
-
-    confidence = extraction.get("confidence")
-    if not isinstance(confidence, (int, float)) or confidence < min_confidence:
-        return False, 0, f"Низкая уверенность распознавания ({confidence!r} < {min_confidence})"
-
-    amount = extraction.get("amount")
-    if not isinstance(amount, (int, float)) or amount < min_amount or amount % min_amount != 0:
-        return False, 0, f"Сумма не кратна {min_amount}₽ или не распознана: {amount!r}"
-
-    months = int(amount) // min_amount
-    return True, months, "OK"
-
-
-# ---------------- FILE RETRIEVAL ----------------
-
-def _pending_file_ref(pending: dict):
-    """
-    Returns (file_id, is_photo) straight from the pending_request record
-    — no network call, no bytes downloaded. Used purely to attach the
-    original receipt image to an admin card (e.g. the anti-abuse fallback
-    card, see _process_pending_request_with_ai_inner) at a point in the
-    pipeline that may bail out before ever needing the actual file
-    contents. Contrast with _fetch_receipt_file() below, which downloads
-    real bytes for handing to Gemini and is the source of truth for
-    whether the file can actually be retrieved at all.
-    """
-    if pending.get("source") == "max":
-        # Mirrors _fetch_receipt_file()'s handling: MAX-origin receipts
-        # don't keep a re-fetchable file reference today.
-        return None, True
-    return pending.get("receipt_file_id"), pending.get("receipt_is_photo", True)
-
-
-def _fetch_receipt_file(pending: dict):
-    """Returns (bytes, mime_type, file_id, is_photo) or (None, None, None, None)."""
-    if pending.get("source") == "max":
-        # MAX-origin receipts don't keep a re-fetchable file reference
-        # today (see max_bot/handlers/receipt.py) — and MAX development is
-        # paused for now anyway. Falls back to manual, same as any other
-        # unreadable case.
-        return None, None, None, None
-
-    file_id = pending.get("receipt_file_id")
-    if not file_id:
-        return None, None, None, None
-
-    is_photo = pending.get("receipt_is_photo", True)
-    file_bytes, file_path = get_file_bytes(file_id)
-    if file_bytes is None:
-        return None, None, None, None
-
-    if is_photo:
-        mime_type = "image/jpeg"
-    elif file_path and file_path.lower().endswith(".pdf"):
-        mime_type = "application/pdf"
-    elif file_path and file_path.lower().endswith(".png"):
-        mime_type = "image/png"
-    else:
-        mime_type = "application/octet-stream"
-
-    return file_bytes, mime_type, file_id, is_photo
-
-
-# ---------------- MAIN PIPELINE ----------------
-
-def _trigger_label(trigger: str) -> str:
-    return {
-        "night_window": "ночной режим",
-        "overdue_3h": "заявка висела > порога",
-        "manual_retry": "повтор вручную",
-    }.get(trigger, trigger)
-
-
-def _log_or_warn(caption: str, file_id: str = None, is_photo: bool = True) -> None:
-    """
-    Wraps log_to_channel() with a visible failure path. Previously a
-    misconfigured/inaccessible LOG_CHANNEL_ID (wrong ID, or the bot added
-    as a channel member without the "Post Messages" admin permission —
-    the single most common cause) failed completely silently: the admin
-    would keep getting the normal Telegram notifications and never notice
-    the audit trail simply wasn't being written anywhere.
-
-    See also core.notify.diagnose_log_channel() / the "🔍 Диагностика"
-    button in the "🤖 Автопродление" menu — that runs live Bot API checks
-    (getMe / getChat / getChatMember / a real test send) and reports back
-    Telegram's own error text instead of this function's best guess.
-    """
-    ok = log_to_channel(caption, file_id=file_id, is_photo=is_photo)
-    if not ok and log_channel_configured():
-        notify_admin(
-            "⚠️ Не удалось записать событие в лог-канал автопродления "
-            "(LOG_CHANNEL_ID настроен, но отправка не удалась).\n\n"
-            "Самая частая причина: бот добавлен в канал, но у него не включено "
-            "право «Публикация сообщений» — зайдите в настройки канала → "
-            "Администраторы → права бота, и включите его.\n"
-            "Также проверьте, что LOG_CHANNEL_ID в .env указан верно "
-            "(для приватных каналов обычно начинается с -100).\n\n"
-            "Точную причину можно посмотреть в «🤖 Автопродление» → «🔍 Диагностика»."
+        window_line = (
+            f"• {auto_renewal.get_setting('night_start')}–{auto_renewal.get_setting('night_end')} "
+            f"по Красноярску — сразу при поступлении чека"
         )
 
+    lines = [
+        "🤖 Автопродление по чеку через Gemini",
+        "",
+        f"Статус: {'✅  включено' if enabled else '⬜  выключено'}",
+        f"Канал лога: {'✅  настроен' if log_ok else '❌  НЕ настроен (LOG_CHANNEL_ID в .env)'}",
+    ]
 
-def process_pending_request_with_ai(username: str, trigger: str) -> bool:
-    """
-    MUST be called only after core.db.claim_pending_request_for_ai(username)
-    returned True. Returns True if auto-approved (client's access already
-    extended, admin sent a review card) — False if it fell back to the
-    normal manual queue (the fallback card itself already has the usual
-    ➕1мес/➕2мес/✍️/❌ buttons attached, plus a 🔄 retry button — see
-    _fallback_to_manual).
-    """
+    if gemini_client.proxy_configured():
+        proxy_line = "✅  включен" if gemini_client.is_proxy_enabled() else "🔌 выключен (прямое подключение)"
+        lines.append(f"Прокси для Gemini: {proxy_line}")
+        # CHANGED: added this line -- previously the on/off state was
+        # visible but not WHICH url it points to, so there was no quick
+        # way to confirm .env's GEMINI_PROXY_URL is actually what you
+        # think it is (or to double-check where calls are headed right
+        # after flipping the toggle off).
+        lines.append(f"  Путь: {gemini_client.proxy_url()}")
+
+    lines += [
+        "",
+        "Условия срабатывания:",
+        window_line,
+        f"• Заявка висит без ответа администратора > {auto_renewal.get_setting('overdue_hours')} ч. "
+        f"— в любое время суток",
+        "",
+        "Решение принимает не ИИ напрямую — Gemini только распознаёт сумму "
+        "с чека (дата платежа не проверяется, важна только сумма), дальше "
+        "код проверяет по правилам (см. «⚙️ Настроить условия»).",
+        "",
+        f"🔒 Защита от накрутки: после одного автопродления следующее для "
+        f"того же пользователя блокируется на {auto_renewal.get_setting('abuse_lock_days')} дн. "
+        f"(настраивается). Первая заявка — автоматически, все последующие "
+        f"в этот период — только вручную, с отдельной пометкой "
+        f"«🚨 ЗАЩИТА ОТ НАКРУТКИ» в карточке админу. Снимается раньше срока "
+        f"вручную (любое ручное продление или «🚫 Отключить»), либо само "
+        f"по истечении срока.",
+        "",
+        "Клиент уведомляется о продлении сразу же, тем же текстом, что и "
+        "при ручном одобрении — про автопродление он не узнаёт ничего. "
+        "Единственный случай полной тишины для клиента — срабатывание "
+        "защиты от накрутки: заявка уходит только администратору.",
+    ]
+    return "\n".join(lines)
+
+
+@router.message(F.text == "🤖 Автопродление")
+async def auto_renewal_menu(msg: Message):
+    if not await admin_only(msg):
+        return
+    await msg.answer(_status_text(), reply_markup=auto_renewal_menu_kb())
+
+
+@router.callback_query(F.data == "autoren:toggle")
+async def auto_renewal_toggle(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    # Trying to turn ON without a log channel configured would silently
+    # violate "everything gets logged" -- refuse instead of turning on a
+    # feature that can't do what it promises.
+    if not auto_renewal.is_auto_renewal_enabled() and not auto_renewal.log_channel_configured():
+        await call.answer(
+            "Сначала настройте LOG_CHANNEL_ID в .env — без канала лога "
+            "включить автопродление нельзя (правило «логируем всё»).",
+            show_alert=True,
+        )
+        return
+
+    auto_renewal.toggle_auto_renewal()
     try:
-        return _process_pending_request_with_ai_inner(username, trigger)
+        await call.message.edit_text(_status_text(), reply_markup=auto_renewal_menu_kb())
     except Exception:
-        log.exception("auto-renewal pipeline crashed for %s (trigger=%s)", username, trigger)
-        _log_or_warn(f"🔥 Автопродление упало с ошибкой для {username} ({_trigger_label(trigger)}) — см. логи сервера.")
-        notify_admin(f"🔥 Автопродление упало с ошибкой для {username}, заявка осталась в ручной очереди.")
-        return False
+        pass
+    await call.answer()
 
 
-def _process_pending_request_with_ai_inner(username: str, trigger: str) -> bool:
-    from core.gemini_client import GeminiError, extract_receipt_data
+@router.callback_query(F.data == "autoren:toggle_full")
+async def auto_renewal_toggle_full(call: CallbackQuery):
+    if not await admin_only(call):
+        return
 
+    now_full = auto_renewal.toggle_fully_automatic()
+    try:
+        await call.message.edit_text(_status_text(), reply_markup=auto_renewal_menu_kb())
+    except Exception:
+        pass
+    await call.answer(
+        "Теперь работает круглосуточно" if now_full else "Теперь только в ночном окне"
+    )
+
+
+@router.callback_query(F.data == "autoren:toggle_proxy")
+async def auto_renewal_toggle_proxy(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    if not gemini_client.proxy_configured():
+        # Shouldn't normally be reachable (the button only renders when a
+        # proxy IS configured), but .env could have changed without a
+        # bot restart reflecting it yet -- fail safely rather than throw.
+        await call.answer("GEMINI_PROXY_URL не задан в .env — нечего переключать.", show_alert=True)
+        return
+
+    now_on = gemini_client.toggle_proxy_enabled()
+    try:
+        await call.message.edit_text(_status_text(), reply_markup=auto_renewal_menu_kb())
+    except Exception:
+        pass
+    await call.answer(
+        "Прокси включен — Gemini идёт через него" if now_on
+        else "Прокси выключен — прямое подключение к Gemini"
+    )
+
+
+# ---------------- SETTINGS SUBMENU ----------------
+
+def _settings_text() -> str:
+    lines = ["⚙️ Условия срабатывания автопродления:", ""]
+    for key, meta in auto_renewal.FIELD_META.items():
+        lines.append(f"{meta['label']}: {auto_renewal.get_setting(key)}")
+    lines += ["", "Дата платежа на чеке не проверяется — важна только сумма."]
+    return "\n".join(lines)
+
+
+def _settings_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"✏️ {meta['label']}", callback_data=f"autoren:edit:{key}")]
+        for key, meta in auto_renewal.FIELD_META.items()
+    ]
+    rows.append([InlineKeyboardButton(text="↩️ Сбросить по умолчанию", callback_data="autoren:reset")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="autoren:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "autoren:settings")
+async def auto_renewal_settings_menu(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+    try:
+        await call.message.edit_text(_settings_text(), reply_markup=_settings_kb())
+    except Exception:
+        await call.message.answer(_settings_text(), reply_markup=_settings_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data == "autoren:back")
+async def auto_renewal_back(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+    try:
+        await call.message.edit_text(_status_text(), reply_markup=auto_renewal_menu_kb())
+    except Exception:
+        await call.message.answer(_status_text(), reply_markup=auto_renewal_menu_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data == "autoren:reset")
+async def auto_renewal_reset(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+    auto_renewal.reset_settings_to_defaults()
+    try:
+        await call.message.edit_text(_settings_text(), reply_markup=_settings_kb())
+    except Exception:
+        pass
+    await call.answer("Условия сброшены к значениям по умолчанию")
+
+
+@router.callback_query(F.data.startswith("autoren:edit:"))
+async def auto_renewal_edit_start(call: CallbackQuery, state: FSMContext):
+    if not await admin_only(call):
+        return
+
+    key = call.data.split(":", 2)[2]
+    meta = auto_renewal.FIELD_META.get(key)
+    if not meta:
+        await call.answer("Неизвестный параметр", show_alert=True)
+        return
+
+    await state.set_state(AutoRenewalSettings.waiting_value)
+    await state.update_data(field=key)
+
+    current = auto_renewal.get_setting(key)
+    await call.message.answer(f"{meta['label']}\nТекущее значение: {current}\n\n{meta['prompt']}")
+    await call.answer()
+
+
+@router.message(AutoRenewalSettings.waiting_value)
+async def auto_renewal_edit_apply(msg: Message, state: FSMContext):
+    if not await admin_only(msg):
+        return
+
+    data = await state.get_data()
+    key = data.get("field")
+    await state.clear()
+
+    ok, error = auto_renewal.set_setting_validated(key, msg.text or "")
+    if not ok:
+        await msg.answer(
+            f"❌  {error}\n\nЗначение не сохранено, попробуйте ещё раз через «⚙️ Настроить условия».",
+            reply_markup=main_menu
+        )
+        return
+
+    meta = auto_renewal.FIELD_META.get(key, {})
+    new_value = auto_renewal.get_setting(key)
+    await msg.answer(
+        f"✅  {meta.get('label', key)} сохранено: {new_value}",
+        reply_markup=main_menu
+    )
+
+
+# ---------------- DIAGNOSTICS ----------------
+
+def _format_diag(d: dict) -> str:
+    lines = ["🔍 Диагностика лог-канала автопродления", ""]
+    lines.append(f"BOT_TOKEN в .env: {'✅  задан' if d['bot_token_set'] else '❌  НЕ задан'}")
+    lines.append(f"ADMIN_ID в .env: {'✅  задан' if d['admin_id_set'] else '❌  НЕ задан'}")
+    lines.append(
+        f"LOG_CHANNEL_ID в .env: "
+        f"{'✅  задан (' + str(d['log_channel_id']) + ')' if d['log_channel_id_set'] else '❌  НЕ задан'}"
+    )
+    lines.append("")
+
+    if d["get_me_ok"]:
+        lines.append(f"getMe: ✅  токен рабочий, бот @{d['bot_username']} (id {d['bot_id']})")
+    else:
+        lines.append(f"getMe: ❌  {d['get_me_error']}")
+
+    if not d["log_channel_id_set"]:
+        lines.append("")
+        lines.append("Дальше проверять нечего — сначала задайте LOG_CHANNEL_ID в .env и перезапустите бота.")
+        return "\n".join(lines)
+
+    if d["get_chat_ok"]:
+        lines.append(f"getChat: ✅  канал виден, «{d['chat_title']}»")
+    else:
+        lines.append(f"getChat: ❌  {d['get_chat_error']}")
+        lines.append("   → скорее всего неверный LOG_CHANNEL_ID, либо бота там вообще нет.")
+
+    if d["member_status"] is not None:
+        status_ru = {
+            "creator": "создатель",
+            "administrator": "администратор",
+            "member": "участник",
+            "restricted": "ограничен",
+            "left": "НЕ состоит в канале",
+            "kicked": "исключён/забанен",
+        }.get(d["member_status"], d["member_status"])
+        lines.append(f"Статус бота в канале: {status_ru}")
+
+        if d["member_status"] in ("left", "kicked"):
+            lines.append("   → бот не состоит в канале (или был удалён) — добавьте его заново как администратора.")
+        elif d["can_post_messages"] is False:
+            lines.append(
+                "can_post_messages: ❌  ВЫКЛЮЧЕНО — вот и причина. Статуса «администратор» "
+                "недостаточно: зайдите в настройки канала → Администраторы → права бота → "
+                "включите «Публикация сообщений»."
+            )
+        elif d["can_post_messages"] is True:
+            lines.append("can_post_messages: ✅  включено")
+    elif d["get_member_error"]:
+        lines.append(f"getChatMember: ❌  {d['get_member_error']}")
+
+    lines.append("")
+    if d["test_send_ok"]:
+        lines.append("Тестовая отправка в канал: ✅  УСПЕШНО — лог физически работает прямо сейчас.")
+        lines.append(
+            "Если сообщения всё равно не появляются в реальных сценариях — проверьте, что "
+            "включён сам тумблер автопродления и что канал в .env совпадает с этим же ID."
+        )
+    else:
+        lines.append(f"Тестовая отправка в канал: ❌  {d['test_send_error']}")
+        lines.append("   → это точная причина, по которой log_to_channel() сейчас не работает.")
+
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data == "autoren:diag")
+async def auto_renewal_diag(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    await call.answer("Проверяю...")
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, diagnose_log_channel)
+    await call.message.answer(_format_diag(result))
+
+
+# ---------------- REVIEW: confirm / disable ----------------
+
+@router.callback_query(F.data.startswith("aircheck:"))
+async def auto_renewal_review(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    _, username, action = call.data.split(":", 2)
     user = get_user(username)
     if not user:
-        return False
+        await call.answer("Пользователь не найден", show_alert=True)
+        return
 
     pending = user.get("pending_request") or {}
-    display_file_id, display_is_photo = _pending_file_ref(pending)
+    decision = pending.get("ai_decision")
+    if not decision:
+        await call.answer("Эта заявка уже обработана.", show_alert=True)
+        try:
+            await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n⚠️ Уже обработано.")
+        except Exception:
+            pass
+        return
 
-    # ---- anti-abuse: auto-renewal can apply at most once per lock window ----
-    # Without this, a client could resubmit the same (or a slightly
-    # doctored) receipt repeatedly and have auto-renewal extend their
-    # access again and again, unattended. The first receipt in a window
-    # is handled automatically; every next one falls straight to manual
-    # review with a clearly marked warning card -- no Gemini call spent
-    # on it. See _is_locked() for exactly when this clears.
-    #
-    # Uses display_file_id/display_is_photo (read straight from the
-    # pending record, no network call) rather than _fetch_receipt_file()
-    # below -- this exits before ever needing the actual bytes, but the
-    # admin still needs to SEE the receipt on this card to judge whether
-    # it's a genuine replay attempt, so the file reference has to be
-    # resolved up front, not after the point where the pipeline would
-    # normally bail out.
-    locked, unlock_date = _is_locked(user)
-    if locked:
-        _fallback_to_manual(
-            username,
-            "Защита от накрутки: автопродление уже применялось этому "
-            "пользователю недавно, повторно сработать не могло.",
-            trigger,
-            file_id=display_file_id,
-            is_photo=display_is_photo,
-            anti_abuse=True,
-            unlock_date=unlock_date,
+    if action == "confirm":
+        update_user(username, pending_request=None)
+        # Client was already notified the moment auto-renewal applied
+        # (see core/auto_renewal.py's _apply_and_request_review) --
+        # "Подтвердить" just closes this review card, nothing more to send.
+        await notify_bg(
+            log_to_channel,
+            f"✅  Автопродление {username} подтверждено администратором (доп. действий не требуется)."
         )
-        return False
+        try:
+            await call.message.edit_caption(
+                caption=(call.message.caption or "") + "\n\n✅  Подтверждено администратором."
+            )
+        except Exception:
+            pass
+        await call.answer("Подтверждено")
+        return
 
-    file_bytes, mime_type, file_id, is_photo = _fetch_receipt_file(pending)
-    if file_bytes is None:
-        _fallback_to_manual(username, "Не удалось получить файл чека для проверки", trigger)
-        return False
+    if action == "disable":
+        previous_expires_at = decision.get("previous_expires_at")
+        previous_status = decision.get("previous_status", "active")
 
+        # Full rollback, not just a disable -- undo the auto-renewal
+        # entirely: status AND expiry both go back to what they were
+        # right before Gemini's decision was applied. Also releases the
+        # anti-abuse lock (auto_renewal_applied/_at) early -- this
+        # auto-renewal is being treated as if it never happened, so it
+        # shouldn't cost the user their next legitimate chance either.
+        # Split into two calls -- core.db.update_user() redirects
+        # expires_at/status onto the leader (and fans out to the group)
+        # whenever they're in the kwargs; bundling pending_request/
+        # auto_renewal_applied into that same call would misroute them
+        # onto the leader for a follower account instead of staying on
+        # `username` itself.
+        update_user(username, status="inactive", expires_at=previous_expires_at)
+        update_user(username, pending_request=None, auto_renewal_applied=False, auto_renewal_applied_at=None)
+        await run_sync()
+
+        # The client was already told "продлено" -- now they need to be
+        # told it's off again. Generic wording, same as any other manual
+        # rejection: never mentions "automatic" so the client learns
+        # nothing about how auto-renewal works.
+        await notify_bg(
+            notify_user,
+            user,
+            "❌  Продление отменено администратором после проверки. "
+            "Если это ошибка — напишите администратору."
+        )
+        await notify_bg(
+            log_to_channel,
+            f"🚫 Автопродление {username} отклонено администратором — "
+            f"откат: статус inactive, дата вернулась на {previous_expires_at or '∞'}, "
+            f"защита от повторной накрутки снята."
+        )
+        try:
+            await call.message.edit_caption(
+                caption=(call.message.caption or "") +
+                "\n\n🚫 Отклонено, доступ отключён, дата откачена, клиент уведомлён."
+            )
+        except Exception:
+            pass
+        await call.answer("Отключено и откачено")
+        return
+
+    await call.answer("Неизвестное действие", show_alert=True)
+
+
+# ---------------- RETRY (attached to fallback cards) ----------------
+
+@router.callback_query(F.data.startswith("airretry:"))
+async def auto_renewal_retry(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+
+    username = call.data.split(":", 1)[1]
+    user = get_user(username)
+    if not user or not user.get("pending_request"):
+        await call.answer("Заявка не найдена или уже обработана.", show_alert=True)
+        return
+
+    if not claim_pending_request_for_ai(username):
+        await call.answer("Уже обрабатывается — подождите немного.", show_alert=True)
+        return
+
+    await call.answer("Повторяю проверку через Gemini...")
+    loop = asyncio.get_event_loop()
+    approved = await loop.run_in_executor(
+        None, auto_renewal.process_pending_request_with_ai, username, "manual_retry"
+    )
+
+    note = "\n\n🔄 Повторная проверка: одобрено (см. новую карточку выше)." if approved \
+        else "\n\n🔄 Повторная проверка снова не прошла — см. новое сообщение."
     try:
-        extraction = extract_receipt_data(file_bytes, mime_type)
-    except GeminiError as e:
-        _fallback_to_manual(username, f"Ошибка при обращении к Gemini: {e}", trigger, file_id, is_photo)
-        return False
-
-    approved, months, reason = evaluate_receipt_extraction(extraction)
-
-    if not approved:
-        _fallback_to_manual(username, reason, trigger, file_id, is_photo, extraction)
-        return False
-
-    _apply_and_request_review(username, months, extraction, trigger, file_id, is_photo)
-    return True
-
-
-def _fallback_admin_kb(username: str) -> dict:
-    """
-    Plain-dict mirror of bot/keyboards.py's renewal_admin_kb() (this
-    module sends via raw HTTP, not aiogram objects — if you change one,
-    check the other), plus a 🔄 retry button. Attaching the normal approve
-    buttons here means a fallback (e.g. a transient Gemini error, like an
-    outdated model name) doesn't cost the admin an extra trip to 📋 List
-    users to approve manually — everything needed is on this one card.
-    """
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "➕1 мес", "callback_data": f"apr:{username}:30"},
-                {"text": "➕2 мес", "callback_data": f"apr:{username}:60"},
-            ],
-            [{"text": "✍️ Ручная дата", "callback_data": f"apr:{username}:manual"}],
-            [{"text": "🔄 Повторить автопроверку", "callback_data": f"airretry:{username}"}],
-            [{"text": "❌ Отклонить", "callback_data": f"apr:{username}:reject"}],
-        ]
-    }
-
-
-def _fallback_to_manual(username, reason, trigger, file_id=None, is_photo=True, extraction=None, anti_abuse=False, unlock_date=None):
-    user = get_user(username)
-    pending = (user or {}).get("pending_request") or {}
-    pending["ai_result"] = "fallback"
-    pending["ai_fallback_reason"] = reason
-    pending["ai_trigger"] = trigger
-    pending["ai_anti_abuse"] = anti_abuse
-    update_user(username, pending_request=pending)
-
-    log.info(
-        "auto-renewal fallback for %s (%s)%s: %s",
-        username, trigger, " [ANTI-ABUSE]" if anti_abuse else "", reason,
-    )
-
-    if anti_abuse:
-        # Deliberately a different, louder header than the generic
-        # fallback below -- this is not "Gemini couldn't read it", it's
-        # "someone may be trying to replay a receipt for a second
-        # auto-renewal". The client is NOT told any of this -- they just
-        # get the normal "Отправлено администратору. Ждите
-        # подтверждения." acknowledgement (see bot/handlers/receipt.py /
-        # feedback.py) -- only the admin sees this card.
-        unlock_line = f" (снимется {unlock_date})" if unlock_date else ""
-        caption = (
-            f"🚨 ЗАЩИТА ОТ НАКРУТКИ ({_trigger_label(trigger)})\n"
-            f"👤 {username}\n"
-            f"Попытка повторного автопродления, сработала защита{unlock_line}\n"
-            f"Чек на проверку, пожалуйста, обработайте заявку вручную."
-        )
-    else:
-        caption = (
-            f"⚠️ Автопродление не сработало ({_trigger_label(trigger)})\n"
-            f"👤 {username}\n"
-            f"Причина: {reason}\n\n"
-            f"Можно одобрить вручную, повторить автопроверку (например, если "
-            f"причина — временная ошибка Gemini) или отклонить:"
-        )
-
-    kb = _fallback_admin_kb(username)
-
-    if file_id:
-        if is_photo:
-            send_photo_by_file_id(file_id, caption=caption, reply_markup=kb)
-        else:
-            from core.notify import send_document_by_file_id
-            send_document_by_file_id(file_id, caption=caption, reply_markup=kb)
-    else:
-        # No file to attach (e.g. couldn't even download it) -- admin still
-        # needs SOME way to act, so fall back to a plain text notice; the
-        # normal apr:/airretry: buttons work the same either way since they
-        # only reference the username, not this specific message.
-        notify_admin(caption)
-
-    _log_or_warn(caption, file_id=file_id, is_photo=is_photo)
-
-
-def _apply_and_request_review(username, months, extraction, trigger, file_id=None, is_photo=True):
-    """
-    Applies the renewal immediately AND notifies the client immediately —
-    the exact same "✅ Ваша подписка продлена..." text a manual approval
-    sends, no delay. The admin still gets a post-hoc review card
-    ("✅ Подтвердить" / "🚫 Отключить") so a wrong auto-approval can be
-    caught and rolled back after the fact, but that review no longer
-    gates when the client hears about it — see the module docstring for
-    why (the anti-abuse fallback is the case that stays silent, not this
-    one).
-    """
-    user = get_user(username)
-    previous_expires_at = user.get("expires_at")
-    previous_status = user.get("status")
-    was_expired_or_inactive = previous_status != "active" or is_expired(previous_expires_at)
-
-    new_expires_at = calc_new_expiry_months(previous_expires_at, months)
-    applied_at = utcnow_naive().isoformat()
-
-    pending = user.get("pending_request") or {}
-    pending["ai_result"] = "approved"
-    pending["ai_decision"] = {
-        "months": months,
-        "previous_expires_at": previous_expires_at,
-        "previous_status": previous_status,
-        "new_expires_at": new_expires_at,
-        "extraction": extraction,
-        "trigger": trigger,
-        "decided_at": applied_at,
-    }
-
-    # Two separate update_user() calls, deliberately: core.db.update_user()
-    # redirects a call onto the leader (and fans out to the whole group)
-    # whenever expires_at/status are among the kwargs -- if pending_request/
-    # auto_renewal_applied were bundled into that same call, they'd land on
-    # the leader's record instead of this specific account's, for any user
-    # who happens to be a follower. Splitting keeps expires_at/status going
-    # through the leader-sync path while pending_request/auto_renewal_*
-    # always land on `username` itself, exactly as intended.
-    update_user(username, expires_at=new_expires_at, status="active")
-    update_user(
-        username,
-        notified_days=[],
-        post_disable_notified=[],
-        pending_request=pending,
-        auto_renewal_applied=True,        # anti-abuse lock, see _is_locked()
-        auto_renewal_applied_at=applied_at,
-    )
-
-    if was_expired_or_inactive:
-        safe_sync()
-
-    # The client's only signal, ever, that anything happened -- same
-    # wording bot/handlers/receipt.py's manual approval uses.
-    notify_user(user, f"✅ Ваша подписка продлена до {new_expires_at}. Спасибо!")
-
-    amount = extraction.get("amount")
-    confidence = extraction.get("confidence")
-    caption = (
-        f"🤖 Автопродление применено ({_trigger_label(trigger)})\n"
-        f"👤 {username}\n"
-        f"💰 Сумма по чеку: {amount}₽ → {months} мес.\n"
-        f"📅 {previous_expires_at or '∞'} → {new_expires_at}\n"
-        f"🎯 Уверенность распознавания: {confidence}\n\n"
-        f"Клиент уже уведомлён о продлении. Проверьте чек — если что-то не так, "
-        f"«🚫 Отключить» откатит и статус, и дату, и отправит клиенту сообщение "
-        f"об отмене. «✅ Подтвердить» просто закрывает карточку без доп. действий:"
-    )
-
-    review_kb = {
-        "inline_keyboard": [[
-            {"text": "✅ Подтвердить", "callback_data": f"aircheck:{username}:confirm"},
-            {"text": "🚫 Отключить", "callback_data": f"aircheck:{username}:disable"},
-        ]]
-    }
-
-    if file_id:
-        if is_photo:
-            send_photo_by_file_id(file_id, caption=caption, reply_markup=review_kb)
-        else:
-            from core.notify import send_document_by_file_id
-            send_document_by_file_id(file_id, caption=caption, reply_markup=review_kb)
-    else:
-        notify_admin(caption)
-
-    _log_or_warn(caption, file_id=file_id, is_photo=is_photo)
+        await call.message.edit_caption(caption=(call.message.caption or "") + note)
+    except Exception:
+        pass
