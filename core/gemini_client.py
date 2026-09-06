@@ -100,6 +100,15 @@ def proxy_configured() -> bool:
     return bool(GEMINI_PROXY_URL)
 
 
+def proxy_url() -> str:
+    """The configured Worker/reverse-proxy base URL as-is, straight from
+    .env — for display only (e.g. bot/handlers/auto_renewal_review.py's
+    status screen, so the admin can see exactly where the on/off toggle
+    is pointing). Empty string if nothing is configured; callers should
+    check proxy_configured() first rather than treat "" as a real value."""
+    return GEMINI_PROXY_URL
+
+
 def is_proxy_enabled() -> bool:
     """Whether outbound Gemini calls actually go through the configured
     proxy RIGHT NOW. Only meaningful when proxy_configured() is True —
