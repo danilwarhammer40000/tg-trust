@@ -34,6 +34,23 @@ whether the API key itself is valid. The worker is expected to forward
 whatever path+query it receives straight to Google (and may inject its
 own key, in which case our own ?key= is simply redundant/ignored — either
 way works).
+
+TIMEOUT / THINKING: gemini-3.6-flash is a reasoning model — even a
+one-word "test" prompt burns real thinking tokens (seen: ~200
+thoughtsTokenCount on a trivial prompt), and a real receipt image easily
+pushes a request past a 30s budget, especially with the extra hop through
+a Worker. Two mitigations, applied together:
+  - REQUEST_TIMEOUT raised to 60s (was 30s) — receipts are infrequent
+    enough that a slower-but-successful call beats a fast timeout that
+    just falls back to manual review.
+  - thinking_config.thinking_budget=0 in generationConfig — this task is
+    pure extraction (read numbers/text off an image), not multi-step
+    reasoning, so disabling the "thinking" phase entirely both speeds up
+    the response and removes one whole source of timeout risk. If a
+    future model/API version rejects this field, Gemini will typically
+    just ignore an unknown generationConfig key rather than error — but
+    if extraction quality or reliability regresses after a model change,
+    this is the first thing to try removing.
 """
 import json
 import logging
@@ -60,6 +77,9 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 GEMINI_PROXY_URL = os.getenv("GEMINI_PROXY_URL", "").strip()
 
 DIRECT_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+# Raised from 30s -- see module docstring's TIMEOUT / THINKING section.
+REQUEST_TIMEOUT = 60
 
 # Keep this in Russian: the receipts themselves are Russian bank transfer
 # screenshots, and error/notes fields written in Russian are what end up
@@ -158,11 +178,14 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str) -> dict:
         "generationConfig": {
             "response_mime_type": "application/json",
             "temperature": 0,
+            # Pure extraction, no multi-step reasoning needed -- see
+            # module docstring's TIMEOUT / THINKING section.
+            "thinking_config": {"thinking_budget": 0},
         },
     }
 
     try:
-        r = requests.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=30)
+        r = requests.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=REQUEST_TIMEOUT)
     except requests.RequestException as e:
         raise GeminiError(f"network error ({'proxy' if url != DIRECT_URL else 'direct'}): {e}") from e
 
