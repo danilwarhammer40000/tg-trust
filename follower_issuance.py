@@ -24,6 +24,10 @@ falls back to a non-functional placeholder URL.
 import re
 
 from bot.config import DOMAIN
+from bot.formatting import format_full_instructions_message
+from core.dates import utcnow_naive
+from core.db import add_user, get_followers, get_user, link_user
+from core.generator import generate_link
 
 # How many extra links (sub-accounts beyond the leader's own) a client can
 # get WITHOUT admin approval. Each link = up to 2 devices, so this is
@@ -35,10 +39,6 @@ from bot.config import DOMAIN
 # for. See handlers/extra_links.py for where the free/approval split
 # actually happens.
 FREE_EXTRA_LINKS = 2
-from bot.formatting import format_full_instructions_message
-from core.dates import utcnow_naive
-from core.db import add_user, get_followers, get_user, link_user
-from core.generator import generate_link
 
 # Followers of a leader are named "{leader}-2", "{leader}-3", etc. — the
 # leader account itself is implicitly "slot 1". Chosen over "{leader}/2"
