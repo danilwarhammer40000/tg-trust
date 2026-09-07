@@ -15,6 +15,7 @@ from bot.keyboards import instructions_menu_kb, platform_choice_kb, routing_plat
 from core.dates import is_expired
 from core.db import get_followers, get_user, get_user_by_telegram_id
 from core.generator import generate_link
+from follower_issuance import FREE_EXTRA_LINKS
 from core.instructions import (
     ANDROID_BYPASS_DOMAINS,
     IOS_BYPASS_DOMAINS,
@@ -94,10 +95,17 @@ async def client_my_link(msg: Message):
     ]
     rows.append([InlineKeyboardButton(text="📱 Подключить ещё устройства", callback_data="extralinks:start")])
 
+    free_left = max(0, FREE_EXTRA_LINKS - len(followers))
+    free_note = (
+        f"\n\n🆓 Дополнительно вы можете бесплатно подключить ещё "
+        f"{free_left * 2} устройства ({free_left} {'ссылка' if free_left == 1 else 'ссылки'}) — "
+        f"автоматически, без подтверждения администратора."
+    ) if free_left else ""
+
     if followers:
-        header = f"Ваши подключения: {len(accounts)} всего (основное + {len(followers)} доп.)."
+        header = f"Ваши подключения: {len(accounts)} всего (основное + {len(followers)} доп.).{free_note}"
     else:
-        header = "Ваши подключения: 1.\n\nℹ️ Одна ссылка подключает до 2 устройств одновременно."
+        header = f"Ваши подключения: 1.\n\nℹ️ Одна ссылка подключает до 2 устройств одновременно.{free_note}"
 
     await msg.answer(
         f"{header}\n\nНажмите на нужное, чтобы получить карточку:",
