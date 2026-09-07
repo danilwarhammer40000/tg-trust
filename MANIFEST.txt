@@ -1,0 +1,101 @@
+Как использовать: распаковать архив в корень репозитория (пути внутри
+архива уже совпадают со структурой репо) — существующие файлы будут
+перезаписаны, новые появятся на своих местах. После распаковки — рестарт
+бота (systemctl restart trustpanel-bot, либо через /opt/trustpanel/venv...
+как у вас настроено).
+
+Отмечены [НОВЫЙ] — файла раньше не было, остальные — изменённые.
+
+CHANGELOG.md
+    Полная история изменений, актуальная запись — v2.7 сверху.
+
+follower_issuance.py
+    FREE_EXTRA_LINKS = 2 (бесплатный лимит доп. ссылок).
+
+bot/bot.py
+    Регистрация нового роутера settings.py.
+
+bot/keyboards.py
+    main_menu: -3 кнопки, +"⚙️ Настройки". client_menu: "Инструкция" ->
+    "Инструкции". instructions_menu_kb: +3-й пункт "Как пользоваться
+    ботом". +bot_usage_button_kb().
+
+bot/handlers/settings.py                                          [НОВЫЙ]
+    Точка входа "⚙️ Настройки" (сортировка/триалы/автопродление/sync/
+    проверка привязок — переиспользует существующую логику из других
+    файлов) + браузер "💬 Переписки" (список/просмотр/удаление).
+
+bot/handlers/sorting.py
+    Вход теперь только через колбэк settings:sorting (убран прямой
+    F.text-хендлер с главного меню).
+
+bot/handlers/sync_deploy.py
+    Sync users переведён на колбэк settings:sync. Деплой не тронут.
+
+bot/handlers/broadcast.py
+    Кнопка "Проверить привязки" убрана из меню Рассылки (сама функция
+    осталась как есть — только тех, у кого telegram_id уже есть).
+
+bot/handlers/database.py
+    Кнопка "Управление триалами" убрана (переехала в Настройки, тот же
+    callback db:trials).
+
+bot/handlers/auto_renewal_review.py
+    Убрана кнопка "✅ Подтвердить" из карточек автопродления. Добавлена
+    "ℹ️ Как это работает" (короткий статус отдельно от полного текста).
+    Добавлено поле "🌐 Прокси-адрес" в настройках. Вход также через
+    колбэк settings:autoren.
+
+bot/handlers/client_menu.py
+    "Инструкция" -> "Инструкции" (3 пункта). Кнопка "Как пользоваться
+    ботом" под платформенными инструкциями (howto:ios/howto:android).
+
+bot/handlers/start.py
+    /start переведён на CommandStart() с разбором deep-link. Обработка
+    инвайт-ссылок (_handle_invite). Автоотправка гайда после триала и
+    после привязки картой.
+
+bot/handlers/add_user.py
+    Кнопка "🔗 Инвайт-ссылка" на карточках (одиночное и массовое
+    добавление) + общий колбэк-хендлер invite:gen:{username}.
+
+bot/handlers/list_users.py
+    Кнопка "🔗 Инвайт-ссылка" в карточке клиента (только если telegram_id
+    ещё не привязан).
+
+bot/handlers/feedback.py
+    Запись входящих/исходящих сообщений в core/messages.py (чеки не
+    пишутся — у них свой поток).
+
+core/auto_renewal.py
+    _apply_and_request_review: pending_request чистится сразу (не по
+    клику админа) — чинит блокировку доп. ссылок. Данные отката — в
+    last_auto_renewal. +get/set_gemini_proxy_url_override().
+
+core/gemini_client.py
+    timeout=60. Ретраи (до 3, с паузой 2с/4с) на 429/500/502/503/504.
+    proxy_url()/proxy_configured() учитывают live-override.
+
+core/instructions.py
+    +render_bot_usage_instructions() — текст "Как пользоваться ботом".
+
+core/db.py
+    +get_user_by_invite_token().
+
+core/invite.py                                                     [НОВЫЙ]
+    generate_invite_token() / build_invite_link() — бессрочная-до-
+    использования инвайт-ссылка.
+
+core/paths.py
+    +MESSAGES_PATH, добавлен в BACKUP_FILES.
+
+core/messages.py                                                   [НОВЫЙ]
+    Хранилище переписки (бессрочно, без авто-удаления) + список бесед/
+    получение истории/удаление одной беседы целиком.
+
+core/service.py
+    restart_trusttunnel(): опрос systemctl is-active вместо мгновенного
+    доверия к возврату restart.
+
+core/generator.py
+    generate_link(): до 3 попыток при ошибке/пустом ответе бинарника.
