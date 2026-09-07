@@ -250,3 +250,30 @@ ozon-dostavka.ru
 
 rutube.ru
 rutube.app"""
+
+
+def render_bot_usage_instructions() -> str:
+    """
+    "Как пользоваться ботом" — an explanation of the client_menu buttons
+    themselves (ℹ️/🔗/📖/💳/✉️), not a device-connection guide (that's
+    render_android_instructions/render_ios_instructions above). Sent
+    automatically right after a client's first successful link to the DB
+    (see bot/handlers/start.py's onboard_trial_start/bind_by_card, and
+    the invite-link flow in bot/handlers/leader_link.py), plus reachable
+    on demand via the "🤖 Как пользоваться ботом" button both inside
+    "📖 Инструкции" and right after the platform-specific setup steps
+    (bot/keyboards.py's bot_usage_button_kb(), used in client_menu.py's
+    howto:ios/howto:android).
+    """
+    return (
+        "🤖 Как пользоваться ботом\n\n"
+        "ℹ️ Мой статус — когда истекает доступ и сколько подключений активно.\n\n"
+        "🔗 Мои подключения — ваши ссылки, можно подключить доп. устройства "
+        "(всего 6 — бесплатно и сразу).\n\n"
+        "📖 Инструкции — три раздела: как подключить приложение (Android/iOS), "
+        "как открыть заблокированные в России сайты, и это же руководство — "
+        "на случай, если понадобится ещё раз.\n\n"
+        "💳 Реквизиты для оплаты — здесь вы можете продлить ваше подключение.\n\n"
+        "✉️ Написать администратору — напишите ваш вопрос и предложения по "
+        "улучшению работы 👍🚀"
+    )

@@ -8,6 +8,7 @@ TRIAL_USED_PATH = os.path.join(DATA_DIR, "trial_used.json")
 SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
 AUTO_RENEWAL_SETTINGS_PATH = os.path.join(DATA_DIR, "auto_renewal_settings.json")
 GEMINI_PROXY_SETTINGS_PATH = os.path.join(DATA_DIR, "gemini_proxy_settings.json")
+MESSAGES_PATH = os.path.join(DATA_DIR, "messages.json")
 
 # All files that make up "the database" for backup/restore purposes.
 # Deliberately does NOT include credentials.toml — that's derived data,
@@ -18,4 +19,5 @@ BACKUP_FILES = {
     "settings.json": SETTINGS_PATH,
     "auto_renewal_settings.json": AUTO_RENEWAL_SETTINGS_PATH,
     "gemini_proxy_settings.json": GEMINI_PROXY_SETTINGS_PATH,
+    "messages.json": MESSAGES_PATH,
 }

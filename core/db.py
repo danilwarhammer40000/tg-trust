@@ -191,6 +191,20 @@ def get_user_by_max_chat_id(chat_id) -> Optional[Dict]:
     return None
 
 
+def get_user_by_invite_token(token: str) -> Optional[Dict]:
+    """See core.invite for token generation/regeneration. Only ever
+    matches a token that's still the CURRENT one on that user's record —
+    regenerating a user's invite link overwrites invite_token, so an old
+    link (even if never used) stops resolving to anything the moment a
+    new one is generated."""
+    if not token:
+        return None
+    for u in load():
+        if u.get("invite_token") == token:
+            return u
+    return None
+
+
 def username_exists(username: str) -> bool:
     return get_user(username) is not None
 

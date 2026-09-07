@@ -47,14 +47,17 @@ AUTO_RENEWAL_LOCK_DAYS have passed since the last auto-renewal, even if
 no admin touched it.
 
 PROXY (Cloudflare Worker / any HTTPS reverse-proxy for outbound Gemini
-calls): the URL itself (GEMINI_PROXY_URL) only ever comes from .env — not
-editable here, since changing the destination host is a deployment
-decision, not a trigger-tuning one. What IS live-editable, without
-touching .env or restarting the bot, is whether that configured proxy is
-actually USED right now — see gemini_proxy_enabled below and
+calls): GEMINI_PROXY_URL from .env is the DEFAULT proxy address, but the
+admin can override it live from Settings ("🌐 Прокси-адрес" in this
+module's settings submenu) without touching .env or restarting the bot —
+see get_gemini_proxy_url_override()/set_gemini_proxy_url_override() below
+and core.gemini_client.proxy_url(). Separately, whether that configured
+proxy (.env value OR override) is actually USED right now is its own
+live toggle — see gemini_proxy_enabled below and
 core.gemini_client.is_proxy_enabled()/proxy_configured(), and the
 "🌐 Прокси для Gemini" toggle in bot/handlers/auto_renewal_review.py's
-main menu (only shown at all when a URL is actually set).
+main menu (only shown at all when a proxy URL is actually configured,
+from either source).
 """
 import json
 import logging
@@ -85,6 +88,9 @@ DEFAULT_SETTINGS = {
     # True so that simply setting GEMINI_PROXY_URL in .env and restarting
     # is enough to start using it -- no extra step required the first time.
     "gemini_proxy_enabled": True,
+    # Live override for the proxy URL itself -- empty string means "use
+    # GEMINI_PROXY_URL from .env, if any" (see get_gemini_proxy_url_override).
+    "gemini_proxy_url_override": "",
 }
 
 # Human-readable metadata for the bot's "⚙️ Настроить условия" screen — one
@@ -185,17 +191,37 @@ def toggle_fully_automatic() -> bool:
 
 def toggle_gemini_proxy_enabled() -> bool:
     """Flips whether outbound Gemini calls actually use the configured
-    GEMINI_PROXY_URL (see core.gemini_client.is_proxy_enabled) — lets the
-    admin fall back to a direct connection without touching .env or
-    restarting the bot, e.g. to check whether a currently-down proxy is
-    the actual cause of a Gemini failure. Callers (the bot handler) are
-    responsible for checking core.gemini_client.proxy_configured() first —
-    toggling this with no URL set in .env has no visible effect either
-    way."""
+    proxy (see core.gemini_client.is_proxy_enabled) — lets the admin fall
+    back to a direct connection without touching .env or restarting the
+    bot, e.g. to check whether a currently-down proxy is the actual cause
+    of a Gemini failure. Callers (the bot handler) are responsible for
+    checking core.gemini_client.proxy_configured() first — toggling this
+    with no URL configured (from either .env or the override below) has
+    no visible effect either way."""
     settings = _load_settings()
     settings["gemini_proxy_enabled"] = not settings.get("gemini_proxy_enabled", True)
     _save_settings(settings)
     return settings["gemini_proxy_enabled"]
+
+
+def get_gemini_proxy_url_override() -> str:
+    """Empty string means "no override — fall back to GEMINI_PROXY_URL
+    from .env" (see core.gemini_client.proxy_url())."""
+    return _load_settings().get("gemini_proxy_url_override", "") or ""
+
+
+def set_gemini_proxy_url_override(raw_value: str):
+    """Validates and saves a live proxy-URL override from admin-typed
+    text. Returns (ok, error_message_or_none), same shape as
+    set_setting_validated() — an empty string is valid input and clears
+    the override, reverting to whatever (if anything) is in .env."""
+    raw_value = (raw_value or "").strip()
+    if raw_value and not (raw_value.startswith("http://") or raw_value.startswith("https://")):
+        return False, "URL должен начинаться с http:// или https://, либо оставьте пустым, чтобы использовать значение из .env"
+    settings = _load_settings()
+    settings["gemini_proxy_url_override"] = raw_value
+    _save_settings(settings)
+    return True, None
 
 
 def log_channel_configured() -> bool:
@@ -261,6 +287,11 @@ def set_setting_validated(key: str, raw_value: str):
                 raise ValueError
         except ValueError:
             return False, "Введите положительное целое число дней, например 7"
+
+    elif key == "gemini_proxy_url":
+        if raw_value == "-":
+            raw_value = ""
+        return set_gemini_proxy_url_override(raw_value)
 
     else:
         return False, f"Неизвестный параметр: {key}"
@@ -661,12 +692,20 @@ def _apply_and_request_review(username, months, extraction, trigger, file_id=Non
     """
     Applies the renewal immediately AND notifies the client immediately —
     the exact same "✅ Ваша подписка продлена..." text a manual approval
-    sends, no delay. The admin still gets a post-hoc review card
-    ("✅ Подтвердить" / "🚫 Отключить") so a wrong auto-approval can be
-    caught and rolled back after the fact, but that review no longer
-    gates when the client hears about it — see the module docstring for
-    why (the anti-abuse fallback is the case that stays silent, not this
-    one).
+    sends, no delay. The admin still gets a post-hoc review card with a
+    single "🚫 Отключить" button, so a wrong auto-approval can be caught
+    and rolled back after the fact.
+
+    BUG FIX: this used to stash the rollback data inside pending_request
+    (as pending_request["ai_decision"]) and only clear pending_request once
+    the admin tapped a review button. Since pending_request is the SAME
+    field bot/handlers/extra_links.py checks to decide "does this client
+    already have an open request", a client whose auto-renewal the admin
+    simply hadn't looked at yet was incorrectly blocked from requesting
+    extra device links, with no visible connection between the two
+    features. Rollback data now lives in its own `last_auto_renewal` field
+    instead, and pending_request is cleared right here — the review card
+    is now purely an FYI-with-an-undo-button, not a gate on anything.
     """
     user = get_user(username)
     previous_expires_at = user.get("expires_at")
@@ -676,9 +715,7 @@ def _apply_and_request_review(username, months, extraction, trigger, file_id=Non
     new_expires_at = calc_new_expiry_months(previous_expires_at, months)
     applied_at = utcnow_naive().isoformat()
 
-    pending = user.get("pending_request") or {}
-    pending["ai_result"] = "approved"
-    pending["ai_decision"] = {
+    last_auto_renewal = {
         "months": months,
         "previous_expires_at": previous_expires_at,
         "previous_status": previous_status,
@@ -701,7 +738,8 @@ def _apply_and_request_review(username, months, extraction, trigger, file_id=Non
         username,
         notified_days=[],
         post_disable_notified=[],
-        pending_request=pending,
+        pending_request=None,              # BUG FIX: cleared right away, not on admin review
+        last_auto_renewal=last_auto_renewal,
         auto_renewal_applied=True,        # anti-abuse lock, see _is_locked()
         auto_renewal_applied_at=applied_at,
     )
@@ -722,13 +760,11 @@ def _apply_and_request_review(username, months, extraction, trigger, file_id=Non
         f"📅 {previous_expires_at or '∞'} → {new_expires_at}\n"
         f"🎯 Уверенность распознавания: {confidence}\n\n"
         f"Клиент уже уведомлён о продлении. Проверьте чек — если что-то не так, "
-        f"«🚫 Отключить» откатит и статус, и дату, и отправит клиенту сообщение "
-        f"об отмене. «✅ Подтвердить» просто закрывает карточку без доп. действий:"
+        f"«🚫 Отключить» откатит и статус, и дату, и отправит клиенту сообщение об отмене."
     )
 
     review_kb = {
         "inline_keyboard": [[
-            {"text": "✅ Подтвердить", "callback_data": f"aircheck:{username}:confirm"},
             {"text": "🚫 Отключить", "callback_data": f"aircheck:{username}:disable"},
         ]]
     }
