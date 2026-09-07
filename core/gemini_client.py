@@ -35,22 +35,19 @@ whatever path+query it receives straight to Google (and may inject its
 own key, in which case our own ?key= is simply redundant/ignored — either
 way works).
 
-TIMEOUT / THINKING: gemini-3.6-flash is a reasoning model — even a
-one-word "test" prompt burns real thinking tokens (seen: ~200
-thoughtsTokenCount on a trivial prompt), and a real receipt image easily
-pushes a request past a 30s budget, especially with the extra hop through
-a Worker. Two mitigations, applied together:
-  - REQUEST_TIMEOUT raised to 60s (was 30s) — receipts are infrequent
-    enough that a slower-but-successful call beats a fast timeout that
-    just falls back to manual review.
-  - thinking_config.thinking_budget=0 in generationConfig — this task is
-    pure extraction (read numbers/text off an image), not multi-step
-    reasoning, so disabling the "thinking" phase entirely both speeds up
-    the response and removes one whole source of timeout risk. If a
-    future model/API version rejects this field, Gemini will typically
-    just ignore an unknown generationConfig key rather than error — but
-    if extraction quality or reliability regresses after a model change,
-    this is the first thing to try removing.
+TIMEOUT: gemini-3.6-flash is a reasoning model — even a one-word "test"
+prompt burns real thinking tokens (seen: ~200 thoughtsTokenCount on a
+trivial prompt), and a real receipt image easily pushes a request past a
+30s budget, especially with the extra hop through a Worker.
+REQUEST_TIMEOUT is raised to 60s (was 30s) to absorb that — receipts are
+infrequent enough that a slower-but-successful call beats a fast timeout
+that just falls back to manual review.
+
+NOTE: a thinking_config.thinking_budget=0 field was tried here to skip
+the reasoning phase entirely, but gemini-3.6-flash's generateContent
+rejects it outright (400 INVALID_ARGUMENT on the whole request, not just
+ignoring the unknown field) — so it's deliberately NOT set below. Revisit
+only if Google documents the correct field name/shape for this model.
 """
 import json
 import logging
@@ -178,9 +175,6 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str) -> dict:
         "generationConfig": {
             "response_mime_type": "application/json",
             "temperature": 0,
-            # Pure extraction, no multi-step reasoning needed -- see
-            # module docstring's TIMEOUT / THINKING section.
-            "thinking_config": {"thinking_budget": 0},
         },
     }
 
