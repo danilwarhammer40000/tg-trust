@@ -1,5 +1,5 @@
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.access import admin_only
 from bot.display import (
@@ -49,12 +49,12 @@ def sorting_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
-@router.message(F.text == "⚙️ Сортировка БД")
-async def sorting_menu(msg: Message):
-    if not await admin_only(msg):
+@router.callback_query(F.data == "settings:sorting")
+async def sorting_menu(call: CallbackQuery):
+    if not await admin_only(call):
         return
-
-    await msg.answer("⚙️ Настройки отображения списков (тап переключает):", reply_markup=sorting_menu_kb())
+    await call.message.answer("⚙️ Настройки отображения списков (тап переключает):", reply_markup=sorting_menu_kb())
+    await call.answer()
 
 
 @router.callback_query(F.data == "sort:toggle_group")

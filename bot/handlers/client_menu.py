@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from bot.access import is_admin
 from bot.config import DOMAIN
 from bot.formatting import extract_qr_link, format_connection_message
-from bot.keyboards import instructions_menu_kb, platform_choice_kb, routing_platform_kb
+from bot.keyboards import bot_usage_button_kb, instructions_menu_kb, platform_choice_kb, routing_platform_kb
 from core.dates import is_expired
 from core.db import get_followers, get_user, get_user_by_telegram_id
 from core.generator import generate_link
@@ -21,6 +21,7 @@ from core.instructions import (
     IOS_BYPASS_DOMAINS,
     ROUTING_INTRO,
     render_android_instructions,
+    render_bot_usage_instructions,
     render_ios_instructions,
 )
 from core.payment import ACCESS_EXPIRED_MESSAGE, PAYMENT_INFO
@@ -147,7 +148,7 @@ async def client_my_connection_card(call: CallbackQuery):
 
 # ---------------- INSTRUCTIONS MENU ----------------
 
-@router.message(F.text == "📖 Инструкция")
+@router.message(F.text == "📖 Инструкции")
 async def client_instructions_menu(msg: Message):
     if is_admin(msg.from_user.id):
         return
@@ -163,6 +164,12 @@ async def instructions_connect(call: CallbackQuery):
 @router.callback_query(F.data == "instr:routing")
 async def instructions_routing(call: CallbackQuery):
     await call.message.answer(ROUTING_INTRO, reply_markup=routing_platform_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data == "instr:bot_usage")
+async def instructions_bot_usage(call: CallbackQuery):
+    await call.message.answer(render_bot_usage_instructions())
     await call.answer()
 
 
@@ -186,7 +193,7 @@ async def howto_ios(call: CallbackQuery):
     user = get_user_by_telegram_id(call.from_user.id)
     link = extract_qr_link(generate_link(user["username"], DOMAIN)) if user and user.get("username") else None
 
-    await call.message.answer(render_ios_instructions(link))
+    await call.message.answer(render_ios_instructions(link), reply_markup=bot_usage_button_kb())
     await call.answer()
 
 
@@ -195,5 +202,5 @@ async def howto_android(call: CallbackQuery):
     user = get_user_by_telegram_id(call.from_user.id)
     link = extract_qr_link(generate_link(user["username"], DOMAIN)) if user and user.get("username") else None
 
-    await call.message.answer(render_android_instructions(link))
+    await call.message.answer(render_android_instructions(link), reply_markup=bot_usage_button_kb())
     await call.answer()

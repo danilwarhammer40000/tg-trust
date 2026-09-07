@@ -11,7 +11,7 @@ other handlers/ file.
 from datetime import timedelta
 
 from aiogram import Router, F
-from aiogram.filters import StateFilter
+from aiogram.filters import CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyKeyboardRemove
 
@@ -20,16 +20,22 @@ from bot.config import ADMIN_ID, bot
 from bot.formatting import CARD_RE, looks_like_card
 from bot.keyboards import client_menu, main_menu, platform_choice_kb
 from core.dates import utcnow_naive
-from core.db import add_user, get_user, get_user_by_telegram_id, update_user
+from core.db import add_user, get_user, get_user_by_invite_token, get_user_by_telegram_id, update_user
 from core.trial import generate_trial_password, generate_username_from_name, has_used_trial, mark_trial_used
+from core.instructions import render_bot_usage_instructions
 
 router = Router()
 
 
-@router.message(F.text == "/start")
-async def start(msg: Message):
+@router.message(CommandStart())
+async def start(msg: Message, command: CommandObject):
     if is_admin(msg.from_user.id):
         await msg.answer("TrustPanel online", reply_markup=main_menu)
+        return
+
+    payload = command.args or ""
+    if payload.startswith("invite_"):
+        await _handle_invite(msg, payload[len("invite_"):])
         return
 
     user = get_user_by_telegram_id(msg.from_user.id)
@@ -56,6 +62,51 @@ async def start(msg: Message):
     await msg.answer(
         "👋 Привет! Вы уже пользуетесь клубным TrustTunnel VPN?",
         reply_markup=kb
+    )
+
+
+async def _handle_invite(msg: Message, token: str):
+    """
+    Consumes an invite-link deep-link payload. See core/invite.py's module
+    docstring for the "infinite but one-time" contract this implements:
+    a token still resolves to a user record via
+    core.db.get_user_by_invite_token() for as long as it's the CURRENT
+    token on that record (regenerating replaces it, invalidating the old
+    one immediately) -- but ONE-TIME means it only actually binds once:
+    the moment telegram_id gets set below, any further tap of the same
+    link (by anyone) finds the token still resolving to a user, but that
+    user already has a telegram_id, so it's rejected as "already used"
+    rather than silently re-binding (which would let a second person
+    hijack someone else's account just by reusing a forwarded link).
+    """
+    invited = get_user_by_invite_token(token)
+
+    if not invited:
+        await msg.answer(
+            "⚠️ Эта ссылка недействительна — возможно, она устарела или была "
+            "перегенерирована. Обратитесь к администратору."
+        )
+        return
+
+    if invited.get("telegram_id"):
+        await msg.answer(
+            "⚠️ Эта ссылка уже использована. Если это ошибка — напишите администратору."
+        )
+        return
+
+    username = invited["username"]
+    update_user(username, telegram_id=msg.from_user.id)
+
+    await msg.answer(
+        f"✅ Готово, {username}! Аккаунт привязан, буду присылать уведомления об истечении доступа.",
+        reply_markup=client_menu
+    )
+    await msg.answer(render_bot_usage_instructions())
+
+    tg_username = f"@{msg.from_user.username}" if msg.from_user.username else "(без username)"
+    await bot.send_message(
+        ADMIN_ID,
+        f"🔗 Клиент {username} привязан по инвайт-ссылке, Telegram {tg_username} (id {msg.from_user.id})."
     )
 
 
@@ -109,6 +160,8 @@ async def onboard_trial_start(call: CallbackQuery):
         reply_markup=platform_choice_kb()
     )
 
+    await call.message.answer(render_bot_usage_instructions())
+
     await bot.send_message(
         ADMIN_ID,
         f"🆕 Новая регистрация по триалу: {username} (tg id {call.from_user.id}), доступ до {expires_at}."
@@ -160,6 +213,8 @@ async def bind_by_card(msg: Message, state: FSMContext):
         f"✅ Готово, {username}! Теперь я буду присылать уведомления об истечении доступа.",
         reply_markup=client_menu
     )
+
+    await msg.answer(render_bot_usage_instructions())
 
     tg_username = f"@{msg.from_user.username}" if msg.from_user.username else "(без username)"
     await bot.send_message(

@@ -20,6 +20,7 @@ from bot.keyboards import cancel_kb, client_menu, main_menu, renewal_admin_kb
 from bot.states import AdminMessage, Feedback
 from core.dates import is_expired, utcnow_naive
 from core.db import get_user, get_user_by_telegram_id, update_user
+from core.messages import add_message
 from core.notify import log_to_channel
 
 router = Router()
@@ -158,6 +159,8 @@ async def feedback_media_as_message(call: CallbackQuery, state: FSMContext):
     else:
         await bot.send_document(ADMIN_ID, document=file_id, caption=caption, reply_markup=kb)
 
+    add_message(username, "in", text=caption_text, file_id=file_id, is_photo=is_photo)
+
     await call.message.answer("✅ Отправлено администратору.", reply_markup=client_menu)
     await call.answer()
 
@@ -191,6 +194,8 @@ async def client_feedback_send(msg: Message, state: FSMContext):
         f"✉️ Обращение от {username} (tg id: {msg.from_user.id}):\n\n{text}",
         reply_markup=kb
     )
+
+    add_message(username, "in", text=text)
 
     await msg.answer("✅ Отправлено администратору.", reply_markup=client_menu)
 
@@ -269,6 +274,7 @@ async def personal_message_confirm(call: CallbackQuery, state: FSMContext):
 
     try:
         await bot.send_message(user["telegram_id"], f"✉️ Сообщение от администратора:\n\n{text}")
+        add_message(username, "out", text=text)
         await call.message.answer(f"✅ Отправлено {username}.", reply_markup=main_menu)
     except Exception as e:
         log.warning("failed to send personal message to %s: %s", username, e)

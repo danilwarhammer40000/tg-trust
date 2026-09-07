@@ -160,6 +160,9 @@ async def user_actions_menu(call: CallbackQuery):
         )],
     ]
 
+    if not tg_id:
+        rows.append([InlineKeyboardButton(text="🔗 Инвайт-ссылка", callback_data=f"invite:gen:{username}")])
+
     if linked_to:
         # A follower's own expiry/status is redirected to its leader
         # anyway (see core.db.update_user), so it can't become a leader

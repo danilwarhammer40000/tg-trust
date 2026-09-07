@@ -17,15 +17,57 @@ from aiogram.types import (
 )
 
 from bot.access import admin_only, run_sync
-from bot.config import DOMAIN
+from bot.config import DOMAIN, bot
 from bot.formatting import format_full_instructions_message
 from bot.keyboards import cancel_kb, main_menu
 from bot.states import AddUser, AddUserMulti
 from core.dates import add_calendar_months, utcnow_naive
 from core.db import add_user, get_user
 from core.generator import generate_link
+from core.invite import build_invite_link, generate_invite_token
 
 router = Router()
+
+
+def _invite_link_button(username: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Инвайт-ссылка", callback_data=f"invite:gen:{username}")]
+    ])
+
+
+@router.callback_query(F.data.startswith("invite:gen:"))
+async def generate_invite_link_button(call: CallbackQuery):
+    """
+    Shared by the single-add card, the multi-add cards, and
+    bot/handlers/list_users.py's client card — one handler, callback_data
+    just carries the username. See core/invite.py's module docstring for
+    the "infinite but one-time" contract, and bot/handlers/start.py's
+    _handle_invite() for the consuming side.
+    """
+    if not await admin_only(call):
+        return
+
+    username = call.data.split(":", 2)[2]
+    user = get_user(username)
+
+    if not user:
+        await call.answer("Пользователь не найден", show_alert=True)
+        return
+
+    if user.get("telegram_id"):
+        await call.answer("У этого клиента уже привязан Telegram — инвайт-ссылка не нужна.", show_alert=True)
+        return
+
+    token = generate_invite_token(username)
+    me = await bot.get_me()
+    link = build_invite_link(me.username, token)
+
+    await call.message.answer(
+        f"🔗 Инвайт-ссылка для {username}:\n{link}\n\n"
+        "Бессрочная, но одноразовая — перестаёт работать сразу после первого перехода. "
+        "Повторная генерация делает эту ссылку недействительной и выдаёт новую."
+    )
+    await call.answer()
 
 
 # ---------------- SINGLE ----------------
@@ -103,7 +145,7 @@ async def finalize_add_user(msg: Message, state: FSMContext, expires_at):
 
     await msg.answer(
         format_full_instructions_message(username, password, expires_at, link),
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=_invite_link_button(username)
     )
 
     await msg.answer("Menu:", reply_markup=main_menu)
@@ -404,7 +446,8 @@ async def multi_add_get_cards(call: CallbackQuery, state: FSMContext):
             continue
         link = generate_link(username, DOMAIN)
         await call.message.answer(
-            format_full_instructions_message(username, user.get("password"), user.get("expires_at"), link)
+            format_full_instructions_message(username, user.get("password"), user.get("expires_at"), link),
+            reply_markup=_invite_link_button(username)
         )
 
     await call.message.answer("Готово — карточки отправлены выше.", reply_markup=main_menu)

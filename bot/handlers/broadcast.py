@@ -77,6 +77,12 @@ def failure_reason(user) -> str:
 
 
 async def run_binding_check() -> str:
+    """
+    Only checks users who HAVE a telegram_id — those with none simply
+    haven't been reached/used their invite yet, that's an expected,
+    unremarkable state, not something to flag here (see
+    bot/handlers/settings.py's "🔍 Проверка привязок" entry point).
+    """
     users = [u for u in (list_users() or []) if u.get("telegram_id")]
     if not users:
         return "Нет пользователей с привязанным Telegram."
@@ -118,7 +124,6 @@ async def broadcast_menu(msg: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Всем", callback_data="bcast_mode:all")],
         [InlineKeyboardButton(text="🎯 Выбрать получателей", callback_data="bcast_mode:select")],
-        [InlineKeyboardButton(text="🔍 Проверить привязки", callback_data="bcast_mode:check")],
     ])
     await msg.answer("Кому отправить рассылку?", reply_markup=kb)
 

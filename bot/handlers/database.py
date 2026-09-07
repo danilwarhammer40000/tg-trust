@@ -45,7 +45,6 @@ async def db_menu(msg: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📤 Выгрузить сейчас", callback_data="db:export")],
         [InlineKeyboardButton(text="📥 Загрузить БД", callback_data="db:import")],
-        [InlineKeyboardButton(text="🎟 Управление триалами", callback_data="db:trials")],
     ])
     await msg.answer("🗄 База данных:", reply_markup=kb)
 

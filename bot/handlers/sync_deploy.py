@@ -2,7 +2,7 @@ import asyncio
 import logging
 
 from aiogram import Router, F
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message
 
 from bot.access import admin_only, run_sync
 from services import cleanup as cleanup_service
@@ -11,12 +11,13 @@ router = Router()
 log = logging.getLogger(__name__)
 
 
-@router.message(F.text == "🔄 Sync users")
-async def sync_users(msg: Message):
-    if not await admin_only(msg):
+@router.callback_query(F.data == "settings:sync")
+async def sync_users(call: CallbackQuery):
+    if not await admin_only(call):
         return
 
-    await msg.answer("🔄 Checking expirations & syncing...")
+    await call.message.answer("🔄 Checking expirations & syncing...")
+    await call.answer()
 
     loop = asyncio.get_event_loop()
 
@@ -31,10 +32,10 @@ async def sync_users(msg: Message):
         if not already_resynced:
             await run_sync()
 
-        await msg.answer("✅ Sync completed (expiry check + credentials resync)")
+        await call.message.answer("✅ Sync completed (expiry check + credentials resync)")
     except Exception as e:
         log.exception("manual sync failed")
-        await msg.answer(f"❌ Sync error: {e}")
+        await call.message.answer(f"❌ Sync error: {e}")
 
 
 @router.message(F.text == "🚀 Деплой")

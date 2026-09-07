@@ -71,6 +71,7 @@ def auto_renewal_menu_kb() -> InlineKeyboardMarkup:
             callback_data="autoren:toggle_full"
         )],
         [InlineKeyboardButton(text="⚙️ Настроить условия", callback_data="autoren:settings")],
+        [InlineKeyboardButton(text="ℹ️ Как это работает", callback_data="autoren:howitworks")],
         [InlineKeyboardButton(text="🔍 Диагностика лога", callback_data="autoren:diag")],
     ]
 
@@ -90,6 +91,13 @@ def auto_renewal_menu_kb() -> InlineKeyboardMarkup:
 
 
 def _status_text() -> str:
+    """
+    Short status only — the full explanation of how auto-renewal actually
+    works (trigger conditions, anti-abuse lock, client-visibility rule)
+    used to be appended here EVERY time this screen opened. Moved to
+    _how_it_works_text(), shown on demand via the "ℹ️ Как это работает"
+    button instead — see auto_renewal_menu_kb().
+    """
     enabled = auto_renewal.is_auto_renewal_enabled()
     fully_auto = auto_renewal.is_fully_automatic_enabled()
     log_ok = auto_renewal.log_channel_configured()
@@ -119,6 +127,13 @@ def _status_text() -> str:
         window_line,
         f"• Заявка висит без ответа администратора > {auto_renewal.get_setting('overdue_hours')} ч. "
         f"— в любое время суток",
+    ]
+    return "\n".join(lines)
+
+
+def _how_it_works_text() -> str:
+    return "\n".join([
+        "ℹ️ Как работает автопродление",
         "",
         "Решение принимает не ИИ напрямую — Gemini только распознаёт сумму "
         "с чека (дата платежа не проверяется, важна только сумма), дальше "
@@ -136,8 +151,7 @@ def _status_text() -> str:
         "при ручном одобрении — про автопродление он не узнаёт ничего. "
         "Единственный случай полной тишины для клиента — срабатывание "
         "защиты от накрутки: заявка уходит только администратору.",
-    ]
-    return "\n".join(lines)
+    ])
 
 
 @router.message(F.text == "🤖 Автопродление")
@@ -145,6 +159,22 @@ async def auto_renewal_menu(msg: Message):
     if not await admin_only(msg):
         return
     await msg.answer(_status_text(), reply_markup=auto_renewal_menu_kb())
+
+
+@router.callback_query(F.data == "settings:autoren")
+async def auto_renewal_menu_cb(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+    await call.message.answer(_status_text(), reply_markup=auto_renewal_menu_kb())
+    await call.answer()
+
+
+@router.callback_query(F.data == "autoren:howitworks")
+async def auto_renewal_how_it_works(call: CallbackQuery):
+    if not await admin_only(call):
+        return
+    await call.message.answer(_how_it_works_text())
+    await call.answer()
 
 
 @router.callback_query(F.data == "autoren:toggle")
@@ -219,6 +249,12 @@ def _settings_text() -> str:
     for key, meta in auto_renewal.FIELD_META.items():
         lines.append(f"{meta['label']}: {auto_renewal.get_setting(key)}")
     lines += ["", "Дата платежа на чеке не проверяется — важна только сумма."]
+
+    override = auto_renewal.get_gemini_proxy_url_override()
+    lines += [
+        "",
+        f"🌐 Прокси-адрес (переопределение): {override or '(не задан — используется .env)'}",
+    ]
     return "\n".join(lines)
 
 
@@ -227,6 +263,7 @@ def _settings_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"✏️ {meta['label']}", callback_data=f"autoren:edit:{key}")]
         for key, meta in auto_renewal.FIELD_META.items()
     ]
+    rows.append([InlineKeyboardButton(text="✏️ 🌐 Прокси-адрес", callback_data="autoren:edit:gemini_proxy_url")])
     rows.append([InlineKeyboardButton(text="↩️ Сбросить по умолчанию", callback_data="autoren:reset")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="autoren:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -272,16 +309,25 @@ async def auto_renewal_edit_start(call: CallbackQuery, state: FSMContext):
         return
 
     key = call.data.split(":", 2)[2]
-    meta = auto_renewal.FIELD_META.get(key)
-    if not meta:
-        await call.answer("Неизвестный параметр", show_alert=True)
-        return
+
+    if key == "gemini_proxy_url":
+        meta = {
+            "label": "🌐 Прокси-адрес",
+            "prompt": "Введите URL прокси (должен начинаться с http:// или https://), "
+                      "или отправьте \"-\" чтобы очистить override и вернуться к значению из .env:",
+        }
+    else:
+        meta = auto_renewal.FIELD_META.get(key)
+        if not meta:
+            await call.answer("Неизвестный параметр", show_alert=True)
+            return
 
     await state.set_state(AutoRenewalSettings.waiting_value)
     await state.update_data(field=key)
 
-    current = auto_renewal.get_setting(key)
-    await call.message.answer(f"{meta['label']}\nТекущее значение: {current}\n\n{meta['prompt']}")
+    current = auto_renewal.get_gemini_proxy_url_override() if key == "gemini_proxy_url" else auto_renewal.get_setting(key)
+    current_display = current or "(не задано)"
+    await call.message.answer(f"{meta['label']}\nТекущее значение: {current_display}\n\n{meta['prompt']}")
     await call.answer()
 
 
@@ -300,10 +346,16 @@ async def auto_renewal_edit_apply(msg: Message, state: FSMContext):
         await msg.answer(f"❌ {error}\n\nЗначение не сохранено, попробуйте ещё раз через «⚙️ Настроить условия».", reply_markup=main_menu)
         return
 
-    meta = auto_renewal.FIELD_META.get(key, {})
-    new_value = auto_renewal.get_setting(key)
+    if key == "gemini_proxy_url":
+        new_value = auto_renewal.get_gemini_proxy_url_override() or "(не задано — используется .env)"
+        label = "🌐 Прокси-адрес"
+    else:
+        meta = auto_renewal.FIELD_META.get(key, {})
+        new_value = auto_renewal.get_setting(key)
+        label = meta.get("label", key)
+
     await msg.answer(
-        f"✅ {meta.get('label', key)} сохранено: {new_value}",
+        f"✅ {label} сохранено: {new_value}",
         reply_markup=main_menu
     )
 
@@ -397,8 +449,7 @@ async def auto_renewal_review(call: CallbackQuery):
         await call.answer("Пользователь не найден", show_alert=True)
         return
 
-    pending = user.get("pending_request") or {}
-    decision = pending.get("ai_decision")
+    decision = user.get("last_auto_renewal")
 
     if not decision:
         await call.answer("Эта заявка уже обработана.", show_alert=True)
@@ -406,20 +457,6 @@ async def auto_renewal_review(call: CallbackQuery):
             await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n⚠️ Уже обработано.")
         except Exception:
             pass
-        return
-
-    if action == "confirm":
-        update_user(username, pending_request=None)
-
-        # Client was already notified the moment auto-renewal applied
-        # (see core/auto_renewal.py's _apply_and_request_review) --
-        # "Подтвердить" just closes this review card, nothing more to send.
-        await notify_bg(log_to_channel, f"✅ Автопродление {username} подтверждено администратором (доп. действий не требуется).")
-        try:
-            await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n✅ Подтверждено администратором.")
-        except Exception:
-            pass
-        await call.answer("Подтверждено")
         return
 
     if action == "disable":
@@ -434,12 +471,11 @@ async def auto_renewal_review(call: CallbackQuery):
         # shouldn't cost the user their next legitimate chance either.
         # Split into two calls -- core.db.update_user() redirects
         # expires_at/status onto the leader (and fans out to the group)
-        # whenever they're in the kwargs; bundling pending_request/
-        # auto_renewal_applied into that same call would misroute them
-        # onto the leader for a follower account instead of staying on
-        # `username` itself.
+        # whenever they're in the kwargs; bundling last_auto_renewal into
+        # that same call would misroute it onto the leader for a follower
+        # account instead of staying on `username` itself.
         update_user(username, status="inactive", expires_at=previous_expires_at)
-        update_user(username, pending_request=None, auto_renewal_applied=False, auto_renewal_applied_at=None)
+        update_user(username, last_auto_renewal=None, auto_renewal_applied=False, auto_renewal_applied_at=None)
         await run_sync()
 
         # The client was already told "продлено" -- now they need to be
