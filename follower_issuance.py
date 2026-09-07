@@ -24,6 +24,17 @@ falls back to a non-functional placeholder URL.
 import re
 
 from bot.config import DOMAIN
+
+# How many extra links (sub-accounts beyond the leader's own) a client can
+# get WITHOUT admin approval. Each link = up to 2 devices, so this is
+# "4 free bonus devices" (2 links) on top of the leader's own connection.
+# Counted against the leader's CURRENT total follower count regardless of
+# how those followers were issued (admin-issued via leader_link.py counts
+# the same as self-service via extra_links.py) — this is a cap on how many
+# extra accounts a client has, not on how many they've personally asked
+# for. See handlers/extra_links.py for where the free/approval split
+# actually happens.
+FREE_EXTRA_LINKS = 2
 from bot.formatting import format_full_instructions_message
 from core.dates import utcnow_naive
 from core.db import add_user, get_followers, get_user, link_user
