@@ -2,18 +2,28 @@
 Owns: nothing FSM-wise (count picker is a plain inline keyboard, no state
 needed — the callback_data itself carries the chosen count).
 
-Client-initiated self-service request for additional device links — same
-shape as the receipt-renewal request in handlers/receipt.py (a
-pending_request on the user's own record, an admin review card with
-approve/reject), but WITHOUT any payment/receipt involved: this is purely
-"give me N more of my own sub-accounts", approved at the admin's
-discretion.
+Client-initiated self-service request for additional device links.
+
+Split into two tiers (see follower_issuance.FREE_EXTRA_LINKS):
+  - Up to FREE_EXTRA_LINKS total follower accounts: issued IMMEDIATELY,
+    no admin involved — this mirrors the admin-approval path exactly
+    (issue -> resync -> build card -> deliver) but skips the
+    pending_request/review step entirely.
+  - Anything beyond that cap: same shape as the receipt-renewal request
+    in handlers/receipt.py (a pending_request on the user's own record,
+    an admin review card with approve/reject), but WITHOUT any
+    payment/receipt involved — purely "give me N more of my own
+    sub-accounts", approved at the admin's discretion.
+A single request can straddle both tiers (e.g. 1 free follower already
+issued, client asks for 3 more -> 1 issued free, 2 sent for review).
 
 Reuses the single pending_request slot on the user record — a client can't
 have a renewal receipt AND an extra-links request in flight at the same
 time (see the guard in extra_links_start/extra_links_pick below). That's a
 deliberate simplification, not an oversight: both are rare, short-lived,
-one-at-a-time asks from the same person.
+one-at-a-time asks from the same person. Note this guard only applies to
+the review-tier part of a request — the free tier never touches
+pending_request, so it's never blocked by it.
 """
 import logging
 
@@ -23,7 +33,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from bot.access import admin_only, notify_bg, notify_client, run_sync
 from bot.config import ADMIN_ID, bot
-from follower_issuance import build_connection_card, issue_follower, leader_is_active
+from follower_issuance import FREE_EXTRA_LINKS, build_connection_card, issue_follower, leader_is_active
 from core.dates import utcnow_naive
 from core.db import get_followers, get_user, get_user_by_telegram_id, update_user
 from core.notify import log_to_channel
@@ -32,6 +42,39 @@ router = Router()
 log = logging.getLogger(__name__)
 
 MAX_EXTRA_LINKS = 4
+
+
+def _free_remaining(username: str, followers: list = None) -> int:
+    """How many more follower accounts `username` can get before hitting
+    FREE_EXTRA_LINKS — counts ALL current followers, however they were
+    issued (admin-issued ones count too), since this is a cap on total
+    extra accounts, not on self-service requests specifically."""
+    if followers is None:
+        followers = get_followers(username)
+    return max(0, FREE_EXTRA_LINKS - len(followers))
+
+
+async def _issue_now(username: str, count: int, followers_snapshot: list) -> list:
+    """Issues `count` new follower accounts immediately (no approval),
+    following the exact same issue -> resync -> build-card ordering the
+    admin-approval path uses (see follower_issuance.py's docstring for
+    why that order matters). Returns the list of (username, card) pairs
+    actually created — may be shorter than `count` if issue_follower()
+    ever returns None (shouldn't happen for an existing leader)."""
+    was_active = leader_is_active(get_user(username))
+
+    created_usernames = []
+    for _ in range(count):
+        new_username = issue_follower(username, existing_followers=followers_snapshot)
+        if not new_username:
+            break
+        created_usernames.append(new_username)
+        followers_snapshot = followers_snapshot + [{"username": new_username}]
+
+    if was_active and created_usernames:
+        await run_sync()
+
+    return [(u, build_connection_card(u)) for u in created_usernames]
 
 
 @router.callback_query(F.data == "extralinks:start")
@@ -53,8 +96,20 @@ async def extra_links_start(call: CallbackQuery):
         for n in range(1, MAX_EXTRA_LINKS + 1)
     ]])
 
+    free_left = _free_remaining(user["username"])
+    if free_left:
+        free_note = (
+            f"🆓 Бесплатно и сразу — доступно ещё {free_left} "
+            f"{'ссылка' if free_left == 1 else 'ссылки'} "
+            f"(до {free_left * 2} устройств).\n"
+            "Сверх этого — по согласованию с администратором."
+        )
+    else:
+        free_note = "ℹ️ Бесплатный лимит уже использован — новые ссылки потребуют согласования с администратором."
+
     await call.message.answer(
         "ℹ️ Одна ссылка подключает до 2 устройств одновременно.\n\n"
+        f"{free_note}\n\n"
         "Сколько дополнительных ссылок нужно?",
         reply_markup=kb
     )
@@ -68,29 +123,59 @@ async def extra_links_pick(call: CallbackQuery):
         await call.answer("Не удалось определить ваш аккаунт.", show_alert=True)
         return
 
-    if user.get("pending_request"):
-        await call.answer("У вас уже есть необработанный запрос.", show_alert=True)
-        return
-
     count = int(call.data.split(":", 2)[2])
     username = user["username"]
 
-    update_user(username, pending_request={
-        "type": "extra_links",
-        "count": count,
-        "requested_at": utcnow_naive().isoformat(),
-    })
+    followers = get_followers(username)
+    free_count = min(count, _free_remaining(username, followers))
+    review_count = count - free_count
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"✅ Выдать {count}", callback_data=f"exlreview:{username}:approve"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"exlreview:{username}:reject"),
-    ]])
+    # A pending_request is only ever needed for the review-tier part, so
+    # the "one request in flight" guard only applies when this pick
+    # actually needs review — a request that's entirely within the free
+    # tier is never blocked by a stale pending_request.
+    if review_count and user.get("pending_request"):
+        await call.answer("У вас уже есть необработанный запрос.", show_alert=True)
+        return
 
-    caption = f"🔌 Запрос доп. ссылок от {username}: {count} шт. (без оплаты)"
-    await bot.send_message(ADMIN_ID, caption, reply_markup=kb)
-    await notify_bg(log_to_channel, caption)
+    reply_lines = []
 
-    await call.message.answer(f"✅ Запрос на {count} доп. ссылок отправлен администратору.")
+    # --- FREE TIER: issued immediately, no admin involved ---
+    if free_count:
+        created = await _issue_now(username, free_count, followers)
+        for _, card in created:
+            await call.message.answer(card)
+
+        if created:
+            reply_lines.append(f"🆓 Выдано автоматически (бесплатно): {len(created)}.")
+            await notify_bg(
+                log_to_channel,
+                f"🆓 Автовыдача бесплатных доп. ссылок для {username}: {len(created)} шт."
+            )
+
+    # --- REVIEW TIER: sent to the admin, same as before ---
+    if review_count:
+        update_user(username, pending_request={
+            "type": "extra_links",
+            "count": review_count,
+            "requested_at": utcnow_naive().isoformat(),
+        })
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=f"✅ Выдать {review_count}", callback_data=f"exlreview:{username}:approve"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"exlreview:{username}:reject"),
+        ]])
+
+        caption = (
+            f"🔌 Запрос доп. ссылок от {username}: {review_count} шт. "
+            f"сверх бесплатного лимита (без оплаты)"
+        )
+        await bot.send_message(ADMIN_ID, caption, reply_markup=kb)
+        await notify_bg(log_to_channel, caption)
+
+        reply_lines.append(f"📨 Запрос на {review_count} доп. ссылок сверх бесплатного лимита отправлен администратору.")
+
+    await call.message.answer("\n".join(reply_lines) if reply_lines else "Запрос обработан.")
     await call.answer()
 
 
@@ -130,28 +215,9 @@ async def extra_links_review(call: CallbackQuery):
         await call.answer("Отклонено")
         return
 
-    # action == "approve"
-    was_active = leader_is_active(user)
-
-    # STEP 1: create every new sub-account in the DB. Deliberately no card
-    # generation yet — see follower_issuance.py's module docstring for why
-    # generate_link() must not run before the resync below.
-    created_usernames = []
-    followers_snapshot = get_followers(username)
-    for _ in range(count):
-        new_username = issue_follower(username, existing_followers=followers_snapshot)
-        if not new_username:
-            break
-        created_usernames.append(new_username)
-        followers_snapshot = followers_snapshot + [{"username": new_username}]
-
-    # STEP 2: resync so the trusttunnel binary actually knows about the
-    # new usernames -- MUST happen before any generate_link() call below.
-    if was_active and created_usernames:
-        await run_sync()
-
-    # STEP 3: only now is it safe to build the actual connection cards.
-    created = [(u, build_connection_card(u)) for u in created_usernames]
+    # action == "approve" — same issue -> resync -> build-card ordering as
+    # the free tier in extra_links_pick, via the shared _issue_now() helper.
+    created = await _issue_now(username, count, get_followers(username))
 
     try:
         await call.message.edit_text((call.message.text or "") + f"\n\n✅ Выдано {len(created)} из {count}")
