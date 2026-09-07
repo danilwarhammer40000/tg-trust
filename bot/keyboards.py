@@ -19,9 +19,7 @@ main_menu = ReplyKeyboardMarkup(
         [KeyboardButton(text="🔗 Get link")],
         [KeyboardButton(text="📢 Рассылка")],
         [KeyboardButton(text="🗄 База данных")],
-        [KeyboardButton(text="⚙️ Сортировка БД")],
-        [KeyboardButton(text="🤖 Автопродление")],
-        [KeyboardButton(text="🔄 Sync users")],
+        [KeyboardButton(text="⚙️ Настройки")],
         [KeyboardButton(text="🚀 Деплой")]
     ],
     resize_keyboard=True
@@ -38,7 +36,7 @@ client_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="ℹ️ Мой статус")],
         [KeyboardButton(text="🔗 Мои подключения")],
-        [KeyboardButton(text="📖 Инструкция")],
+        [KeyboardButton(text="📖 Инструкции")],
         [KeyboardButton(text="💳 Реквизиты для оплаты")],
         [KeyboardButton(text="✉️ Написать администратору")],
     ],
@@ -62,6 +60,19 @@ def instructions_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📲 Подключение", callback_data="instr:connect")],
         [InlineKeyboardButton(text="🇷🇺 РФ-сайты и ВПН", callback_data="instr:routing")],
+        [InlineKeyboardButton(text="🤖 Как пользоваться ботом", callback_data="instr:bot_usage")],
+    ])
+
+
+def bot_usage_button_kb() -> InlineKeyboardMarkup:
+    """Standalone single-button keyboard attached right after a client
+    gets their platform-specific setup steps (howto:ios/howto:android in
+    client_menu.py) — see core.instructions.render_bot_usage_instructions
+    for the actual guide text. Label must stay exactly "🤖 Как пользоваться
+    ботом" (matches the guide's own title and the instr:bot_usage entry
+    inside "📖 Инструкции")."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 Как пользоваться ботом", callback_data="instr:bot_usage")],
     ])
 
 
