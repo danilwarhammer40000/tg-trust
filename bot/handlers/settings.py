@@ -20,9 +20,12 @@ handlers.
 
 Also owns the "💬 Переписки" chat-history browser (list clients with
 stored messages -> pick one -> see recent history -> optionally delete
-the whole thing) — this one IS implemented directly in this file, since
-it's a new feature with no pre-existing home. Storage/retrieval itself
-lives in core/messages.py; see that module's docstring for the
+the whole thing) — implemented directly in this file since it's a new
+feature with no pre-existing home, though the entry-point BUTTON now
+lives in bot/handlers/broadcast.py's "📢 Обращения" menu instead of here
+(callback_data "settings:chats:0" is unchanged, so nothing else about
+this feature moved — only which menu links to it). Storage/retrieval
+itself lives in core/messages.py; see that module's docstring for the
 "keep forever, delete only on explicit admin action" contract.
 """
 from aiogram import Router, F
@@ -49,7 +52,6 @@ def settings_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🤖 Автопродление", callback_data="settings:autoren")],
         [InlineKeyboardButton(text="🔄 Sync users", callback_data="settings:sync")],
         [InlineKeyboardButton(text="🔍 Проверка привязок", callback_data="bcast_mode:check")],
-        [InlineKeyboardButton(text="💬 Переписки", callback_data="settings:chats:0")],
     ])
 
 

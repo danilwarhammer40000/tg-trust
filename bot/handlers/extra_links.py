@@ -37,6 +37,7 @@ from follower_issuance import FREE_EXTRA_LINKS, build_connection_card, issue_fol
 from core.dates import utcnow_naive
 from core.db import get_followers, get_user, get_user_by_telegram_id, update_user
 from core.notify import log_to_channel
+from core.payment import EXTRA_LINK_SURCHARGE
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -161,15 +162,21 @@ async def extra_links_pick(call: CallbackQuery):
             "requested_at": utcnow_naive().isoformat(),
         })
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text=f"✅ Выдать {review_count}", callback_data=f"exlreview:{username}:approve"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"exlreview:{username}:reject"),
-        ]])
-
+        current_total = len(followers) + free_count  # includes free-tier ones just issued above
         caption = (
-            f"🔌 Запрос доп. ссылок от {username}: {review_count} шт. "
-            f"сверх бесплатного лимита (без оплаты)"
+            f"🔌 Запрос доп. ссылок от {username}\n"
+            f"Сейчас выпущено доп. ссылок: {current_total} (сверх основной)\n"
+            f"Запрашивает ещё: {review_count} шт. сверх бесплатного лимита\n\n"
+            f"«✅ Выдать» — с наценкой +{EXTRA_LINK_SURCHARGE}₽/мес за каждую сверх лимита.\n"
+            f"«💚 Без наценки» — выдать столько же, но без повышения тарифа."
         )
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✅ Выдать {review_count}", callback_data=f"exlreview:{username}:approve")],
+            [InlineKeyboardButton(text="💚 Без наценки", callback_data=f"exlreview:{username}:approve_free")],
+            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"exlreview:{username}:reject")],
+        ])
+
         await bot.send_message(ADMIN_ID, caption, reply_markup=kb)
         await notify_bg(log_to_channel, caption)
 
@@ -215,19 +222,35 @@ async def extra_links_review(call: CallbackQuery):
         await call.answer("Отклонено")
         return
 
-    # action == "approve" — same issue -> resync -> build-card ordering as
-    # the free tier in extra_links_pick, via the shared _issue_now() helper.
+    # action == "approve" or "approve_free" — same issue -> resync ->
+    # build-card ordering as the free tier in extra_links_pick, via the
+    # shared _issue_now() helper. The only difference between the two is
+    # whether these links count toward the monthly-price surcharge (see
+    # core/payment.py's calc_monthly_price) — "approve_free" bumps
+    # surcharge_exempt_links so these specific links never add to the
+    # client's price, "approve" leaves it as-is so they do.
     created = await _issue_now(username, count, get_followers(username))
+    waived = action == "approve_free"
 
+    if waived and created:
+        update_user(username, surcharge_exempt_links=(user.get("surcharge_exempt_links") or 0) + len(created))
+
+    status_note = "✅ Выдано {} из {}{}".format(
+        len(created), count, " (без наценки)" if waived else ""
+    )
     try:
-        await call.message.edit_text((call.message.text or "") + f"\n\n✅ Выдано {len(created)} из {count}")
+        await call.message.edit_text((call.message.text or "") + f"\n\n{status_note}")
     except Exception:
         pass
 
     if user.get("telegram_id") and created:
+        client_note = (
+            f"✅ Администратор выдал вам {len(created)} доп. {'ссылку' if len(created) == 1 else 'ссылки/ссылок'}"
+            + (" без повышения тарифа:" if waived else f" (+{EXTRA_LINK_SURCHARGE}₽/мес за каждую — см. «💳 Реквизиты для оплаты»):")
+        )
         delivered = await notify_client(
             bot, user["telegram_id"],
-            f"✅ Администратор выдал вам {len(created)} доп. {'ссылку' if len(created) == 1 else 'ссылки/ссылок'}:",
+            client_note,
             clear_username=username
         )
         if delivered:
@@ -239,7 +262,8 @@ async def extra_links_review(call: CallbackQuery):
 
     await notify_bg(
         log_to_channel,
-        f"✅ Выдано {len(created)} доп. ссылок для {username} (запрошено {count})."
+        f"✅ Выдано {len(created)} доп. ссылок для {username} (запрошено {count})"
+        + (", без наценки." if waived else ".")
     )
 
     await call.answer("Готово")

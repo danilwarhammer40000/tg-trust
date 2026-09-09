@@ -116,7 +116,7 @@ async def run_binding_check() -> str:
     return report
 
 
-@router.message(F.text == "📢 Рассылка")
+@router.message(F.text == "📢 Обращения")
 async def broadcast_menu(msg: Message):
     if not await admin_only(msg):
         return
@@ -124,8 +124,9 @@ async def broadcast_menu(msg: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Всем", callback_data="bcast_mode:all")],
         [InlineKeyboardButton(text="🎯 Выбрать получателей", callback_data="bcast_mode:select")],
+        [InlineKeyboardButton(text="💬 Переписки", callback_data="settings:chats:0")],
     ])
-    await msg.answer("Кому отправить рассылку?", reply_markup=kb)
+    await msg.answer("📢 Обращения", reply_markup=kb)
 
 
 @router.callback_query(F.data == "bcast_mode:check")

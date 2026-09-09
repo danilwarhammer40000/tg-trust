@@ -24,7 +24,7 @@ from core.instructions import (
     render_bot_usage_instructions,
     render_ios_instructions,
 )
-from core.payment import ACCESS_EXPIRED_MESSAGE, PAYMENT_INFO
+from core.payment import ACCESS_EXPIRED_MESSAGE, PAYMENT_INFO, EXTRA_LINK_SURCHARGE, calc_monthly_price
 
 router = Router()
 
@@ -51,7 +51,22 @@ async def client_status(msg: Message):
 async def client_payment_info(msg: Message):
     if is_admin(msg.from_user.id):
         return
-    await msg.answer(PAYMENT_INFO)
+
+    user = get_user_by_telegram_id(msg.from_user.id)
+    if not user:
+        await msg.answer(PAYMENT_INFO)
+        return
+
+    price, surcharged = calc_monthly_price(user["username"])
+    if surcharged:
+        word = "ссылка" if surcharged == 1 else "ссылки" if surcharged < 5 else "ссылок"
+        note = (
+            f"\n\nℹ️ У вас {surcharged} доп. {word} сверх бесплатного лимита "
+            f"(+{surcharged * EXTRA_LINK_SURCHARGE}₽/мес) — итоговая сумма к оплате: {price}₽/мес."
+        )
+        await msg.answer(PAYMENT_INFO + note)
+    else:
+        await msg.answer(PAYMENT_INFO)
 
 
 # ---------------- MY CONNECTIONS ----------------

@@ -118,8 +118,8 @@ def _status_text() -> str:
     ]
 
     if gemini_client.proxy_configured():
-        proxy_line = "✅ включен" if gemini_client.is_proxy_enabled() else "🔌 выключен (прямое подключение)"
-        lines.append(f"Прокси для Gemini: {proxy_line}")
+        proxy_state = "✅ включен" if gemini_client.is_proxy_enabled() else "🔌 выключен (прямое подключение)"
+        lines.append(f"Прокси для Gemini: {proxy_state} — {gemini_client.proxy_url()}")
 
     lines += [
         "",
@@ -251,9 +251,16 @@ def _settings_text() -> str:
     lines += ["", "Дата платежа на чеке не проверяется — важна только сумма."]
 
     override = auto_renewal.get_gemini_proxy_url_override()
+    effective = gemini_client.proxy_url()
+    if effective:
+        source = "задан вручную здесь" if override else "берётся из .env (GEMINI_PROXY_URL)"
+        proxy_display = f"{effective} ({source})"
+    else:
+        proxy_display = "(не задан ни здесь, ни в .env — Gemini вызывается напрямую)"
+
     lines += [
         "",
-        f"🌐 Прокси-адрес (переопределение): {override or '(не задан — используется .env)'}",
+        f"🌐 Прокси-адрес, который реально используется сейчас: {proxy_display}",
     ]
     return "\n".join(lines)
 
@@ -347,8 +354,9 @@ async def auto_renewal_edit_apply(msg: Message, state: FSMContext):
         return
 
     if key == "gemini_proxy_url":
-        new_value = auto_renewal.get_gemini_proxy_url_override() or "(не задано — используется .env)"
-        label = "🌐 Прокси-адрес"
+        effective = gemini_client.proxy_url()
+        new_value = effective if effective else "(не задано нигде — Gemini вызывается напрямую)"
+        label = "🌐 Прокси-адрес (сейчас реально используется)"
     else:
         meta = auto_renewal.FIELD_META.get(key, {})
         new_value = auto_renewal.get_setting(key)
