@@ -37,6 +37,7 @@ from bot.states import ReceiptConfirm, RenewalApproval
 from core.dates import calc_new_expiry_months, is_expired, utcnow_naive
 from core.db import get_user, get_user_by_telegram_id, update_user
 from core.notify import log_to_channel
+from core.payment import calc_monthly_price
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -82,7 +83,16 @@ async def receipt_yes(call: CallbackQuery, state: FSMContext):
         "type": "renewal",
         "receipt_file_id": file_id,
         "receipt_is_photo": is_photo,
-        "requested_at": utcnow_naive().isoformat()
+        "requested_at": utcnow_naive().isoformat(),
+        # Snapshotted HERE, not recalculated when the receipt is actually
+        # processed (which can happen much later — night-mode window,
+        # queue backlog) — see core/payment.py's calc_monthly_price
+        # docstring and core/auto_renewal.py's evaluate_receipt_extraction.
+        # If the client's extra-link count changes between "sent the
+        # receipt" and "Gemini/admin actually looked at it", the amount
+        # they already paid still gets evaluated against the rate that
+        # was true AT PAYMENT TIME, not whatever it drifted to since.
+        "rate_at_submission": calc_monthly_price(username)[0],
     })
 
     user = get_user(username) or {}
@@ -228,6 +238,11 @@ async def approve_renewal(call: CallbackQuery, state: FSMContext):
     months = int(action) // 30
     was_expired_or_inactive = user.get("status") != "active" or is_expired(user.get("expires_at"))
     new_expires = calc_new_expiry_months(user.get("expires_at"), months)
+    # Snapshot the rate this manual approval is treated as having been
+    # paid at — the client's CURRENT rate, since a human is confirming
+    # money was actually received right now. Baseline for
+    # core/payment.py's calc_rate_gap if their rate changes again later.
+    renewal_rate, _ = calc_monthly_price(username)
 
     # Split into two calls -- see core/auto_renewal.py's
     # _apply_and_request_review for why (core.db.update_user() redirects
@@ -239,6 +254,7 @@ async def approve_renewal(call: CallbackQuery, state: FSMContext):
         pending_request=None,
         notified_days=[],
         post_disable_notified=[],
+        last_renewal_rate=renewal_rate,
         # A real manual approval is exactly the "human checked it" event
         # that resets the auto-renewal anti-abuse lock for next cycle —
         # see core/auto_renewal.py's process pipeline.

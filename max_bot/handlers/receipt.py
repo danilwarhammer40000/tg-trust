@@ -28,6 +28,7 @@ from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 from core.dates import is_expired, utcnow_naive
 from core.db import get_user, get_user_by_max_chat_id, update_user
 from core.notify import notify_admin, send_photo_bytes
+from core.payment import calc_monthly_price
 from max_bot.handlers.start import _extract_chat_id
 
 router = Router()
@@ -118,6 +119,9 @@ async def receipt_yes(event: MessageCallback):
         "type": "renewal",
         "source": "max",
         "requested_at": utcnow_naive().isoformat(),
+        # See bot/handlers/receipt.py's receipt_yes for why this is
+        # snapshotted at submission time rather than recalculated later.
+        "rate_at_submission": calc_monthly_price(username)[0],
     })
 
     user = get_user(username) or {}

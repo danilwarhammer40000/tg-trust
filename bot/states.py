@@ -80,3 +80,17 @@ class DBImport(StatesGroup):
 
 class AutoRenewalSettings(StatesGroup):
     waiting_value = State()
+
+
+class RateTopup(StatesGroup):
+    """
+    Client-side flow for "💰 Доплатить сейчас" — see
+    bot/handlers/client_menu.py (starts here) and bot/handlers/receipt.py
+    (owns the resulting admin review card, "rtopup:" callback prefix).
+    Separate from ReceiptConfirm because the expected amount is a
+    computed top-up figure (core.payment.calc_topup_amount), not a clean
+    multiple of the client's monthly rate — mixing it into the normal
+    receipt pipeline would make it fail evaluate_receipt_extraction's
+    "amount must be a multiple of the rate" check.
+    """
+    waiting_receipt = State()

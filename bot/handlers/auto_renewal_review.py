@@ -483,7 +483,13 @@ async def auto_renewal_review(call: CallbackQuery):
         # that same call would misroute it onto the leader for a follower
         # account instead of staying on `username` itself.
         update_user(username, status="inactive", expires_at=previous_expires_at)
-        update_user(username, last_auto_renewal=None, auto_renewal_applied=False, auto_renewal_applied_at=None)
+        update_user(
+            username,
+            last_auto_renewal=None,
+            auto_renewal_applied=False,
+            auto_renewal_applied_at=None,
+            last_renewal_rate=decision.get("previous_renewal_rate"),
+        )
         await run_sync()
 
         # The client was already told "продлено" -- now they need to be

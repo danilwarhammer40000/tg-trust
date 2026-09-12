@@ -119,3 +119,55 @@ bot/handlers/client_menu.py:
     "💳 Реквизиты для оплаты" считает и показывает итоговую сумму с
     учётом доп. ссылок сверх бесплатного лимита.
 ---
+
+--- v3.0 (последний заход) ---
+bot/handlers/extra_links.py:
+    Кнопка "💬 Открыть чат в Telegram" в карточке заявки на доп. ссылки.
+core/auto_renewal.py:
+    evaluate_receipt_extraction() принимает rate клиента вместо
+    фиксированной min_amount.
+bot/handlers/receipt.py, bot/handlers/feedback.py, max_bot/handlers/receipt.py:
+    Ставка клиента (calc_monthly_price) фиксируется в pending_request в
+    момент подтверждения отправки чека ("rate_at_submission").
+---
+
+--- v3.1 (последний заход) ---
+bot/handlers/extra_links.py:
+    Экран выбора доп. ссылок — подробное объяснение + цена прямо на
+    кнопках (адаптируется под остаток бесплатного лимита).
+---
+
+--- v3.2 (последний заход) ---
+core/payment.py:
+    +get_last_renewal_rate, +calc_rate_gap, +calc_recalculated_expiry,
+    +calc_topup_amount.
+core/auto_renewal.py, bot/handlers/receipt.py:
+    last_renewal_rate трекается при каждом реальном продлении (авто и
+    ручном), откатывается при "🚫 Отключить".
+bot/handlers/auto_renewal_review.py:
+    Откат ("🚫 Отключить") восстанавливает last_renewal_rate.
+bot/handlers/client_menu.py:
+    Кнопки "🔄 Пересчитать срок" / "💰 Доплатить сейчас" на экране
+    "💳 Реквизиты для оплаты", показываются только если есть разрыв
+    ставки. Доплата — отдельная заявка админу (rtopup:).
+bot/handlers/extra_links.py:
+    Явная формулировка "со следующего продления" в уведомлении клиенту.
+bot/states.py:
+    +RateTopup.waiting_receipt.
+---
+
+--- v3.3 (последний заход) ---
+bot/handlers/client_menu.py:
+    Кнопки "Доплатить"/"Пересчитать" показываются по отдельности, в
+    зависимости от остатка оплаченного срока (< месяца / >= месяца).
+bot/handlers/extra_links.py:
+    Полная блокировка выдачи доп. ссылок, пока висит rate_topup.
+core/auto_renewal.py:
+    +try_auto_verify_topup() — автопроверка доплаты через Gemini.
+---
+
+--- v3.4 (последний заход) ---
+bot/handlers/extra_links.py:
+    Кнопки выбора количества подписаны диапазоном устройств (1-2, 3-4,
+    5-6, 7-8), а не числом ссылок.
+---

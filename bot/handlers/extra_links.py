@@ -45,6 +45,34 @@ log = logging.getLogger(__name__)
 MAX_EXTRA_LINKS = 4
 
 
+async def _send_admin_review_card(caption: str, kb_rows: list, tg_id) -> None:
+    """
+    Same "💬 Открыть чат в Telegram" tg://user?id=... deep-link pattern as
+    bot/handlers/list_users.py's _send_user_card() — see that function's
+    docstring for why this specific button sometimes gets rejected by
+    Telegram (BUTTON_USER_INVALID / BUTTON_USER_PRIVACY_RESTRICTED,
+    depending on the target's resolvability/privacy settings) and why the
+    fix is "retry once without that one button" rather than failing the
+    whole card. Duplicated here rather than imported because the two
+    call sites send to different chats via different means (call.message
+    vs bot.send_message(ADMIN_ID, ...)) — not worth threading a chat_id
+    parameter through list_users.py's version for one extra call site.
+    """
+    rows = list(kb_rows)
+    if tg_id:
+        rows = rows + [[InlineKeyboardButton(text="💬 Открыть чат в Telegram", url=f"tg://user?id={tg_id}")]]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await bot.send_message(ADMIN_ID, caption, reply_markup=kb)
+    except TelegramBadRequest as e:
+        if tg_id and "BUTTON_USER_" in str(e):
+            log.info("tg://user deep link rejected for telegram_id=%s (%s), resending without it", tg_id, e)
+            await bot.send_message(ADMIN_ID, caption, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+        else:
+            raise
+
+
 def _free_remaining(username: str, followers: list = None) -> int:
     """How many more follower accounts `username` can get before hitting
     FREE_EXTRA_LINKS — counts ALL current followers, however they were
@@ -78,6 +106,28 @@ async def _issue_now(username: str, count: int, followers_snapshot: list) -> lis
     return [(u, build_connection_card(u)) for u in created_usernames]
 
 
+def _link_count_button_label(n: int, free_left: int) -> str:
+    """
+    Label for one "how many extra links" button — phrased in DEVICES, not
+    links, since that's what the client actually cares about ("1-2",
+    "3-4"... rather than a bare link count they'd have to multiply by 2
+    themselves). callback_data still carries the link count `n` — device
+    range is purely a display transform, nothing downstream changes.
+
+    Always shows the actual price for choosing exactly `n` links: whichever
+    of the `n` links fall inside `free_left` are free, anything beyond
+    that adds EXTRA_LINK_SURCHARGE per link. Adapts automatically to how
+    much of the free tier is already used — if free_left is 0 (free tier
+    already used up), even the "1-2" button shows a price; if free_left
+    covers the whole request, it shows "бесплатно" with no price at all.
+    """
+    device_range = f"{n * 2 - 1}-{n * 2}"
+    paid_units = max(0, n - free_left)
+    if paid_units == 0:
+        return f"{device_range} (бесплатно)"
+    return f"{device_range} (+{paid_units * EXTRA_LINK_SURCHARGE}₽/мес)"
+
+
 @router.callback_query(F.data == "extralinks:start")
 async def extra_links_start(call: CallbackQuery):
     user = get_user_by_telegram_id(call.from_user.id)
@@ -86,32 +136,58 @@ async def extra_links_start(call: CallbackQuery):
         return
 
     if user.get("pending_request"):
-        await call.answer(
-            "У вас уже есть необработанный запрос — дождитесь ответа администратора.",
-            show_alert=True
-        )
+        pending_type = (user.get("pending_request") or {}).get("type")
+        if pending_type == "rate_topup":
+            await call.answer(
+                "У вас есть неоплаченная доплата за уже выданные доп. ссылки — "
+                "оплатите её («💳 Реквизиты для оплаты» → «💰 Доплатить сейчас»), "
+                "прежде чем запрашивать новые.",
+                show_alert=True
+            )
+        else:
+            await call.answer(
+                "У вас уже есть необработанный запрос — дождитесь ответа администратора.",
+                show_alert=True
+            )
         return
 
+    free_left = _free_remaining(user["username"])
+
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"+{n}", callback_data=f"extralinks:req:{n}")
+        InlineKeyboardButton(
+            text=_link_count_button_label(n, free_left),
+            callback_data=f"extralinks:req:{n}"
+        )
         for n in range(1, MAX_EXTRA_LINKS + 1)
     ]])
 
-    free_left = _free_remaining(user["username"])
     if free_left:
         free_note = (
             f"🆓 Бесплатно и сразу — доступно ещё {free_left} "
             f"{'ссылка' if free_left == 1 else 'ссылки'} "
             f"(до {free_left * 2} устройств).\n"
-            "Сверх этого — по согласованию с администратором."
+            f"Сверх этого — {EXTRA_LINK_SURCHARGE}₽/мес за каждую доп. ссылку "
+            "(по согласованию с администратором)."
         )
     else:
-        free_note = "ℹ️ Бесплатный лимит уже использован — новые ссылки потребуют согласования с администратором."
+        free_note = (
+            "ℹ️ Бесплатный лимит уже использован — каждая новая ссылка "
+            f"стоит {EXTRA_LINK_SURCHARGE}₽/мес и потребует согласования с администратором."
+        )
 
     await call.message.answer(
-        "ℹ️ Одна ссылка подключает до 2 устройств одновременно.\n\n"
+        "📱 Подключение доп. устройств\n\n"
+        "Как это работает:\n"
+        "1️⃣ Каждая ссылка — это отдельный QR/конфиг, который можно "
+        "подключить на ДО 2 устройств одновременно (например, телефон + "
+        "ноутбук на одну ссылку).\n"
+        "2️⃣ Выберите ниже, сколько ДОП. ссылок нужно — сверх той, что у "
+        "вас уже есть.\n"
+        "3️⃣ То, что укладывается в бесплатный лимит, выдаётся сразу же "
+        "автоматически. Остальное — заявка администратору на согласование.\n\n"
         f"{free_note}\n\n"
-        "Сколько дополнительных ссылок нужно?",
+        "Сколько ещё устройств хотите подключить? (цена на кнопке — итоговая "
+        "надбавка к месячному платежу за этот выбор)",
         reply_markup=kb
     )
     await call.answer()
@@ -131,11 +207,30 @@ async def extra_links_pick(call: CallbackQuery):
     free_count = min(count, _free_remaining(username, followers))
     review_count = count - free_count
 
+    pending = user.get("pending_request") or {}
+
+    # Rate-topup gate: while the client owes a top-up for a rate increase
+    # that already happened (see bot/handlers/client_menu.py's
+    # "💰 Доплатить сейчас"), NO new extra links get issued at all — not
+    # even the free-tier ones — until they pay it and it clears (manually
+    # or via core.auto_renewal.try_auto_verify_topup). This is a
+    # narrower, more aggressive gate than the general "one request in
+    # flight" rule right below: it blocks BOTH tiers, specifically for
+    # this one pending_request type.
+    if pending.get("type") == "rate_topup":
+        await call.answer(
+            "У вас есть неоплаченная доплата за уже выданные доп. ссылки — "
+            "оплатите её («💳 Реквизиты для оплаты» → «💰 Доплатить сейчас»), "
+            "прежде чем запрашивать новые.",
+            show_alert=True
+        )
+        return
+
     # A pending_request is only ever needed for the review-tier part, so
     # the "one request in flight" guard only applies when this pick
     # actually needs review — a request that's entirely within the free
     # tier is never blocked by a stale pending_request.
-    if review_count and user.get("pending_request"):
+    if review_count and pending:
         await call.answer("У вас уже есть необработанный запрос.", show_alert=True)
         return
 
@@ -171,13 +266,13 @@ async def extra_links_pick(call: CallbackQuery):
             f"«💚 Без наценки» — выдать столько же, но без повышения тарифа."
         )
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
+        kb_rows = [
             [InlineKeyboardButton(text=f"✅ Выдать {review_count}", callback_data=f"exlreview:{username}:approve")],
             [InlineKeyboardButton(text="💚 Без наценки", callback_data=f"exlreview:{username}:approve_free")],
             [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"exlreview:{username}:reject")],
-        ])
+        ]
 
-        await bot.send_message(ADMIN_ID, caption, reply_markup=kb)
+        await _send_admin_review_card(caption, kb_rows, user.get("telegram_id"))
         await notify_bg(log_to_channel, caption)
 
         reply_lines.append(f"📨 Запрос на {review_count} доп. ссылок сверх бесплатного лимита отправлен администратору.")
@@ -246,7 +341,10 @@ async def extra_links_review(call: CallbackQuery):
     if user.get("telegram_id") and created:
         client_note = (
             f"✅ Администратор выдал вам {len(created)} доп. {'ссылку' if len(created) == 1 else 'ссылки/ссылок'}"
-            + (" без повышения тарифа:" if waived else f" (+{EXTRA_LINK_SURCHARGE}₽/мес за каждую — см. «💳 Реквизиты для оплаты»):")
+            + (" без повышения тарифа:" if waived else (
+                f" (+{EXTRA_LINK_SURCHARGE}₽/мес за каждую — сумма к оплате увеличится "
+                f"НАЧИНАЯ СО СЛЕДУЮЩЕГО продления, см. «💳 Реквизиты для оплаты»):"
+            ))
         )
         delivered = await notify_client(
             bot, user["telegram_id"],

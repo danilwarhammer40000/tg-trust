@@ -22,6 +22,7 @@ from core.dates import is_expired, utcnow_naive
 from core.db import get_user, get_user_by_telegram_id, update_user
 from core.messages import add_message
 from core.notify import log_to_channel
+from core.payment import calc_monthly_price
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -99,7 +100,10 @@ async def feedback_media_as_receipt(call: CallbackQuery, state: FSMContext):
         "type": "renewal",
         "receipt_file_id": file_id,
         "receipt_is_photo": is_photo,
-        "requested_at": utcnow_naive().isoformat()
+        "requested_at": utcnow_naive().isoformat(),
+        # See bot/handlers/receipt.py's receipt_yes for why this is
+        # snapshotted at submission time rather than recalculated later.
+        "rate_at_submission": calc_monthly_price(username)[0],
     })
 
     user = get_user(username) or {}

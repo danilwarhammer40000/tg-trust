@@ -404,7 +404,7 @@ def _is_locked(user: dict):
 
 # ---------------- BUSINESS RULES ----------------
 
-def evaluate_receipt_extraction(extraction: dict):
+def evaluate_receipt_extraction(extraction: dict, rate: int = None):
     """
     Pure decision function — never calls Gemini or touches the DB. Given
     what Gemini extracted, returns (approved: bool, months: int, reason: str).
@@ -424,9 +424,26 @@ def evaluate_receipt_extraction(extraction: dict):
     lock below (see process_pending_request_with_ai / auto_renewal_applied)
     is what actually prevents the same receipt being replayed for repeat
     auto-renewals, not the date.
+
+    `rate` is the client's price-per-month, snapshotted at the moment
+    they submitted the receipt (pending_request["rate_at_submission"],
+    set by bot/handlers/receipt.py's receipt_yes,
+    bot/handlers/feedback.py's feedback_media_as_receipt, and
+    max_bot/handlers/receipt.py's receipt_yes — see
+    core/payment.py's calc_monthly_price docstring for why this is
+    snapshotted rather than recalculated here). Deliberately NOT
+    recomputed live from the client's CURRENT link count: a client's
+    extra-link count can change between "sent the receipt" and "actually
+    processed" (queue backlog, night-mode window), and the amount they
+    already paid must be evaluated against the rate that was true when
+    they paid, not whatever it drifted to since. Falls back to the
+    global min_amount setting only for pending_request records that
+    predate this field (rate=None) — genuinely old/in-flight requests at
+    the moment this shipped, not an ongoing fallback path.
     """
     min_amount = get_setting("min_amount")
     min_confidence = get_setting("min_confidence")
+    effective_rate = rate if rate else min_amount
 
     if not isinstance(extraction, dict) or not extraction.get("readable"):
         notes = (extraction or {}).get("notes") if isinstance(extraction, dict) else None
@@ -437,10 +454,10 @@ def evaluate_receipt_extraction(extraction: dict):
         return False, 0, f"Низкая уверенность распознавания ({confidence!r} < {min_confidence})"
 
     amount = extraction.get("amount")
-    if not isinstance(amount, (int, float)) or amount < min_amount or amount % min_amount != 0:
-        return False, 0, f"Сумма не кратна {min_amount}₽ или не распознана: {amount!r}"
+    if not isinstance(amount, (int, float)) or amount < effective_rate or amount % effective_rate != 0:
+        return False, 0, f"Сумма не кратна ставке клиента ({effective_rate}₽) или не распознана: {amount!r}"
 
-    months = int(amount) // min_amount
+    months = int(amount) // effective_rate
     return True, months, "OK"
 
 
@@ -600,13 +617,14 @@ def _process_pending_request_with_ai_inner(username: str, trigger: str) -> bool:
         _fallback_to_manual(username, f"Ошибка при обращении к Gemini: {e}", trigger, file_id, is_photo)
         return False
 
-    approved, months, reason = evaluate_receipt_extraction(extraction)
+    approved, months, reason = evaluate_receipt_extraction(extraction, rate=pending.get("rate_at_submission"))
 
     if not approved:
         _fallback_to_manual(username, reason, trigger, file_id, is_photo, extraction)
         return False
 
-    _apply_and_request_review(username, months, extraction, trigger, file_id, is_photo)
+    effective_rate = pending.get("rate_at_submission") or get_setting("min_amount")
+    _apply_and_request_review(username, months, extraction, trigger, file_id, is_photo, rate=effective_rate)
     return True
 
 
@@ -688,7 +706,7 @@ def _fallback_to_manual(username, reason, trigger, file_id=None, is_photo=True, 
     _log_or_warn(caption, file_id=file_id, is_photo=is_photo)
 
 
-def _apply_and_request_review(username, months, extraction, trigger, file_id=None, is_photo=True):
+def _apply_and_request_review(username, months, extraction, trigger, file_id=None, is_photo=True, rate=None):
     """
     Applies the renewal immediately AND notifies the client immediately —
     the exact same "✅ Ваша подписка продлена..." text a manual approval
@@ -710,6 +728,7 @@ def _apply_and_request_review(username, months, extraction, trigger, file_id=Non
     user = get_user(username)
     previous_expires_at = user.get("expires_at")
     previous_status = user.get("status")
+    previous_renewal_rate = user.get("last_renewal_rate")
     was_expired_or_inactive = previous_status != "active" or is_expired(previous_expires_at)
 
     new_expires_at = calc_new_expiry_months(previous_expires_at, months)
@@ -719,6 +738,7 @@ def _apply_and_request_review(username, months, extraction, trigger, file_id=Non
         "months": months,
         "previous_expires_at": previous_expires_at,
         "previous_status": previous_status,
+        "previous_renewal_rate": previous_renewal_rate,
         "new_expires_at": new_expires_at,
         "extraction": extraction,
         "trigger": trigger,
@@ -740,6 +760,12 @@ def _apply_and_request_review(username, months, extraction, trigger, file_id=Non
         post_disable_notified=[],
         pending_request=None,              # BUG FIX: cleared right away, not on admin review
         last_auto_renewal=last_auto_renewal,
+        # Baseline for core/payment.py's calc_rate_gap if the client's
+        # rate changes again before their next renewal. Falls back to
+        # get_setting("min_amount") when rate wasn't passed (shouldn't
+        # happen via the normal pipeline, but keeps this function safe
+        # to call directly, e.g. from a script or a future caller).
+        last_renewal_rate=rate or get_setting("min_amount"),
         auto_renewal_applied=True,        # anti-abuse lock, see _is_locked()
         auto_renewal_applied_at=applied_at,
     )
@@ -779,3 +805,83 @@ def _apply_and_request_review(username, months, extraction, trigger, file_id=Non
         notify_admin(caption)
 
     _log_or_warn(caption, file_id=file_id, is_photo=is_photo)
+
+
+def try_auto_verify_topup(username: str) -> bool:
+    """
+    Attempts to auto-approve a pending "rate_topup" receipt (see
+    bot/handlers/client_menu.py's rate_topup_receipt, which always sends
+    the manual admin review card FIRST and then calls this — this only
+    sometimes beats the admin to it, it never replaces the manual card).
+    Same shape as the main auto-renewal pipeline: Gemini only reads the
+    amount, this function is what actually decides.
+
+    Deliberately re-checks core.payment.calc_topup_amount() fresh HERE
+    rather than trusting whatever was computed when the client first
+    clicked "💰 Доплатить сейчас" — time may have passed (admin approved
+    more extra links, client's rate shifted again, etc.), so this
+    verifies against the CURRENT state of how much is actually owed, not
+    a stale snapshot.
+
+    Returns True if it applied the top-up (cleared pending_request, set
+    last_renewal_rate, notified the client and admin) — False for
+    anything that should just fall back to the manual "✅ Принять
+    доплату" / "❌ Отклонить" card instead (unreadable image, low
+    confidence, amount short of what's owed, or a suspiciously large
+    amount that's more likely an unrelated receipt attached by mistake).
+    """
+    from core.payment import calc_monthly_price, calc_topup_amount
+    from core.gemini_client import GeminiError, extract_receipt_data
+
+    user = get_user(username)
+    pending = (user or {}).get("pending_request") or {}
+    if pending.get("type") != "rate_topup":
+        return False
+
+    current_expected = calc_topup_amount(username)
+    if current_expected is None:
+        # The gap already closed some other way (e.g. admin manually
+        # fixed the rate in the meantime) — nothing left to verify
+        # against, let the manual card close this out instead of guessing.
+        return False
+
+    file_bytes, mime_type, file_id, is_photo = _fetch_receipt_file(pending)
+    if file_bytes is None:
+        return False
+
+    try:
+        extraction = extract_receipt_data(file_bytes, mime_type)
+    except GeminiError:
+        return False
+
+    if not isinstance(extraction, dict) or not extraction.get("readable"):
+        return False
+
+    confidence = extraction.get("confidence")
+    min_confidence = get_setting("min_confidence")
+    if not isinstance(confidence, (int, float)) or confidence < min_confidence:
+        return False
+
+    amount = extraction.get("amount")
+    # Accept anything that covers the current gap, plus a small allowance
+    # for rounding up (clients often send a round number). Reject
+    # anything short, and anything wildly larger than expected — the
+    # latter is far more likely to be an unrelated receipt sent to the
+    # wrong prompt than a generous overpayment.
+    if not isinstance(amount, (int, float)) or amount < current_expected or amount > current_expected + 20:
+        return False
+
+    new_rate, _ = calc_monthly_price(username)
+    update_user(username, pending_request=None, last_renewal_rate=new_rate)
+
+    notify_user(
+        user,
+        f"✅ Доплата принята автоматически. Дата истечения не изменилась "
+        f"({user.get('expires_at')}), ставка зафиксирована: {new_rate}₽/мес."
+    )
+    notify_admin(
+        f"✅ Доплата ставки для {username} подтверждена автоматически через Gemini "
+        f"(сумма {amount}₽, требовалось ~{current_expected}₽). Дата истечения не менялась."
+    )
+
+    return True
