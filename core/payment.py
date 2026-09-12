@@ -69,6 +69,25 @@ def calc_monthly_price(username: str):
     return price, surcharged
 
 
+def calc_monthly_price_with_additional(username: str, additional_paid_links: int) -> int:
+    """
+    What calc_monthly_price() WOULD return if `additional_paid_links`
+    more surcharged links existed right now — used by
+    bot/handlers/extra_links.py to price a NOT-YET-ISSUED batch of extra
+    devices (the links don't exist yet when the client needs to see the
+    price, so calc_monthly_price() alone would under-count). This IS
+    literally "pay one month at the rate you'd have after this request" —
+    a plain renewal payment, not a prorated top-up. calc_topup_amount()
+    below is for a DIFFERENT situation — reconciling time already paid
+    for in the past — and deliberately isn't used here: a brand-new
+    request happening right now has no "already paid" period to
+    reconcile against, which is exactly what produced the nonsensical
+    tiny top-up amount this function replaces.
+    """
+    price, _ = calc_monthly_price(username)
+    return price + additional_paid_links * EXTRA_LINK_SURCHARGE
+
+
 # Used for the proportional day-math below — matches the same "1 month =
 # 30 days" convention core.dates.add_calendar_months already falls back
 # to for its February edge case, rather than introducing a second

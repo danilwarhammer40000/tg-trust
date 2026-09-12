@@ -67,7 +67,7 @@ from zoneinfo import ZoneInfo
 
 from core.dates import calc_new_expiry_months, is_expired, utcnow_naive
 from core.db import get_user, update_user
-from core.notify import get_file_bytes, log_to_channel, notify_admin, notify_user, send_photo_by_file_id
+from core.notify import get_file_bytes, log_to_channel, notify_admin, notify_user, send_message, send_photo_by_file_id
 from core.paths import AUTO_RENEWAL_SETTINGS_PATH
 from core.service import safe_sync
 
@@ -882,6 +882,115 @@ def try_auto_verify_topup(username: str) -> bool:
     notify_admin(
         f"✅ Доплата ставки для {username} подтверждена автоматически через Gemini "
         f"(сумма {amount}₽, требовалось ~{current_expected}₽). Дата истечения не менялась."
+    )
+
+    return True
+
+
+def _issue_followers_sync(username: str, count: int, followers_snapshot: list) -> list:
+    """
+    Synchronous equivalent of bot/handlers/extra_links.py's _issue_now() —
+    needed here because this module's Gemini-driven auto-check pipeline
+    runs in a background thread (run_in_executor), which can't await
+    aiogram coroutines. Same issue -> resync -> build-card ordering (see
+    follower_issuance.py's module docstring for why that order matters),
+    just using core.service.safe_sync() instead of bot.access.run_sync().
+    """
+    from follower_issuance import build_connection_card, issue_follower, leader_is_active
+
+    was_active = leader_is_active(get_user(username))
+
+    created_usernames = []
+    for _ in range(count):
+        new_username = issue_follower(username, existing_followers=followers_snapshot)
+        if not new_username:
+            break
+        created_usernames.append(new_username)
+        followers_snapshot = followers_snapshot + [{"username": new_username}]
+
+    if was_active and created_usernames:
+        safe_sync()
+
+    return [(u, build_connection_card(u)) for u in created_usernames]
+
+
+def try_auto_verify_extra_links_payment(username: str) -> bool:
+    """
+    Attempts to auto-approve AND issue a pending extra-devices payment
+    (see bot/handlers/extra_links.py — the client is shown the amount
+    owed and payment details, then asked to send a receipt; NO admin
+    card is sent until either this succeeds or fails). Same shape as
+    try_auto_verify_topup above: Gemini only reads the amount, this
+    function is what decides.
+
+    Returns True if it issued the devices (cleared pending_request,
+    delivered the new connection cards, notified the client and admin).
+    False means the caller should send the manual admin review card with
+    the receipt attached instead (unreadable image, low confidence, or
+    amount short of what was asked) — the existing "✅ Выдать" / "💚 Без
+    наценки" / "❌ Отклонить" buttons (bot/handlers/extra_links.py's
+    extra_links_review) handle that path exactly as they did before this
+    payment-upfront flow existed.
+    """
+    from core.db import get_followers
+    from core.gemini_client import GeminiError, extract_receipt_data
+    from core.payment import calc_monthly_price
+
+    user = get_user(username)
+    pending = (user or {}).get("pending_request") or {}
+    if pending.get("type") != "extra_links" or not pending.get("receipt_file_id"):
+        return False
+
+    amount_due = pending.get("amount_due")
+    count = pending.get("count", 1)
+    if not amount_due:
+        return False
+
+    file_bytes, mime_type, file_id, is_photo = _fetch_receipt_file(pending)
+    if file_bytes is None:
+        return False
+
+    try:
+        extraction = extract_receipt_data(file_bytes, mime_type)
+    except GeminiError:
+        return False
+
+    if not isinstance(extraction, dict) or not extraction.get("readable"):
+        return False
+
+    confidence = extraction.get("confidence")
+    min_confidence = get_setting("min_confidence")
+    if not isinstance(confidence, (int, float)) or confidence < min_confidence:
+        return False
+
+    amount = extraction.get("amount")
+    # Accept anything covering what was asked; reject anything short, and
+    # anything more than double (far more likely an unrelated receipt
+    # sent to the wrong prompt than a generous overpayment).
+    if not isinstance(amount, (int, float)) or amount < amount_due or amount > amount_due * 2:
+        return False
+
+    followers = get_followers(username)
+    created = _issue_followers_sync(username, count, followers)
+
+    new_rate, _ = calc_monthly_price(username)
+    new_expires_at = calc_new_expiry_months(user.get("expires_at"), 1)
+    update_user(username, expires_at=new_expires_at, status="active")
+    update_user(username, pending_request=None, last_renewal_rate=new_rate)
+
+    if created and user.get("telegram_id"):
+        notify_user(
+            user,
+            f"✅ Оплата получена — подключено ещё {len(created) * 2} устройств, "
+            f"доступ продлён на 1 месяц по ставке {new_rate}₽/мес:"
+        )
+        for _, card in created:
+            send_message(user["telegram_id"], card)
+
+    notify_admin(
+        f"✅ Доп. устройства для {username} выданы автоматически после подтверждённой "
+        f"Gemini оплаты ({amount}₽, требовалось ~{amount_due}₽): {len(created)} ссылок "
+        f"({len(created) * 2} устройств), продлено на 1 мес по ставке {new_rate}₽/мес."
     )
 
     return True

@@ -76,9 +76,9 @@ async def client_payment_info(msg: Message):
     price, surcharged = calc_monthly_price(username)
 
     if surcharged:
-        word = "ссылка" if surcharged == 1 else "ссылки" if surcharged < 5 else "ссылок"
+        word = "устройство" if surcharged * 2 == 2 else "устройства" if surcharged * 2 < 5 else "устройств"
         note = (
-            f"\n\nℹ️ У вас {surcharged} доп. {word} сверх бесплатного лимита "
+            f"\n\nℹ️ У вас {surcharged * 2} доп. {word} сверх бесплатного лимита "
             f"(+{surcharged * EXTRA_LINK_SURCHARGE}₽/мес). Со следующего продления "
             f"сумма к оплате — {price}₽/мес."
         )
@@ -103,10 +103,10 @@ async def client_payment_info(msg: Message):
             ])
             await msg.answer(
                 f"⚠️ У вас уже оплачено до {expires_at} по ставке {old_rate}₽/мес, "
-                f"но сейчас ваша ставка — {new_rate}₽/мес (доп. ссылки сверх лимита). "
+                f"но сейчас ваша ставка — {new_rate}₽/мес (доп. устройства сверх лимита). "
                 f"Оставшегося оплаченного срока меньше месяца — доплатите разницу "
                 f"(~{topup}₽), дата истечения при этом не изменится.\n\n"
-                "⚠️ Новые доп. ссылки не будут выдаваться, пока эта доплата не закрыта.",
+                "⚠️ Новые доп. устройства не будут выдаваться, пока эта доплата не закрыта.",
                 reply_markup=kb
             )
         else:
@@ -116,7 +116,7 @@ async def client_payment_info(msg: Message):
             ])
             await msg.answer(
                 f"⚠️ У вас уже оплачено до {expires_at} по ставке {old_rate}₽/мес, "
-                f"но сейчас ваша ставка — {new_rate}₽/мес (доп. ссылки сверх лимита).\n\n"
+                f"но сейчас ваша ставка — {new_rate}₽/мес (доп. устройства сверх лимита).\n\n"
                 f"🔄 «Пересчитать моё подключение» — новая дата истечения станет "
                 f"{new_expiry} (уже уплаченные деньги пересчитываются под новую "
                 "ставку, без доплаты).\n\n"
@@ -363,14 +363,14 @@ async def client_my_link(msg: Message):
     free_left = max(0, FREE_EXTRA_LINKS - len(followers))
     free_note = (
         f"\n\n🆓 Дополнительно вы можете бесплатно подключить ещё "
-        f"{free_left * 2} устройства ({free_left} {'ссылка' if free_left == 1 else 'ссылки'}) — "
-        f"автоматически, без подтверждения администратора."
+        f"{free_left * 2} устройства — автоматически, без подтверждения "
+        "администратора."
     ) if free_left else ""
 
     if followers:
         header = f"Ваши подключения: {len(accounts)} всего (основное + {len(followers)} доп.).{free_note}"
     else:
-        header = f"Ваши подключения: 1.\n\nℹ️ Одна ссылка подключает до 2 устройств одновременно.{free_note}"
+        header = f"Ваши подключения: 1.\n\nℹ️ Одно подключение поддерживает до 2 устройств одновременно.{free_note}"
 
     await msg.answer(
         f"{header}\n\nНажмите на нужное, чтобы получить карточку:",

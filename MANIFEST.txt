@@ -171,3 +171,18 @@ bot/handlers/extra_links.py:
     Кнопки выбора количества подписаны диапазоном устройств (1-2, 3-4,
     5-6, 7-8), а не числом ссылок.
 ---
+
+--- v3.5 (последний заход) ---
+bot/handlers/extra_links.py:
+    Переписан целиком — оплата за месяц по новой ставке вместо
+    прорейтинга, автовыдача через Gemini, тексты про устройства,
+    компактные горизонтальные кнопки.
+core/payment.py:
+    +calc_monthly_price_with_additional().
+core/auto_renewal.py:
+    +try_auto_verify_extra_links_payment(), +_issue_followers_sync().
+bot/states.py:
+    +ExtraLinksPayment.waiting_receipt.
+bot/handlers/client_menu.py:
+    Тексты переписаны на "устройства" вместо "ссылки".
+---

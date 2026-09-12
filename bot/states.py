@@ -85,12 +85,26 @@ class AutoRenewalSettings(StatesGroup):
 class RateTopup(StatesGroup):
     """
     Client-side flow for "💰 Доплатить сейчас" — see
-    bot/handlers/client_menu.py (starts here) and bot/handlers/receipt.py
-    (owns the resulting admin review card, "rtopup:" callback prefix).
-    Separate from ReceiptConfirm because the expected amount is a
-    computed top-up figure (core.payment.calc_topup_amount), not a clean
-    multiple of the client's monthly rate — mixing it into the normal
-    receipt pipeline would make it fail evaluate_receipt_extraction's
-    "amount must be a multiple of the rate" check.
+    bot/handlers/client_menu.py (starts here AND owns the resulting admin
+    review card, "rtopup:" callback prefix). Separate from ReceiptConfirm
+    because the expected amount is a computed top-up figure
+    (core.payment.calc_topup_amount), not a clean multiple of the
+    client's monthly rate — mixing it into the normal receipt pipeline
+    would make it fail evaluate_receipt_extraction's "amount must be a
+    multiple of the rate" check.
+    """
+    waiting_receipt = State()
+
+
+class ExtraLinksPayment(StatesGroup):
+    """
+    Client-side flow for paying the surcharge on extra devices beyond
+    the free tier — see bot/handlers/extra_links.py (starts here, owns
+    the resulting admin review card, "exlreview:" callback prefix, same
+    one the older direct-approval path already used). Separate state
+    (rather than reusing RateTopup) because the two mean different
+    things even though the shape is similar: this is "pay to unlock N
+    new devices", RateTopup is "true up money already owed on devices
+    you already have".
     """
     waiting_receipt = State()
