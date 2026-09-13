@@ -186,3 +186,15 @@ bot/states.py:
 bot/handlers/client_menu.py:
     Тексты переписаны на "устройства" вместо "ссылки".
 ---
+
+--- v3.6 (последний заход) ---
+bot/handlers/extra_links.py:
+    Фикс: к оплате идёт только маржинальная сумма (не весь новый месяц).
+    Убрано продление даты. Добавлена ветка "согласие вместо оплаты" для
+    короткого остатка срока (≤4 дня).
+core/auto_renewal.py:
+    try_auto_verify_extra_links_payment — та же правка (маржинальная
+    сумма, без продления даты).
+core/payment.py:
+    +PAYMENT_LINK, +PAYMENT_RECIPIENT, +SHORT_REMAINING_THRESHOLD_DAYS.
+---

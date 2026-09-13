@@ -7,29 +7,51 @@ Split into two tiers (see follower_issuance.FREE_EXTRA_LINKS):
   - Up to FREE_EXTRA_LINKS total follower accounts (2 links = 4 devices,
     on top of the leader's own 2): issued IMMEDIATELY, no payment, no
     admin involved.
-  - Anything beyond that cap: the client is shown the amount owed
-    (count * EXTRA_LINK_SURCHARGE, per month) and payment details, and
-    asked to send a receipt. NO admin card is sent at request time —
-    only once a receipt actually arrives, and even then only if
-    core.auto_renewal.try_auto_verify_extra_links_payment() couldn't
-    already auto-approve it via Gemini. This deliberately replaces an
-    earlier version that sent extra devices on credit (surcharge applied
-    silently, billed at the client's next renewal) — that produced a
-    confusing "pay 4 rubles" prompt for a trial account with almost no
-    paid time left, since the follow-up reconciliation math in
-    core/payment.py's calc_rate_gap is meant for clients who prepaid
-    MONTHS in advance, not hours. Paying upfront for a fixed monthly
-    amount, every time, sidesteps that entirely.
-A single request can straddle both tiers (e.g. 1 free device pair
-already issued, client asks for 3 more -> 1 free, 2 requiring payment).
+  - Anything beyond that cap splits again, by how much paid time the
+    client has left:
+      - MORE than SHORT_REMAINING_THRESHOLD_DAYS days left: the client
+        pays the MARGINAL cost right now (paid_count * EXTRA_LINK_SURCHARGE
+        — just what's being added, NOT a recomputed whole-month total —
+        see the note on that bug below), sends a receipt, Gemini
+        auto-checks it, devices are issued on success. No admin card is
+        sent at request time — only once a receipt arrives, and even
+        then only if auto-verify couldn't already approve it.
+      - SHORT_REMAINING_THRESHOLD_DAYS days or fewer (a trial about to
+        end, functionally): asking for money right now makes no sense —
+        instead the client is shown the new rate and just needs to
+        CONFIRM they accept it; devices are issued immediately on
+        confirmation, no payment collected. The rate increase is billed
+        starting their next real renewal (core.payment.calc_monthly_price
+        already reflects it once the devices exist).
+
+BUG HISTORY: an earlier version charged
+core.payment.calc_monthly_price_with_additional() — the client's WHOLE
+new monthly total — as the amount to pay THIS transaction. That
+double-charged for links the client was already paying for (e.g.
+already at 130₽/mo for 1 paid link, asked to pay 160₽ for one MORE —
+should have been just the 30₽ marginal cost). That function is now only
+used for the informational "итого в месяц получится X₽" line, never as
+the charged amount. A second, unrelated bug from an even earlier version
+prorated the charge by days remaining (core.payment.calc_rate_gap /
+calc_topup_amount) — fine for a client who genuinely prepaid months in
+advance, nonsensical for a brand-new request with no "already paid"
+period to reconcile against (a 4-day trial got asked to pay ~4₽). Ended
+up replaced twice; this version doesn't touch calc_rate_gap at all and
+doesn't extend expires_at — paying the marginal surcharge changes the
+ongoing RATE only, never the date.
+
+A single request can straddle the free tier and one of the paid paths
+(e.g. 1 free device pair already issued, client asks for 3 more -> 1
+free, 2 requiring payment/confirmation).
 
 Reuses the single pending_request slot on the user record — a client
 can't have a renewal receipt AND an extra-devices request in flight at
 the same time (see the guards in extra_links_start/extra_links_pick
 below). That's a deliberate simplification, not an oversight: both are
 rare, short-lived, one-at-a-time asks from the same person. Note this
-guard only applies to the paid tier — a request entirely within the free
-tier is never blocked by a stale pending_request.
+guard only applies to the paid/payment-flow tier — a request entirely
+within the free tier, or resolved via the trial-consent path, is never
+blocked by a stale pending_request.
 """
 import logging
 
@@ -44,10 +66,17 @@ from bot.keyboards import client_menu
 from bot.states import ExtraLinksPayment
 from follower_issuance import FREE_EXTRA_LINKS, build_connection_card, issue_follower, leader_is_active
 from core.auto_renewal import try_auto_verify_extra_links_payment
-from core.dates import calc_new_expiry_months, utcnow_naive
+from core.dates import parse_expiry, utcnow_naive
 from core.db import get_followers, get_user, get_user_by_telegram_id, update_user
 from core.notify import log_to_channel
-from core.payment import EXTRA_LINK_SURCHARGE, PAYMENT_INFO, calc_monthly_price, calc_monthly_price_with_additional
+from core.payment import (
+    EXTRA_LINK_SURCHARGE,
+    PAYMENT_LINK,
+    PAYMENT_RECIPIENT,
+    SHORT_REMAINING_THRESHOLD_DAYS,
+    calc_monthly_price,
+    calc_monthly_price_with_additional,
+)
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -100,6 +129,21 @@ def _free_remaining(username: str, followers: list = None) -> int:
     if followers is None:
         followers = get_followers(username)
     return max(0, FREE_EXTRA_LINKS - len(followers))
+
+
+def _remaining_days(user: dict):
+    """None if there's no valid expiry to compute from (treated as
+    "not short" — only a genuinely short, valid remaining period routes
+    to the trial-consent path; missing/unparseable data falls back to
+    the normal payment flow rather than silently giving away free
+    devices)."""
+    expires_at = user.get("expires_at")
+    if not expires_at:
+        return None
+    dt = parse_expiry(expires_at)
+    if not dt:
+        return None
+    return (dt.date() - utcnow_naive().date()).days
 
 
 async def _issue_now(username: str, count: int, followers_snapshot: list) -> list:
@@ -172,20 +216,22 @@ async def extra_links_start(call: CallbackQuery):
         for n in range(1, MAX_EXTRA_LINKS + 1)
     ]])
 
+    parts = [
+        "📱 Подключить ещё устройства",
+        "",
+        "Выберите, сколько устройств хотите подключить дополнительно — вам "
+        "будут выданы ссылки для подключения.",
+        "",
+        "На каждую ссылку подключаются два устройства.",
+    ]
     if free_left:
-        free_note = f"🆓 Бесплатно доступно ещё {free_left * 2} устройства (сразу, автоматически)."
-    else:
-        free_note = "Бесплатный лимит уже использован."
+        parts.append(f"\n🆓 Бесплатно доступно ещё {free_left * 2} устройства (сразу, автоматически).")
+    parts += [
+        f"\n— {EXTRA_LINK_SURCHARGE}₽/мес за два устройства (1 доп. ссылка) сверх бесплатного лимита.",
+        "\nСколько ещё устройств хотите подключить?",
+    ]
 
-    await call.message.answer(
-        "📱 Подключить ещё устройства\n\n"
-        "Одна ссылка = до 2 устройств одновременно. Сверх бесплатного "
-        f"лимита — {EXTRA_LINK_SURCHARGE}₽/мес за каждую доп. ссылку (оплата "
-        "по чеку, дальше выдаётся автоматически).\n\n"
-        f"{free_note}\n\n"
-        "Сколько всего устройств хотите иметь?",
-        reply_markup=kb
-    )
+    await call.message.answer("\n".join(parts), reply_markup=kb)
     await call.answer()
 
 
@@ -240,33 +286,99 @@ async def extra_links_pick(call: CallbackQuery, state: FSMContext):
                 log_to_channel,
                 f"🆓 Автовыдача бесплатных доп. устройств для {username}: {len(created)} ссылок."
             )
+        followers = followers + [{"username": u} for u, _ in created]
 
-    # --- PAID TIER: pay a month upfront at the new rate, receipt
-    # auto-checked, then issued (and the month applied to expires_at) ---
-    if paid_count:
-        amount_due = calc_monthly_price_with_additional(username, paid_count)
+    if not paid_count:
+        if reply_lines:
+            await call.message.answer("\n".join(reply_lines))
+        await call.answer()
+        return
 
-        update_user(username, pending_request={
-            "type": "extra_links",
-            "count": paid_count,
-            "amount_due": amount_due,
-            "requested_at": utcnow_naive().isoformat(),
-        })
-        await state.set_state(ExtraLinksPayment.waiting_receipt)
-        await state.update_data(epay_username=username)
+    amount_due = paid_count * EXTRA_LINK_SURCHARGE
+    new_total = calc_monthly_price_with_additional(username, paid_count)
+    total_devices = (len(followers) + 1 + paid_count) * 2  # +1 for the leader's own account
 
+    remaining_days = _remaining_days(user)
+
+    # --- SHORT REMAINING TIME (trial, basically): no payment collected
+    # upfront — asking a 4-day trial to pay right now produced a
+    # nonsensical result in an earlier version (see module docstring).
+    # Just confirm the new rate and issue immediately. ---
+    if remaining_days is not None and remaining_days <= SHORT_REMAINING_THRESHOLD_DAYS:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Согласен", callback_data=f"extralinks:trialok:{paid_count}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="extralinks:trialcancel")],
+        ])
         await call.message.answer(
-            f"💰 Ещё {paid_count * 2} устройства — это {amount_due}₽ за месяц по "
-            "вашей новой ставке (с учётом этих устройств).\n\n"
-            "Оплатите по реквизитам ниже и пришлите чек следующим сообщением — "
-            "устройства будут подключены автоматически после проверки, доступ "
-            "продлится на месяц по этой ставке:\n\n"
-            f"{PAYMENT_INFO}"
+            f"⏳ У вас осталось {remaining_days} дн. — для {paid_count * 2} доп. устройств "
+            f"ставка увеличится на {amount_due}₽/мес (итого будет {new_total}₽/мес). "
+            "Устройства подключаются сразу, без оплаты сейчас — новая ставка "
+            "начнёт действовать со следующего продления. Согласны?",
+            reply_markup=kb
         )
-        reply_lines.append("📨 Ожидаю чек на оплату доп. устройств.")
+        if reply_lines:
+            await call.message.answer("\n".join(reply_lines))
+        await call.answer()
+        return
 
+    # --- NORMAL PAYMENT FLOW: pay the marginal cost now, receipt
+    # auto-checked, then issued. Rate only — no date change. ---
+    update_user(username, pending_request={
+        "type": "extra_links",
+        "count": paid_count,
+        "amount_due": amount_due,
+        "requested_at": utcnow_naive().isoformat(),
+    })
+    await state.set_state(ExtraLinksPayment.waiting_receipt)
+    await state.update_data(epay_username=username)
+
+    await call.message.answer(
+        f"💰 Ещё {paid_count * 2} устройства — это {amount_due}₽ к вашей основной "
+        f"подписке (итого в месяц получится {new_total}₽ за {total_devices} устройств).\n\n"
+        f"Переведите по ссылке ниже ещё {amount_due}₽\n\n"
+        "Чек или скрин для проверки отправьте прямо сюда в чат ✅.\n\n"
+        f"{PAYMENT_LINK}\n{PAYMENT_RECIPIENT}"
+    )
     if reply_lines:
         await call.message.answer("\n".join(reply_lines))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("extralinks:trialok:"))
+async def extra_links_trial_confirm(call: CallbackQuery):
+    user = get_user_by_telegram_id(call.from_user.id)
+    if not user:
+        await call.answer("Не удалось определить ваш аккаунт.", show_alert=True)
+        return
+
+    paid_count = int(call.data.split(":", 2)[2])
+    username = user["username"]
+
+    created = await _issue_now(username, paid_count, get_followers(username))
+    for _, card in created:
+        await call.message.answer(card)
+
+    if created:
+        new_rate, _ = calc_monthly_price(username)
+        update_user(username, last_renewal_rate=new_rate)
+        await call.message.answer(
+            f"✅ Подключено. Ваша ставка теперь {new_rate}₽/мес — начнёт списываться "
+            "со следующего продления."
+        )
+        await notify_bg(
+            log_to_channel,
+            f"✅ {username} (короткий остаток срока) согласился на новую ставку "
+            f"{new_rate}₽/мес и получил {len(created)} доп. ссылок автоматически, без оплаты сейчас."
+        )
+    else:
+        await call.message.answer("Не получилось подключить — попробуйте ещё раз или напишите администратору.")
+
+    await call.answer()
+
+
+@router.callback_query(F.data == "extralinks:trialcancel")
+async def extra_links_trial_cancel(call: CallbackQuery):
+    await call.message.answer("Хорошо, ничего не подключаю.")
     await call.answer()
 
 
@@ -304,9 +416,9 @@ async def extra_links_payment_receipt(msg: Message, state: FSMContext):
     amount_due = pending.get("amount_due")
     caption = (
         f"💰 Оплата доп. устройств от {username}\n"
-        f"{count * 2} устройства, ожидается ~{amount_due}₽ (месяц по новой ставке)\n\n"
-        f"«✅ Выдать» — подтвердить оплату, выдать и продлить на месяц по этой ставке.\n"
-        f"«💚 Без наценки» — выдать бесплатно, без оплаты и без продления.\n"
+        f"{count * 2} устройства, ожидается ~{amount_due}₽ (доплата к текущей ставке)\n\n"
+        f"«✅ Выдать» — подтвердить оплату и выдать.\n"
+        f"«💚 Без наценки» — выдать бесплатно, без учёта наценки.\n"
         f"«❌ Отклонить» — не выдавать."
     )
     kb_rows = [
@@ -363,12 +475,13 @@ async def extra_links_review(call: CallbackQuery):
 
     # action == "approve" or "approve_free" — same issue -> resync ->
     # build-card ordering as the free tier in extra_links_pick, via the
-    # shared _issue_now() helper. The difference: "approve" confirms a
-    # real payment for one month at the new rate — issues the devices
-    # AND extends expires_at by a month AND fixes last_renewal_rate to
-    # that new rate (this payment IS a renewal, not just an unlock).
-    # "approve_free" bumps surcharge_exempt_links instead — a plain
-    # grant, no payment, no date change, these links never add to price.
+    # shared _issue_now() helper. The only difference between the two is
+    # whether these links count toward the monthly-price surcharge (see
+    # core/payment.py's calc_monthly_price) — "approve_free" bumps
+    # surcharge_exempt_links so these specific links never add to the
+    # client's price, "approve" leaves it as-is so they do (and confirms
+    # last_renewal_rate at the new total). Neither touches expires_at —
+    # this is a rate change, not a renewal.
     created = await _issue_now(username, count, get_followers(username))
     waived = action == "approve_free"
 
@@ -376,12 +489,10 @@ async def extra_links_review(call: CallbackQuery):
         update_user(username, surcharge_exempt_links=(user.get("surcharge_exempt_links") or 0) + len(created))
     elif created:
         new_rate, _ = calc_monthly_price(username)
-        new_expires_at = calc_new_expiry_months(user.get("expires_at"), 1)
-        update_user(username, expires_at=new_expires_at, status="active")
         update_user(username, last_renewal_rate=new_rate)
 
     status_note = "✅ Выдано {} из {}{}".format(
-        len(created), count, " (без наценки)" if waived else " + продлено на 1 мес"
+        len(created), count, " (без наценки)" if waived else ""
     )
     try:
         await call.message.edit_caption(caption=(call.message.caption or "") + f"\n\n{status_note}")
@@ -392,8 +503,7 @@ async def extra_links_review(call: CallbackQuery):
         client_note = (
             f"✅ Администратор подключил вам ещё {len(created) * 2} устройства"
             + (" без повышения тарифа:" if waived else (
-                f" — оплата получена, доступ продлён на 1 месяц по ставке "
-                f"{calc_monthly_price(username)[0]}₽/мес:"
+                f" — оплата подтверждена, ставка теперь {calc_monthly_price(username)[0]}₽/мес:"
             ))
         )
         delivered = await notify_client(

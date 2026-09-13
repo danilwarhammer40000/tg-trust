@@ -11,11 +11,20 @@ BASE_PRICE_PER_MONTH = 100
 # увеличивают цену (см. calc_monthly_price ниже).
 EXTRA_LINK_SURCHARGE = 30
 
+# How few days of paid access remaining counts as "basically a trial" for
+# bot/handlers/extra_links.py's purposes — see that module's docstring
+# for why a short-remaining client gets a different (payment-free,
+# consent-based) path instead of the normal pay-and-send-a-receipt one.
+SHORT_REMAINING_THRESHOLD_DAYS = 4
+
+PAYMENT_LINK = "https://finance.ozon.ru/apps/sbp/ozonbankpay/019deec7-3a90-7887-aed0-13b23f04ee5b"
+PAYMENT_RECIPIENT = "Даниил П."
+
 PAYMENT_INFO = (
     f"💳 Для продления переведите клубный донат из расчета {BASE_PRICE_PER_MONTH}руб/мес "
     "(без комиссии и из любого банка):\n"
-    "https://finance.ozon.ru/apps/sbp/ozonbankpay/019deec7-3a90-7887-aed0-13b23f04ee5b\n"
-    "Даниил П.\n\n"
+    f"{PAYMENT_LINK}\n"
+    f"{PAYMENT_RECIPIENT}\n\n"
     "Чек или скрин для проверки отправьте прямо сюда в чат ✅.\n"
 )
 
@@ -73,16 +82,15 @@ def calc_monthly_price_with_additional(username: str, additional_paid_links: int
     """
     What calc_monthly_price() WOULD return if `additional_paid_links`
     more surcharged links existed right now — used by
-    bot/handlers/extra_links.py to price a NOT-YET-ISSUED batch of extra
-    devices (the links don't exist yet when the client needs to see the
-    price, so calc_monthly_price() alone would under-count). This IS
-    literally "pay one month at the rate you'd have after this request" —
-    a plain renewal payment, not a prorated top-up. calc_topup_amount()
-    below is for a DIFFERENT situation — reconciling time already paid
-    for in the past — and deliberately isn't used here: a brand-new
-    request happening right now has no "already paid" period to
-    reconcile against, which is exactly what produced the nonsensical
-    tiny top-up amount this function replaces.
+    bot/handlers/extra_links.py PURELY FOR DISPLAY ("итого в месяц
+    получится X₽"), so the client can see their new steady-state rate
+    before agreeing to add devices. NOT the amount actually charged for
+    THIS transaction — that's just `additional_paid_links *
+    EXTRA_LINK_SURCHARGE` (the marginal cost of what's being added right
+    now), computed directly where it's needed rather than through this
+    function. Charging the full recomputed total here was an earlier,
+    wrong version of this feature — it double-charged for links the
+    client was already paying for.
     """
     price, _ = calc_monthly_price(username)
     return price + additional_paid_links * EXTRA_LINK_SURCHARGE

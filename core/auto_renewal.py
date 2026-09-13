@@ -964,25 +964,32 @@ def try_auto_verify_extra_links_payment(username: str) -> bool:
         return False
 
     amount = extraction.get("amount")
-    # Accept anything covering what was asked; reject anything short, and
-    # anything more than double (far more likely an unrelated receipt
-    # sent to the wrong prompt than a generous overpayment).
+    # Accept anything covering what was asked (the MARGINAL cost of the
+    # new devices, not a recomputed whole-month total — see
+    # bot/handlers/extra_links.py's module docstring for why); reject
+    # anything short, and anything more than double the marginal amount
+    # (far more likely an unrelated receipt sent to the wrong prompt than
+    # a generous overpayment for a couple of extra links).
     if not isinstance(amount, (int, float)) or amount < amount_due or amount > amount_due * 2:
         return False
 
     followers = get_followers(username)
     created = _issue_followers_sync(username, count, followers)
 
+    # Rate only — no date change. Paying the marginal surcharge changes
+    # the ongoing monthly rate; it isn't a renewal, so expires_at is
+    # untouched (see module docstring for the earlier, wrong version that
+    # extended by a month here).
+    update_user(username, pending_request=None)
     new_rate, _ = calc_monthly_price(username)
-    new_expires_at = calc_new_expiry_months(user.get("expires_at"), 1)
-    update_user(username, expires_at=new_expires_at, status="active")
-    update_user(username, pending_request=None, last_renewal_rate=new_rate)
+    if created:
+        update_user(username, last_renewal_rate=new_rate)
 
     if created and user.get("telegram_id"):
         notify_user(
             user,
-            f"✅ Оплата получена — подключено ещё {len(created) * 2} устройств, "
-            f"доступ продлён на 1 месяц по ставке {new_rate}₽/мес:"
+            f"✅ Оплата получена — подключено ещё {len(created) * 2} устройств. "
+            f"Ставка теперь {new_rate}₽/мес (спишется со следующего продления):"
         )
         for _, card in created:
             send_message(user["telegram_id"], card)
@@ -990,7 +997,7 @@ def try_auto_verify_extra_links_payment(username: str) -> bool:
     notify_admin(
         f"✅ Доп. устройства для {username} выданы автоматически после подтверждённой "
         f"Gemini оплаты ({amount}₽, требовалось ~{amount_due}₽): {len(created)} ссылок "
-        f"({len(created) * 2} устройств), продлено на 1 мес по ставке {new_rate}₽/мес."
+        f"({len(created) * 2} устройств), ставка теперь {new_rate}₽/мес."
     )
 
     return True
