@@ -171,11 +171,14 @@ async def _issue_now(username: str, count: int, followers_snapshot: list) -> lis
 
 def _device_button_label(n: int, free_left: int) -> str:
     """
-    Short button label in DEVICES (each link = 2 devices), kept as
-    compact as possible so 4 buttons fit in one horizontal row without
-    Telegram wrapping them — just the device range, plus a short "+N₽"
-    when part of this choice needs payment. No "/мес" suffix on the
-    button itself (that's spelled out in the message text instead).
+    Short button label in DEVICES (each link = 2 devices) — how many
+    NEW devices this specific choice adds, kept as compact as possible
+    so 4 buttons fit in one horizontal row without Telegram wrapping
+    them. Always relative ("1-2" = 1 new link, "3-4" = 2 new links,
+    etc.), regardless of how many devices the client already has — the
+    client's EXISTING total is shown separately as its own line in the
+    message text (see extra_links_start), so the buttons and the
+    context don't have to be conflated into one number.
     """
     device_range = f"{n * 2 - 1}-{n * 2}"
     paid_units = max(0, n - free_left)
@@ -206,7 +209,8 @@ async def extra_links_start(call: CallbackQuery):
         await call.answer(msg, show_alert=True)
         return
 
-    free_left = _free_remaining(user["username"])
+    followers = get_followers(user["username"])
+    free_left = _free_remaining(user["username"], followers)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
@@ -216,8 +220,18 @@ async def extra_links_start(call: CallbackQuery):
         for n in range(1, MAX_EXTRA_LINKS + 1)
     ]])
 
+    total_links = len(followers) + 1
+    total_devices = total_links * 2
+    link_word = "ссылку" if total_links == 1 else "ссылки" if total_links < 5 else "ссылок"
+
     parts = [
         "📱 Подключить ещё устройства",
+        "",
+        # Context first: how many the client already has, so the
+        # buttons below (which are always relative — "how many MORE")
+        # aren't ambiguous with an absolute device count.
+        f"Вы уже получили {total_links} {link_word} на {total_devices} устройств "
+        "(включая основное подключение).",
         "",
         "Выберите, сколько устройств хотите подключить дополнительно — вам "
         "будут выданы ссылки для подключения.",
