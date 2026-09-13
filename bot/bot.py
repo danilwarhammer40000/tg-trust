@@ -18,10 +18,8 @@ import logging
 from dotenv import load_dotenv
 load_dotenv()  # MUST run before importing bot.config (or anything that imports it)
 
-from bot.config import bot
+from bot.config import bot, dp
 from core.logging_setup import setup_logging
-
-from aiogram import Dispatcher
 
 from bot.handlers import (
     add_user,
@@ -46,8 +44,6 @@ from bot import pagination
 
 setup_logging()
 log = logging.getLogger(__name__)
-
-dp = Dispatcher()
 
 for router in (
     pagination.router,

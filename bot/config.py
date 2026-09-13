@@ -12,7 +12,7 @@ top-level os.getenv() calls run, .env is already loaded into os.environ.
 """
 import os
 
-from aiogram import Bot
+from aiogram import Bot, Dispatcher
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -26,3 +26,11 @@ if not DOMAIN:
     raise RuntimeError("TRUSTTUNNEL_DOMAIN missing")
 
 bot = Bot(token=BOT_TOKEN)
+
+# Created here (not in bot/bot.py) so handler modules can import it
+# directly — e.g. bot/handlers/settings.py's "🔓 Закрыть висящие заявки"
+# needs dp.storage to clear a stuck client's FSM state by hand. bot/bot.py
+# still owns registering every router onto it and calling
+# dp.start_polling(bot) — this module only creates the instance, doesn't
+# touch its routing.
+dp = Dispatcher()
