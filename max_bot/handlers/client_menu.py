@@ -27,7 +27,7 @@ from core.instructions import (
     render_android_instructions,
     render_ios_instructions,
 )
-from core.payment import ACCESS_EXPIRED_MESSAGE, PAYMENT_INFO
+from core.payment import render_access_expired_message, render_payment_info, render_payment_info_for_user
 from max_bot.handlers.start import _extract_chat_id
 
 router = Router()
@@ -47,7 +47,7 @@ async def client_status(event: MessageCreated):
     username = user.get("username")
 
     if user.get("status") != "active" or is_expired(user.get("expires_at")):
-        await event.message.answer(f"👤 {username}\n\n{ACCESS_EXPIRED_MESSAGE}")
+        await event.message.answer(f"👤 {username}\n\n{render_access_expired_message(username)}")
         return
 
     expires_at = user.get("expires_at")
@@ -57,7 +57,12 @@ async def client_status(event: MessageCreated):
 
 @router.message_created(F.message.body.text == "/pay")
 async def client_payment_info(event: MessageCreated):
-    await event.message.answer(PAYMENT_INFO)
+    chat_id = _extract_chat_id(event)
+    user = get_user_by_max_chat_id(chat_id)
+    if not user:
+        await event.message.answer(render_payment_info())
+        return
+    await event.message.answer(render_payment_info_for_user(user.get("username")))
 
 
 @router.message_created(F.message.body.text == "/link")
@@ -69,7 +74,7 @@ async def client_my_link(event: MessageCreated):
         return
 
     if user.get("status") != "active" or is_expired(user.get("expires_at")):
-        await event.message.answer(ACCESS_EXPIRED_MESSAGE)
+        await event.message.answer(render_access_expired_message(user.get("username")))
         return
 
     username = user.get("username")

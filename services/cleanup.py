@@ -9,7 +9,7 @@ from core.dates import parse_expiry, utcnow_naive
 from core.db import list_users, update_user
 from core.service import full_resync_and_reload, mark_user_inactive
 from core.notify import notify_user, notify_admin
-from core.payment import PAYMENT_INFO, ACCESS_EXPIRED_MESSAGE
+from core.payment import render_access_expired_message, render_payment_info_for_user
 
 setup_logging()
 log = logging.getLogger(__name__)
@@ -49,13 +49,13 @@ def check_upcoming_expirations(users, now):
                     text = (
                         f"⏳ Сегодня последний день вашего доступа ({exp_dt.date()}).\n"
                         f"Чтобы не потерять доступ — пришлите чек об оплате прямо в этот чат сегодня.\n\n"
-                        f"{PAYMENT_INFO}"
+                        f"{render_payment_info_for_user(username)}"
                     )
                 else:
                     text = (
                         f"⏳ Ваш доступ истекает через {w} дн. ({exp_dt.date()}).\n"
                         f"Чтобы продлить — пришлите чек об оплате прямо в этот чат.\n\n"
-                        f"{PAYMENT_INFO}"
+                        f"{render_payment_info_for_user(username)}"
                     )
 
                 notify_user(u, text)
@@ -133,7 +133,7 @@ def run() -> bool:
             update_user(username, status="inactive")
             update_user(username, notified_days=[], auto_renewal_applied=False, auto_renewal_applied_at=None)
 
-            notify_user(u, ACCESS_EXPIRED_MESSAGE)
+            notify_user(u, render_access_expired_message(username))
             notify_admin(f"⚠️ Пользователь {username} отключён (истёк срок).")
 
             changed = True

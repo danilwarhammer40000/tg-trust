@@ -32,13 +32,14 @@ from core.instructions import (
     render_ios_instructions,
 )
 from core.payment import (
-    ACCESS_EXPIRED_MESSAGE,
-    PAYMENT_INFO,
     EXTRA_LINK_SURCHARGE,
     calc_monthly_price,
     calc_rate_gap,
     calc_recalculated_expiry,
     calc_topup_amount,
+    render_access_expired_message,
+    render_payment_info,
+    render_payment_info_for_user,
 )
 
 router = Router()
@@ -54,7 +55,7 @@ async def client_status(msg: Message):
     username = user.get("username")
 
     if user.get("status") != "active" or is_expired(user.get("expires_at")):
-        await msg.answer(f"👤 {username}\n\n{ACCESS_EXPIRED_MESSAGE}")
+        await msg.answer(f"👤 {username}\n\n{render_access_expired_message(username)}")
         return
 
     expires_at = user.get("expires_at")
@@ -69,22 +70,11 @@ async def client_payment_info(msg: Message):
 
     user = get_user_by_telegram_id(msg.from_user.id)
     if not user:
-        await msg.answer(PAYMENT_INFO)
+        await msg.answer(render_payment_info())
         return
 
     username = user["username"]
-    price, surcharged = calc_monthly_price(username)
-
-    if surcharged:
-        word = "устройство" if surcharged * 2 == 2 else "устройства" if surcharged * 2 < 5 else "устройств"
-        note = (
-            f"\n\nℹ️ У вас {surcharged * 2} доп. {word} сверх бесплатного лимита "
-            f"(+{surcharged * EXTRA_LINK_SURCHARGE}₽/мес). Со следующего продления "
-            f"сумма к оплате — {price}₽/мес."
-        )
-        await msg.answer(PAYMENT_INFO + note)
-    else:
-        await msg.answer(PAYMENT_INFO)
+    await msg.answer(render_payment_info_for_user(username))
 
     gap = calc_rate_gap(username)
     if gap:
@@ -347,7 +337,7 @@ async def client_my_link(msg: Message):
         return
 
     if user.get("status") != "active" or is_expired(user.get("expires_at")):
-        await msg.answer(ACCESS_EXPIRED_MESSAGE)
+        await msg.answer(render_access_expired_message(user.get("username")))
         return
 
     username = user.get("username")

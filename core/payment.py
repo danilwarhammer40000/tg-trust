@@ -20,24 +20,63 @@ SHORT_REMAINING_THRESHOLD_DAYS = 4
 PAYMENT_LINK = "https://finance.ozon.ru/apps/sbp/ozonbankpay/019deec7-3a90-7887-aed0-13b23f04ee5b"
 PAYMENT_RECIPIENT = "Даниил П."
 
-PAYMENT_INFO = (
-    f"💳 Для продления переведите клубный донат из расчета {BASE_PRICE_PER_MONTH}руб/мес "
-    "(без комиссии и из любого банка):\n"
-    f"{PAYMENT_LINK}\n"
-    f"{PAYMENT_RECIPIENT}\n\n"
-    "Чек или скрин для проверки отправьте прямо сюда в чат ✅.\n"
-)
+
+def render_payment_info(rate: int = None) -> str:
+    """
+    BUG FIX: this used to be a static PAYMENT_INFO string that always
+    quoted BASE_PRICE_PER_MONTH ("100руб/мес"), even to a client whose
+    ACTUAL rate (core.payment.calc_monthly_price) was higher because of
+    surcharged extra devices — the screen would say "100руб/мес" and
+    THEN, in a separate paragraph, mention a "+30₽" surcharge, which
+    read as two conflicting numbers instead of one. Now the quoted rate
+    IS whatever the caller passes in (normally calc_monthly_price(username)
+    — callers all have a username in scope; see
+    render_payment_info_for_user below, which is what most callers
+    actually want). Falls back to BASE_PRICE_PER_MONTH if no rate is given.
+    """
+    effective_rate = rate if rate else BASE_PRICE_PER_MONTH
+    return (
+        f"💳 Для продления переведите клубный донат из расчета {effective_rate}руб/мес "
+        "(без комиссии и из любого банка):\n"
+        f"{PAYMENT_LINK}\n"
+        f"{PAYMENT_RECIPIENT}\n\n"
+        "Чек или скрин для проверки отправьте прямо сюда в чат ✅.\n"
+    )
+
+
+def render_payment_info_for_user(username: str) -> str:
+    """
+    Convenience wrapper: looks up `username`'s actual rate and device
+    count, and appends the "ℹ️ Вы подключили N устройств..." explanation
+    line whenever their rate is above BASE_PRICE_PER_MONTH — this is
+    what bot/handlers/client_menu.py's "💳 Реквизиты для оплаты" and every
+    other renewal-related client message now call, instead of building
+    that explanation separately and bolting it on afterwards.
+    """
+    from core.db import get_followers
+
+    rate, surcharged = calc_monthly_price(username)
+    text = render_payment_info(rate)
+
+    if surcharged:
+        total_devices = (len(get_followers(username)) + 1) * 2
+        text += f"\nℹ️ Вы подключили {total_devices} устройств, поэтому стоимость продления {rate}₽/мес."
+
+    return text
+
 
 # Показывается клиенту, когда доступ истёк: и в момент автоотключения
 # (services/cleanup.py), и по кнопке "🔗 Моя ссылка" (bot/bot.py) — если
 # клиент истёк, но ещё не был формально отключён (окно между истечением
 # и следующим запуском cleanup/sync), либо уже отключён. Один текст в
 # одном месте, чтобы формулировки не разъезжались.
-ACCESS_EXPIRED_MESSAGE = (
-    "❌ Ваш доступ истёк и был отключён.\n"
-    "Пришлите чек об оплате в этот чат, чтобы продлить доступ.\n\n"
-    f"{PAYMENT_INFO}"
-)
+def render_access_expired_message(username: str = None) -> str:
+    payment_block = render_payment_info_for_user(username) if username else render_payment_info()
+    return (
+        "❌ Ваш доступ истёк и был отключён.\n"
+        "Пришлите чек об оплате в этот чат, чтобы продлить доступ.\n\n"
+        f"{payment_block}"
+    )
 
 
 def calc_monthly_price(username: str):

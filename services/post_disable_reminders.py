@@ -19,7 +19,7 @@ from core.logging_setup import setup_logging
 from core.dates import parse_expiry, utcnow_naive
 from core.db import list_users, update_user
 from core.notify import notify_user
-from core.payment import PAYMENT_INFO
+from core.payment import render_payment_info_for_user
 
 setup_logging()
 log = logging.getLogger(__name__)
@@ -28,17 +28,17 @@ log = logging.getLogger(__name__)
 REMINDER_DAYS = (1, 3)
 
 
-def _reminder_text(days_since: int) -> str:
+def _reminder_text(days_since: int, username: str) -> str:
     if days_since == 1:
         return (
             "❌ Напоминаем: доступ отключён уже 1 день.\n"
             "Продлите сейчас, чтобы не потерять настройки — пришлите чек об оплате прямо в этот чат.\n\n"
-            f"{PAYMENT_INFO}"
+            f"{render_payment_info_for_user(username)}"
         )
     return (
         f"❌ Доступ отключён уже {days_since} дня.\n"
         "Если не продлить в ближайшее время, аккаунт может быть удалён при следующей чистке базы.\n\n"
-        f"{PAYMENT_INFO}"
+        f"{render_payment_info_for_user(username)}"
     )
 
 
@@ -74,7 +74,7 @@ def run() -> int:
                 d, username, exp_dt.date(), "set" if has_tg else "MISSING",
             )
 
-            notify_user(u, _reminder_text(d))
+            notify_user(u, _reminder_text(d, username))
 
             already_sent.add(d)
             # NOT a synced field (see core.db._SYNCED_FIELDS) -- each linked

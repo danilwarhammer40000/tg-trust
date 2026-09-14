@@ -219,3 +219,14 @@ bot/handlers/settings.py:
     +"🔓 Закрыть висящие заявки" — список зависших pending_request,
     очистка заявки + сброс FSM-состояния клиента point-and-click.
 ---
+
+--- v3.10 (последний заход) ---
+core/payment.py:
+    PAYMENT_INFO/ACCESS_EXPIRED_MESSAGE -> render_payment_info() /
+    render_access_expired_message() / render_payment_info_for_user() —
+    показывают реальную ставку клиента, одна строка вместо противоречия.
+bot/handlers/client_menu.py, max_bot/handlers/client_menu.py,
+services/cleanup.py, services/post_disable_reminders.py:
+    Все клиентские сообщения о реквизитах/истёкшем доступе переведены на
+    новые функции.
+---
