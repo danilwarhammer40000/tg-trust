@@ -444,17 +444,57 @@ async def routing_list_ios(call: CallbackQuery):
 
 @router.callback_query(F.data == "howto:ios")
 async def howto_ios(call: CallbackQuery):
-    user = get_user_by_telegram_id(call.from_user.id)
-    link = extract_qr_link(generate_link(user["username"], DOMAIN)) if user and user.get("username") else None
-
-    await call.message.answer(render_ios_instructions(link), reply_markup=bot_usage_button_kb())
-    await call.answer()
+    await _howto_dispatch(call, "ios")
 
 
 @router.callback_query(F.data == "howto:android")
 async def howto_android(call: CallbackQuery):
-    user = get_user_by_telegram_id(call.from_user.id)
-    link = extract_qr_link(generate_link(user["username"], DOMAIN)) if user and user.get("username") else None
+    await _howto_dispatch(call, "android")
 
-    await call.message.answer(render_android_instructions(link), reply_markup=bot_usage_button_kb())
+
+async def _howto_dispatch(call: CallbackQuery, platform: str):
+    """
+    Used to always embed the link for the CLIENT'S OWN account, silently
+    ignoring the fact that they might have dop. подключения (followers) —
+    the QR/link shown could be for the wrong device slot entirely.  Now,
+    if there's more than one account to choose from, asks which one
+    first ("Выберите, к какой ссылке хотите подключить устройство") — a
+    single-account client (the common case, including every fresh trial
+    signup) skips straight to the instructions exactly as before, no
+    extra tap added for them.
+    """
+    user = get_user_by_telegram_id(call.from_user.id)
+    if not user:
+        await call.answer("Не удалось определить ваш аккаунт.", show_alert=True)
+        return
+
+    followers = get_followers(user["username"])
+
+    if not followers:
+        await _send_howto_instructions(call, platform, user["username"])
+        await call.answer()
+        return
+
+    accounts = [user] + followers
+    rows = [
+        [InlineKeyboardButton(text=f"🔌 {a.get('username')}", callback_data=f"howtolink:{platform}:{a.get('username')}")]
+        for a in accounts
+    ]
+    await call.message.answer(
+        "Выберите, к какой ссылке хотите подключить устройство:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("howtolink:"))
+async def howto_link_pick(call: CallbackQuery):
+    _, platform, username = call.data.split(":", 2)
+    await _send_howto_instructions(call, platform, username)
+    await call.answer()
+
+
+async def _send_howto_instructions(call: CallbackQuery, platform: str, username: str):
+    link = extract_qr_link(generate_link(username, DOMAIN))
+    text = render_ios_instructions(link) if platform == "ios" else render_android_instructions(link)
+    await call.message.answer(text, reply_markup=bot_usage_button_kb())

@@ -230,3 +230,23 @@ services/cleanup.py, services/post_disable_reminders.py:
     Все клиентские сообщения о реквизитах/истёкшем доступе переведены на
     новые функции.
 ---
+
+--- v3.11 (последний заход) ---
+max_bot/main.py:
+    БАГ-ФИКС: include_router -> include_routers (реальный метод).
+max_bot/config.py, max_bot/handlers/start.py, max_bot/handlers/receipt.py:
+    Подтверждены реальной библиотекой (были "unverified" по докам).
+max_bot/handlers/extra_links.py (новый):
+    Доп. устройства для MAX — полный перенос логики Telegram-версии.
+core/auto_renewal.py:
+    _fetch_receipt_file теперь реально скачивает MAX-чеки — Gemini
+    авточек заработал и для MAX.
+bot/handlers/extra_links.py:
+    Уведомления клиенту теперь доходят и до MAX (notify_user fallback).
+---
+
+--- v3.12 (последний заход) ---
+bot/handlers/client_menu.py:
+    "Подключение" (iOS/Android) спрашивает, к какой ссылке подключать,
+    если у клиента больше одного подключения (иначе — как раньше, сразу).
+---

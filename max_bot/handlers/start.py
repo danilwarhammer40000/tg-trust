@@ -29,13 +29,15 @@ log = logging.getLogger(__name__)
 
 def _extract_chat_id(event: MessageCreated) -> int:
     """
-    NOTE (unverified against a real install): best-informed guess based on
-    the documented Message object (message.recipient is a Recipient —
-    user/bot/chat/channel — and MAX's own GET /messages endpoint takes a
-    chat_id query param, so a Recipient should expose one the same way).
-    Verify this against a real event payload and fix in ONE place if wrong
-    — every other file in max_bot/ calls this function rather than reading
-    the field directly.
+    CONFIRMED against the installed maxapi package: Recipient (the type
+    of message.recipient) is a real model with a plain chat_id: int | None
+    field — this matches maxapi's own internal usage too
+    (Message._resolve_send_target() and MessageCreated.get_ids() both
+    read recipient.chat_id the same way). Every other file in max_bot/
+    calls this function rather than reading the field directly, so if
+    MAX's actual behavior around chat_id ever turns out to need special
+    handling (e.g. None for some message types), this is the one place
+    to fix it.
     """
     return event.message.recipient.chat_id
 

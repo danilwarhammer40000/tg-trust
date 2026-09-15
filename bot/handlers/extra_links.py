@@ -68,7 +68,7 @@ from follower_issuance import FREE_EXTRA_LINKS, build_connection_card, issue_fol
 from core.auto_renewal import try_auto_verify_extra_links_payment
 from core.dates import parse_expiry, utcnow_naive
 from core.db import get_followers, get_user, get_user_by_telegram_id, update_user
-from core.notify import log_to_channel
+from core.notify import log_to_channel, notify_user
 from core.payment import (
     EXTRA_LINK_SURCHARGE,
     PAYMENT_LINK,
@@ -483,6 +483,8 @@ async def extra_links_review(call: CallbackQuery):
                 "❌ Оплата/запрос на доп. устройства отклонён администратором.",
                 clear_username=username
             )
+        elif user.get("max_chat_id"):
+            notify_user(user, "❌ Оплата/запрос на доп. устройства отклонён администратором.")
 
         await call.answer("Отклонено")
         return
@@ -531,6 +533,22 @@ async def extra_links_review(call: CallbackQuery):
                     await bot.send_message(user["telegram_id"], card)
                 except (TelegramBadRequest, TelegramForbiddenError):
                     log.warning("could not deliver a new connection card to %s", username)
+    elif user.get("max_chat_id") and created:
+        # MAX has no equivalent of notify_client's "blocked bot, clear
+        # username" cleanup — core.notify.notify_user already picks the
+        # right platform by itself (see its own docstring), so this is
+        # just the plain synchronous send, same as every other MAX-facing
+        # message in this pipeline (try_auto_verify_extra_links_payment
+        # uses the same call for the Gemini-auto-approved path).
+        client_note = (
+            f"✅ Администратор подключил вам ещё {len(created) * 2} устройства"
+            + (" без повышения тарифа:" if waived else (
+                f" — оплата подтверждена, ставка теперь {calc_monthly_price(username)[0]}₽/мес:"
+            ))
+        )
+        notify_user(user, client_note)
+        for _, card in created:
+            notify_user(user, card)
 
     await notify_bg(
         log_to_channel,

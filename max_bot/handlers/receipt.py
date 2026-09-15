@@ -29,6 +29,7 @@ from core.dates import is_expired, utcnow_naive
 from core.db import get_user, get_user_by_max_chat_id, update_user
 from core.notify import notify_admin, send_photo_bytes
 from core.payment import calc_monthly_price
+from max_bot.handlers.extra_links import handle_extra_links_receipt
 from max_bot.handlers.start import _extract_chat_id
 
 router = Router()
@@ -63,12 +64,24 @@ async def any_media_received(event: MessageCreated):
         return
 
     attachments = event.message.body.attachments
-    # NOTE (unverified): assumes the first image/file attachment exposes a
-    # direct download URL at .payload.url — this is the common shape across
-    # similar bot APIs, but hasn't been confirmed against a real MAX
-    # attachment payload. If wrong, this is the one place to fix it.
+    # CONFIRMED against the installed maxapi package: Attachment.payload
+    # is a union (PhotoAttachmentPayload | OtherAttachmentPayload | ...),
+    # and both of the types that matter for a receipt (a photo or a
+    # generic file) expose a plain .url field — this was flagged
+    # "unverified" before an actual install was available to check
+    # against; it's right.
     attachment = attachments[0]
     url = attachment.payload.url
+
+    pending = user.get("pending_request") or {}
+    if pending.get("type") == "extra_links" and not pending.get("receipt_url"):
+        # This client already picked how many extra devices they want
+        # and was shown a price — this attachment IS that receipt, no
+        # generic "is this a receipt?" prompt needed. See
+        # max_bot/handlers/extra_links.py's module docstring for why
+        # there's no FSM tracking this instead.
+        await handle_extra_links_receipt(event, user, pending, url)
+        return
 
     token = _new_token()
     _pending[token] = {"username": user["username"], "url": url}

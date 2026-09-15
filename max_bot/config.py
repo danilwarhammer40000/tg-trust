@@ -15,8 +15,7 @@ MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
 if not MAX_BOT_TOKEN:
     raise RuntimeError("MAX_BOT_TOKEN missing")
 
-# NOTE (unverified against a real install): the maxapi examples call
-# Bot() with no arguments and it still works, suggesting it may read
-# MAX_BOT_TOKEN from the environment itself. Passing it explicitly here
-# is harmless either way and makes the dependency obvious.
+# CONFIRMED against the installed maxapi package: Bot(token=...) is a
+# real, explicit keyword argument (not just "examples happen to work
+# without it") — Bot.__init__ accepts token as its first parameter.
 bot = Bot(token=MAX_BOT_TOKEN)

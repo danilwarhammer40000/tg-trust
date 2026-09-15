@@ -17,25 +17,23 @@ from core.logging_setup import setup_logging
 
 from maxapi import Dispatcher
 
-from max_bot.handlers import client_menu, receipt, start
+from max_bot.handlers import client_menu, extra_links, receipt, start
 
 setup_logging()
 log = logging.getLogger(__name__)
 
 dp = Dispatcher()
 
-# NOTE (unverified): maxapi's Dispatcher is documented with dp.message_created(...)
-# etc. used directly as decorators in the examples, without a separate
-# include_router step shown. If maxapi's Dispatcher doesn't expose
-# include_router() the same way aiogram's does, switch these handler
-# modules to decorate `dp` directly instead of a per-file `router = Router()`
-# — test this against a real install before relying on it.
-for router in (
+# CONFIRMED against a real install (maxapi package, pip): the method is
+# include_routers() (plural, variadic — takes every router in one call),
+# NOT include_router() singular like aiogram's Dispatcher. The loop below
+# was wrong before this was verified.
+dp.include_routers(
     start.router,
     client_menu.router,
+    extra_links.router,
     receipt.router,
-):
-    dp.include_router(router)
+)
 
 
 async def main():

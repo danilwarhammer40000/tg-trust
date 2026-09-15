@@ -62,6 +62,7 @@ from either source).
 import json
 import logging
 import os
+import requests
 from datetime import datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -473,22 +474,41 @@ def _pending_file_ref(pending: dict):
     contents. Contrast with _fetch_receipt_file() below, which downloads
     real bytes for handing to Gemini and is the source of truth for
     whether the file can actually be retrieved at all.
+
+    MAX-origin receipts have no Telegram file_id (there's nothing to
+    attach via send_photo_by_file_id) — the caption alone still goes out,
+    it just won't have the image attached. This is a display-only
+    limitation; _fetch_receipt_file() below can still retrieve the actual
+    bytes for Gemini via the stored URL.
     """
     if pending.get("source") == "max":
-        # Mirrors _fetch_receipt_file()'s handling: MAX-origin receipts
-        # don't keep a re-fetchable file reference today.
         return None, True
     return pending.get("receipt_file_id"), pending.get("receipt_is_photo", True)
 
 
 def _fetch_receipt_file(pending: dict):
-    """Returns (bytes, mime_type, file_id, is_photo) or (None, None, None, None)."""
+    """
+    Returns (bytes, mime_type, file_id, is_photo) or (None, None, None, None).
+
+    MAX-origin receipts (pending["source"] == "max") store a plain
+    download URL instead of a Telegram file_id — see
+    max_bot/handlers/receipt.py, which sets receipt_url the same way its
+    own receipt_yes already downloads a receipt for forwarding to the
+    admin. `file_id` in the returned tuple is None for these (there's no
+    Telegram file to re-send by ID), but the bytes are real and Gemini
+    doesn't care which platform they came from.
+    """
     if pending.get("source") == "max":
-        # MAX-origin receipts don't keep a re-fetchable file reference
-        # today (see max_bot/handlers/receipt.py) — and MAX development is
-        # paused for now anyway. Falls back to manual, same as any other
-        # unreadable case.
-        return None, None, None, None
+        url = pending.get("receipt_url")
+        if not url:
+            return None, None, None, None
+        try:
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+        except requests.RequestException as e:
+            log.error("failed to download MAX receipt attachment: %s", e)
+            return None, None, None, None
+        return r.content, "image/jpeg", None, True
 
     file_id = pending.get("receipt_file_id")
     if not file_id:
