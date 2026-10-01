@@ -8,6 +8,7 @@ None of these own a persistent FSM state of their own (onboarding uses
 inline buttons, not FSM), so there's no state-ownership overlap with any
 other handlers/ file.
 """
+import time
 from datetime import timedelta
 
 from aiogram import Router, F
@@ -185,6 +186,32 @@ async def cancel(msg: Message, state: FSMContext):
 
 
 # ---------------- BIND BY CARD ----------------
+#
+# Brute-force guard: a wrong username/password pair here is cheap to try
+# repeatedly (the only cost is sending a message), so lock a Telegram
+# account out after too many wrong guesses in a row. In-memory only —
+# resets on bot restart — which is an accepted tradeoff for keeping this
+# simple; the goal is to stop quick automated guessing, not to survive a
+# determined attacker across restarts.
+_BIND_FAILED_ATTEMPTS: dict[int, list] = {}
+BIND_MAX_ATTEMPTS = 5
+BIND_LOCKOUT_SECONDS = 15 * 60
+
+
+def _bind_locked_out(user_id: int) -> bool:
+    now = time.monotonic()
+    attempts = [t for t in _BIND_FAILED_ATTEMPTS.get(user_id, []) if now - t < BIND_LOCKOUT_SECONDS]
+    _BIND_FAILED_ATTEMPTS[user_id] = attempts
+    return len(attempts) >= BIND_MAX_ATTEMPTS
+
+
+def _bind_record_failure(user_id: int) -> None:
+    _BIND_FAILED_ATTEMPTS.setdefault(user_id, []).append(time.monotonic())
+
+
+def _bind_clear_failures(user_id: int) -> None:
+    _BIND_FAILED_ATTEMPTS.pop(user_id, None)
+
 
 @router.message(
     StateFilter(None),
@@ -192,6 +219,13 @@ async def cancel(msg: Message, state: FSMContext):
     F.text.func(looks_like_card),
 )
 async def bind_by_card(msg: Message, state: FSMContext):
+    if _bind_locked_out(msg.from_user.id):
+        await msg.answer(
+            "⏳ Слишком много неудачных попыток привязки подряд. "
+            "Подождите немного и попробуйте снова, или обратитесь к администратору."
+        )
+        return
+
     match = CARD_RE.search(msg.text)
     if not match:
         await msg.answer(
@@ -204,9 +238,11 @@ async def bind_by_card(msg: Message, state: FSMContext):
     user = get_user(username)
 
     if not user or user.get("password") != password:
+        _bind_record_failure(msg.from_user.id)
         await msg.answer("Не нашёл такой аккаунт. Проверьте, что скопировали карточку без изменений.")
         return
 
+    _bind_clear_failures(msg.from_user.id)
     update_user(username, telegram_id=msg.from_user.id)
 
     await msg.answer(

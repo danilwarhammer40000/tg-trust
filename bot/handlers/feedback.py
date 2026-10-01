@@ -7,12 +7,14 @@ Two entry points feed into AdminMessage.personal from OUTSIDE this file
 fine, see bot/states.py's docstring on the state-ownership rule: a
 different file may *transition into* a state without owning its handlers.
 """
+import asyncio
 import logging
 
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+import core.auto_renewal as auto_renewal
 from bot import auto_renewal_hook
 from bot.access import admin_only, is_admin, notify_bg
 from bot.config import ADMIN_ID, bot
@@ -23,6 +25,10 @@ from core.db import get_user, get_user_by_telegram_id, update_user
 from core.messages import add_message
 from core.notify import log_to_channel
 from core.payment import calc_monthly_price
+
+# Same immediate ack as bot/handlers/receipt.py's receipt_yes — see
+# AUTO_RENEWAL_ACK_TEXT there for the full rationale.
+AUTO_RENEWAL_ACK_TEXT = "📨 Ваш чек отправлен на проверку. Подписка скоро будет продлена."
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -80,16 +86,12 @@ async def client_feedback_media(msg: Message, state: FSMContext):
 @router.callback_query(F.data == "fbmedia:receipt", Feedback.media_confirm)
 async def feedback_media_as_receipt(call: CallbackQuery, state: FSMContext):
     """Same handling as the general receipt flow (receipt:yes in
-    handlers/receipt.py) — routes into the renewal approval queue with the
+    handlers/receipt.py, including the immediate AUTO_RENEWAL_ACK_TEXT +
+    background-task pattern — see that handler's docstring and
+    bot/auto_renewal_hook.py's run_auto_renewal_in_background for the
+    full rationale) — routes into the renewal approval queue with the
     ➕1мес/➕2мес/✍️/❌ admin buttons, unless AI auto-renewal claims it
-    first (see bot/auto_renewal_hook.py). If auto-renewal applies, the
-    client was already sent the standard "✅ Ваша подписка продлена..."
-    text synchronously inside try_auto_renewal (see
-    core/auto_renewal.py's _apply_and_request_review) -- this handler
-    must NOT send a second acknowledgement on top of that. The
-    "Отправлено администратору" line below only fires for the manual/
-    fallback path, where it's still the client's only signal that
-    anything happened."""
+    first."""
     data = await state.get_data()
     file_id = data.get("media_file_id")
     username = data.get("media_username")
@@ -116,15 +118,19 @@ async def feedback_media_as_receipt(call: CallbackQuery, state: FSMContext):
 
     await notify_bg(log_to_channel, caption, file_id=file_id, is_photo=is_photo)
 
-    result = await auto_renewal_hook.try_auto_renewal(username, file_id, is_photo)
-
-    if result == "approved":
+    if auto_renewal.should_attempt_now():
+        # See bot/handlers/receipt.py's receipt_yes for the full
+        # rationale — ack immediately, let the AI pipeline run in the
+        # background instead of blocking this callback handler on it.
+        await call.message.answer(AUTO_RENEWAL_ACK_TEXT, reply_markup=client_menu)
         await call.answer()
-        return
-
-    if result == "fallback":
-        await call.message.answer("✅ Отправлено администратору на проверку чека.", reply_markup=client_menu)
-        await call.answer()
+        asyncio.create_task(
+            auto_renewal_hook.run_auto_renewal_in_background(
+                username, file_id, is_photo,
+                caption=caption,
+                fallback_text="✅ Отправлено администратору на проверку чека.",
+            )
+        )
         return
 
     kb = renewal_admin_kb(username)

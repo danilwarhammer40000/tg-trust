@@ -27,10 +27,10 @@ Deleting a client's entire history is a separate, explicit admin action
 import json
 import logging
 import os
-from datetime import datetime
 
 from filelock import FileLock
 
+from core.dates import utcnow_naive
 from core.paths import MESSAGES_PATH
 
 log = logging.getLogger(__name__)
@@ -68,7 +68,7 @@ def add_message(username: str, direction: str, text: str = None, file_id: str = 
             "text": text,
             "file_id": file_id,
             "is_photo": is_photo,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utcnow_naive().isoformat(),
         })
         _save(data)
 

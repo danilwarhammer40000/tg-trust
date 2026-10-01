@@ -12,15 +12,19 @@ different states and different confirm-button callback_data. Both hook
 into the AI auto-renewal pipeline (core/auto_renewal.py) the same way —
 see receipt_yes below.
 
-Client-facing behaviour: if auto-renewal actually applies, the client
-gets the standard renewal text immediately (sent from inside
-core/auto_renewal.py, not from here) and nothing else. Otherwise — auto-
-renewal wasn't applicable, or was attempted and fell back to manual — the
-client gets the normal "Отправлено администратору. Ждите подтверждения."
-acknowledgement, same as if auto-renewal didn't exist. See
-bot/auto_renewal_hook.py's try_auto_renewal() docstring for the exact
-three-way outcome this dispatches on.
+Client-facing behaviour: if auto-renewal MIGHT apply right now
+(auto_renewal.should_attempt_now()), the client gets AUTO_RENEWAL_ACK_TEXT
+immediately — the AI pipeline (Gemini model cascade, can take several
+minutes, see core/gemini_client.py) then runs as a background asyncio
+task instead of blocking this handler, and sends its own follow-up once
+it's actually done: the real renewal confirmation (from inside
+core/auto_renewal.py) if approved, or the normal "Отправлено
+администратору" text if it fell back to manual — see
+bot/auto_renewal_hook.py's run_auto_renewal_in_background(). If
+auto-renewal isn't applicable at all right now, this runs the full
+normal manual flow synchronously, same as if auto-renewal didn't exist.
 """
+import asyncio
 import logging
 from datetime import datetime
 
@@ -29,6 +33,7 @@ from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+import core.auto_renewal as auto_renewal
 from bot import auto_renewal_hook
 from bot.access import admin_only, notify_bg, notify_client, run_sync
 from bot.config import ADMIN_ID, bot
@@ -38,6 +43,11 @@ from core.dates import calc_new_expiry_months, is_expired, utcnow_naive
 from core.db import get_user, get_user_by_telegram_id, update_user
 from core.notify import log_to_channel
 from core.payment import calc_monthly_price
+
+# Sent the instant the client confirms a receipt IS a receipt, before the
+# AI pipeline has even started — see receipt_yes below and
+# bot/auto_renewal_hook.py's run_auto_renewal_in_background.
+AUTO_RENEWAL_ACK_TEXT = "📨 Ваш чек отправлен на проверку. Подписка скоро будет продлена."
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -113,23 +123,26 @@ async def receipt_yes(call: CallbackQuery, state: FSMContext):
 
     await state.clear()
 
-    # Three possible outcomes -- see bot/auto_renewal_hook.py's docstring:
-    #   "approved" -> client already notified, admin already has a card. Do nothing more.
-    #   "fallback" -> admin already has a card (from the pipeline itself, possibly
-    #                 the anti-abuse warning). Do NOT send a second one -- just
-    #                 acknowledge the client, who hasn't heard anything yet.
-    #   "skipped"  -> auto-renewal didn't run at all. Full normal manual flow.
-    result = await auto_renewal_hook.try_auto_renewal(username, file_id, is_photo)
-
-    if result == "approved":
+    if auto_renewal.should_attempt_now():
+        # The AI pipeline can take several minutes in the worst case (see
+        # core/gemini_client.py's model cascade) — acknowledge the client
+        # RIGHT NOW instead of leaving this button's "loading" spinner
+        # hanging, and let the pipeline run in the background. It sends
+        # its own follow-up once it's actually done — see
+        # bot/auto_renewal_hook.py's run_auto_renewal_in_background.
+        await call.message.answer(AUTO_RENEWAL_ACK_TEXT)
         await call.answer()
+        asyncio.create_task(
+            auto_renewal_hook.run_auto_renewal_in_background(
+                username, file_id, is_photo,
+                caption=caption,
+                fallback_text="✅ Отправлено администратору. Ждите подтверждения.",
+            )
+        )
         return
 
-    if result == "fallback":
-        await call.message.answer("✅ Отправлено администратору. Ждите подтверждения.")
-        await call.answer()
-        return
-
+    # Auto-renewal isn't applicable at all right now (master toggle off,
+    # outside the trigger window) — full normal manual flow, unchanged.
     kb = renewal_admin_kb(username)
 
     if is_photo:

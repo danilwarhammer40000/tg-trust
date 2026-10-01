@@ -100,8 +100,8 @@ LOG_CHANNEL_ID=$(echo "$LOG_CHANNEL_ID" | tr -d '\r')
 echo ""
 echo "Прокси для Gemini API (опционально, можно поменять позже в боте) —"
 echo "Worker/HTTPS URL (https://...) или SOCKS5 (socks5h://user:pass@host:port)."
-read -r -p "GEMINI_PROXY (Enter чтобы пропустить): " GEMINI_PROXY
-GEMINI_PROXY=$(echo "$GEMINI_PROXY" | tr -d '\r')
+read -r -p "GEMINI_PROXY_URL (Enter чтобы пропустить): " GEMINI_PROXY_URL
+GEMINI_PROXY_URL=$(echo "$GEMINI_PROXY_URL" | tr -d '\r')
 
 # -------------------------
 # ENV
@@ -114,7 +114,7 @@ ADMIN_ID=$ADMIN_ID
 TRUSTTUNNEL_DOMAIN=$DOMAIN
 MAX_BOT_TOKEN=$MAX_BOT_TOKEN
 GEMINI_API_KEY=$GEMINI_API_KEY
-GEMINI_PROXY=$GEMINI_PROXY
+GEMINI_PROXY_URL=$GEMINI_PROXY_URL
 LOG_CHANNEL_ID=$LOG_CHANNEL_ID
 PYTHONPATH=$PROJECT_DIR
 EOF

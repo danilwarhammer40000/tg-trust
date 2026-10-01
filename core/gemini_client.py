@@ -41,6 +41,28 @@ whether the API key itself is valid. The worker is expected to forward
 whatever path+query it receives straight to Google (and may inject its
 own key, in which case our own ?key= is simply redundant/ignored — either
 way works).
+
+MODEL CASCADE: Google's flash-tier models get retired/rate-limited often
+enough that hardcoding one model name isn't reliable (see the
+GEMINI_MODEL comment below for one such retirement already hit in
+practice). GEMINI_MODELS (plural, comma-separated in .env) is an ORDERED
+list, most capable first, that extract_receipt_data() below works through
+on failure: RETRIES_PER_MODEL attempts against one model, RETRY_DELAY_SECONDS
+apart, before moving on to the next, less-loaded/less-advanced model in
+the list and repeating. Only a TRANSIENT failure (network blip, HTTP 429
+rate-limit, HTTP 5xx "model overloaded") triggers this -- a model that's
+outright gone (HTTP 404) is skipped immediately with no retries wasted on
+it, and an auth failure (HTTP 401/403, i.e. a bad API key) aborts the
+whole cascade immediately rather than failing identically against every
+model in the list one by one. Falls back to a single-model list built
+from GEMINI_MODEL when GEMINI_MODELS isn't set, so an existing
+single-model .env keeps working unchanged.
+
+This can legitimately take several minutes in the worst case (every model
+exhausting its retries) -- that's by design here, not a bug. See
+bot/auto_renewal_hook.py and bot/handlers/receipt.py for how the client
+is kept informed (an immediate "we got it, hang tight" acknowledgement)
+while this runs to completion in a background thread.
 """
 import json
 import logging
@@ -60,13 +82,26 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # instead of needing a code change.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
+# Ordered cascade of models to try, most capable first — see the MODEL
+# CASCADE section of the module docstring above. "gemini-3.6-flash,
+# gemini-2.5-flash,gemini-2.0-flash" is the kind of thing to put here;
+# the exact names depend on what's actually available on the account at
+# deploy time, so there's no hardcoded fallback list beyond GEMINI_MODEL
+# itself — an admin who wants the cascade behaviour has to list the
+# models explicitly.
+_GEMINI_MODELS_RAW = os.getenv("GEMINI_MODELS", "").strip()
+GEMINI_MODELS = [m.strip() for m in _GEMINI_MODELS_RAW.split(",") if m.strip()] or [GEMINI_MODEL]
+
+# How many attempts a single model gets before the cascade moves on, and
+# how long to wait between those attempts — see extract_receipt_data().
+RETRIES_PER_MODEL = 3
+RETRY_DELAY_SECONDS = 180  # 3 minutes
+
 # Cloudflare Worker (or any HTTPS reverse-proxy) base URL, e.g.
 # https://your-worker.workers.dev — set in .env as the default/fallback.
 # The EFFECTIVE url is proxy_url() below, which prefers a live override
 # set from the bot's Settings screen over this .env value.
 GEMINI_PROXY_URL = os.getenv("GEMINI_PROXY_URL", "").strip()
-
-DIRECT_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # Keep this in Russian: the receipts themselves are Russian bank transfer
 # screenshots, and error/notes fields written in Russian are what end up
@@ -97,15 +132,38 @@ EXTRACTION_PROMPT = """\
 
 
 class GeminiError(Exception):
+    """Base class for every failure extract_receipt_data() can raise.
+    Callers (core/auto_renewal.py) treat any instance of this the same
+    way: "couldn't read the receipt", fall back to manual review."""
     pass
 
 
-# HTTP statuses worth retrying before giving up and falling back to manual
-# review — all of these are Google's own "this is temporary, try again"
+class _TransientGeminiError(GeminiError):
+    """Worth retrying the SAME model after RETRY_DELAY_SECONDS — a
+    network blip, an HTTP 429 rate-limit, or an HTTP 5xx ("model
+    overloaded", Google's own wording for the most common case)."""
+    pass
+
+
+class _ModelUnavailableError(GeminiError):
+    """This specific model is gone or misconfigured (HTTP 404) — retrying
+    it won't help, so the cascade skips straight to the next model with
+    no attempts wasted."""
+    pass
+
+
+# HTTP statuses worth retrying against the SAME model before falling
+# through to the next one — Google's own "this is temporary, try again"
 # signals (503 UNAVAILABLE / overloaded model is the most common one in
-# practice), as opposed to e.g. 400 (bad request/malformed image) or 403
-# (bad API key), which won't fix themselves on a retry.
+# practice, 429 is a rate limit).
 _TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+
+# A bad/expired API key fails identically against every model in the
+# cascade — no point working through the whole list one by one.
+_AUTH_STATUS_CODES = {401, 403}
+
+# The model name itself doesn't exist (retired, typo'd in .env, ...).
+_MODEL_UNAVAILABLE_STATUS_CODES = {404}
 
 
 def proxy_configured() -> bool:
@@ -150,35 +208,75 @@ def toggle_proxy_enabled() -> bool:
     return toggle_gemini_proxy_enabled()
 
 
-def _resolve_endpoint() -> str:
+def _endpoint_for(model: str) -> str:
     if proxy_configured() and is_proxy_enabled():
-        return f"{proxy_url().rstrip('/')}/v1beta/models/{GEMINI_MODEL}:generateContent"
-    return DIRECT_URL
+        return f"{proxy_url().rstrip('/')}/v1beta/models/{model}:generateContent"
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 
-def extract_receipt_data(file_bytes: bytes, mime_type: str, retries: int = 3, retry_delay: float = 2.0) -> dict:
+def _call_gemini_once(model: str, payload: dict) -> dict:
+    """
+    One raw HTTP call against `model`. Returns the parsed extraction dict
+    on success. Raises:
+      - _TransientGeminiError for a network error or one of
+        _TRANSIENT_STATUS_CODES — worth retrying the SAME model later.
+      - _ModelUnavailableError for HTTP 404 — this model name doesn't
+        exist, skip it entirely.
+      - plain GeminiError for everything else (auth failure, a malformed
+        request, an unparseable response) — not worth retrying at all.
+    """
+    url = _endpoint_for(model)
+
+    try:
+        r = requests.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=60)
+    except requests.RequestException as e:
+        raise _TransientGeminiError(f"network error on {model}: {e}") from e
+
+    if not r.ok:
+        if r.status_code in _AUTH_STATUS_CODES:
+            raise GeminiError(f"HTTP {r.status_code} (auth) on {model}: {r.text[:300]}")
+        if r.status_code in _MODEL_UNAVAILABLE_STATUS_CODES:
+            raise _ModelUnavailableError(f"HTTP {r.status_code} (model unavailable) on {model}: {r.text[:300]}")
+        if r.status_code in _TRANSIENT_STATUS_CODES:
+            raise _TransientGeminiError(f"HTTP {r.status_code} (transient) on {model}: {r.text[:300]}")
+        raise GeminiError(f"HTTP {r.status_code} on {model}: {r.text[:300]}")
+
+    try:
+        data = r.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        extraction = json.loads(text)
+    except (KeyError, IndexError, ValueError, json.JSONDecodeError) as e:
+        raise GeminiError(f"unexpected response shape on {model}: {e}") from e
+
+    if not isinstance(extraction, dict):
+        raise GeminiError(f"response was valid JSON but not an object on {model}")
+
+    return extraction
+
+
+def extract_receipt_data(file_bytes: bytes, mime_type: str) -> dict:
     """
     Returns a dict matching EXTRACTION_PROMPT's schema. Raises GeminiError
-    on any failure (missing API key, network error, malformed response) —
-    callers (core/auto_renewal.py) treat that the same as "couldn't read
-    the receipt" and fall back to the normal manual-approval queue.
+    (see its subclasses above) once every model in GEMINI_MODELS has been
+    exhausted — callers (core/auto_renewal.py) treat that as "couldn't
+    read the receipt" and fall back to the normal manual-approval queue.
 
-    Retries up to `retries` times (with a growing pause) for network
-    errors and for the transient HTTP statuses in _TRANSIENT_STATUS_CODES
-    — chiefly 503 "model overloaded", which Google's own error message
-    explicitly calls temporary. A permanent failure (bad API key, 400 for
-    a malformed request, an unparseable response) is NOT retried — those
-    fail on the first attempt exactly as before. Synchronous
-    time.sleep() is fine here (see module docstring — this always runs
-    via run_in_executor or the standalone script, never on the event
-    loop thread directly), and the retry math is bounded on purpose:
-    worst case is a handful of extra seconds, not a new multi-minute
-    hang, so this doesn't undermine the timeout=60 above.
+    Works through GEMINI_MODELS in order (see the module docstring's
+    MODEL CASCADE section): up to RETRIES_PER_MODEL attempts against one
+    model, RETRY_DELAY_SECONDS apart, but only when the failure is
+    transient (network blip, rate limit, "model overloaded") — a model
+    that doesn't exist at all (HTTP 404) is skipped with zero attempts
+    wasted on it. An auth failure (bad API key) raises immediately and
+    aborts the WHOLE cascade — retrying or trying other models can't fix
+    a bad key.
+
+    Deliberately synchronous, with real time.sleep() calls that can add
+    up to several minutes in the worst case — see the module docstring
+    for why that's fine here (always called via run_in_executor or a
+    standalone script, never on the event loop thread).
     """
     if not GEMINI_API_KEY:
         raise GeminiError("GEMINI_API_KEY missing")
-
-    url = _resolve_endpoint()
 
     payload = {
         "contents": [{
@@ -193,40 +291,41 @@ def extract_receipt_data(file_bytes: bytes, mime_type: str, retries: int = 3, re
         },
     }
 
-    r = None
-    last_network_error = None
+    last_error = None
 
-    for attempt in range(1, retries + 1):
-        try:
-            r = requests.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=60)
-        except requests.RequestException as e:
-            last_network_error = e
-            if attempt < retries:
-                time.sleep(retry_delay * attempt)
-                continue
-            raise GeminiError(f"network error ({'proxy' if url != DIRECT_URL else 'direct'}): {e}") from e
+    for model in GEMINI_MODELS:
+        for attempt in range(1, RETRIES_PER_MODEL + 1):
+            try:
+                return _call_gemini_once(model, payload)
 
-        if r.ok:
-            break
+            except _ModelUnavailableError as e:
+                log.warning("Gemini model %s unavailable, skipping to next model: %s", model, e)
+                last_error = e
+                break  # no retries for a model that doesn't exist — next model now
 
-        if r.status_code in _TRANSIENT_STATUS_CODES and attempt < retries:
-            log.warning(
-                "Gemini transient error (attempt %d/%d): HTTP %d, retrying in %.1fs",
-                attempt, retries, r.status_code, retry_delay * attempt,
-            )
-            time.sleep(retry_delay * attempt)
-            continue
+            except _TransientGeminiError as e:
+                last_error = e
+                is_last_attempt_for_model = attempt == RETRIES_PER_MODEL
 
-        raise GeminiError(f"HTTP {r.status_code}: {r.text[:300]}")
+                if is_last_attempt_for_model:
+                    log.warning(
+                        "Gemini model %s exhausted %d attempt(s), moving to next model: %s",
+                        model, RETRIES_PER_MODEL, e,
+                    )
+                    break  # on to the next model, no extra wait
 
-    try:
-        data = r.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        extraction = json.loads(text)
-    except (KeyError, IndexError, ValueError, json.JSONDecodeError) as e:
-        raise GeminiError(f"unexpected response shape: {e}") from e
+                log.warning(
+                    "Gemini model %s attempt %d/%d failed (transient), retrying in %ds: %s",
+                    model, attempt, RETRIES_PER_MODEL, RETRY_DELAY_SECONDS, e,
+                )
+                time.sleep(RETRY_DELAY_SECONDS)
 
-    if not isinstance(extraction, dict):
-        raise GeminiError("response was valid JSON but not an object")
+            # Any other GeminiError (auth failure, malformed response) is
+            # permanent and not model-specific in a way retrying or
+            # switching models helps — let it propagate and abort the
+            # whole cascade immediately (no `except GeminiError` here on
+            # purpose: this is the fall-through case).
 
-    return extraction
+    raise GeminiError(
+        f"all Gemini models exhausted ({', '.join(GEMINI_MODELS)}): {last_error}"
+    )
