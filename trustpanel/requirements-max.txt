@@ -1,0 +1,12 @@
+# Only needed if you're running the MAX bot (max_bot/main.py /
+# trustpanel-max-bot.service). Install with:
+#   pip install -r requirements-max.txt
+#
+# Version left unpinned on purpose: the maxapi library's own docs describe
+# it as under active development with breaking changes between releases
+# ("Свежая версия, возможны баги"). Pin to whatever version you actually
+# test against once max_bot/ is verified working — see README.md's MAX bot
+# section for exactly which parts of this codebase are unverified against
+# a real install and would be the first place to check if something in
+# max_bot/ breaks after a maxapi upgrade.
+maxapi

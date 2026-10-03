@@ -1,0 +1,10 @@
+[Unit]
+Description=Run TrustPanel AI auto-renewal overdue check every 15 minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/15:00
+Persistent=true
+Unit=trustpanel-auto-renewal-check.service
+
+[Install]
+WantedBy=timers.target
