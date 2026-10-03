@@ -21,7 +21,14 @@ from bot.config import ADMIN_ID, bot
 from bot.formatting import CARD_RE, looks_like_card
 from bot.keyboards import client_menu, main_menu, platform_choice_kb
 from core.dates import utcnow_naive
-from core.db import add_user, get_user, get_user_by_invite_token, get_user_by_telegram_id, update_user
+from core.db import (
+    DuplicateUsernameError,
+    add_user,
+    get_user,
+    get_user_by_invite_token,
+    get_user_by_telegram_id,
+    update_user,
+)
 from core.trial import generate_trial_password, generate_username_from_name, has_used_trial, mark_trial_used
 from core.instructions import render_bot_usage_instructions
 
@@ -132,16 +139,26 @@ async def onboard_trial_start(call: CallbackQuery):
     password = generate_trial_password()
     expires_at = (utcnow_naive() + timedelta(days=4)).strftime("%Y-%m-%d")
 
-    add_user({
-        "username": username,
-        "password": password,
-        "created_at": utcnow_naive().strftime("%Y-%m-%d"),
-        "expires_at": expires_at,
-        "status": "active",
-        "telegram_id": call.from_user.id,
-        "notified_days": [],
-        "pending_request": None,
-    })
+    try:
+        add_user({
+            "username": username,
+            "password": password,
+            "created_at": utcnow_naive().strftime("%Y-%m-%d"),
+            "expires_at": expires_at,
+            "status": "active",
+            "telegram_id": call.from_user.id,
+            "notified_days": [],
+            "pending_request": None,
+        })
+    except DuplicateUsernameError:
+        # username is deterministic from this Telegram account's id (see
+        # generate_username_from_name) -- a collision here can only mean
+        # THIS account already has a trial record, almost certainly a
+        # double-tap on this button landing before mark_trial_used()
+        # below persisted from the first tap. Same message as the normal
+        # has_used_trial() check above, just reached via the race instead.
+        await call.answer("Пробный период уже был использован этим аккаунтом.", show_alert=True)
+        return
 
     mark_trial_used(call.from_user.id)
 

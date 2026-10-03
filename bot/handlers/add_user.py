@@ -22,7 +22,7 @@ from bot.formatting import format_full_instructions_message
 from bot.keyboards import cancel_kb, main_menu
 from bot.states import AddUser, AddUserMulti
 from core.dates import add_calendar_months, utcnow_naive
-from core.db import add_user, get_user
+from core.db import DuplicateUsernameError, add_user, get_user
 from core.generator import generate_link
 from core.invite import build_invite_link, generate_invite_token
 
@@ -98,7 +98,19 @@ async def add_mode_single(call: CallbackQuery, state: FSMContext):
 async def add_username(msg: Message, state: FSMContext):
     if not await admin_only(msg):
         return
-    await state.update_data(username=msg.text.strip())
+
+    username = msg.text.strip()
+
+    # Same check multi_add_username() below already does — catching it
+    # here, before even asking for a password, is both better UX and the
+    # first line of defense; add_user()'s own DuplicateUsernameError (see
+    # finalize_add_user) is the real guarantee in case this one gets
+    # raced by something else adding the same username in between.
+    if get_user(username):
+        await msg.answer("Это имя уже занято. Введите другое:")
+        return
+
+    await state.update_data(username=username)
     await state.set_state(AddUser.password)
     await msg.answer("Enter password:")
 
@@ -128,16 +140,31 @@ async def finalize_add_user(msg: Message, state: FSMContext, expires_at):
     username = data["username"]
     password = data["password"]
 
-    add_user({
-        "username": username,
-        "password": password,
-        "created_at": utcnow_naive().strftime("%Y-%m-%d"),
-        "expires_at": expires_at,
-        "status": "active",
-        "telegram_id": None,
-        "notified_days": [],
-        "pending_request": None,
-    })
+    try:
+        add_user({
+            "username": username,
+            "password": password,
+            "created_at": utcnow_naive().strftime("%Y-%m-%d"),
+            "expires_at": expires_at,
+            "status": "active",
+            "telegram_id": None,
+            "notified_days": [],
+            "pending_request": None,
+        })
+    except DuplicateUsernameError:
+        # The check in add_username() already caught the common case —
+        # this only fires on an actual race (e.g. the same username
+        # created some other way in the gap between that check and this
+        # write). Don't silently clobber the existing record or lose
+        # this conversation's password/expiry — let the admin retype the
+        # username instead of guessing which one should "win".
+        await state.set_state(AddUser.username)
+        await msg.answer(
+            f"⚠️ Имя «{username}» только что стало занято (кто-то создал его параллельно). "
+            "Введите другое имя:",
+            reply_markup=cancel_kb,
+        )
+        return
 
     await run_sync()
 
@@ -389,35 +416,51 @@ async def multi_add_done(call: CallbackQuery, state: FSMContext):
         return
 
     created_usernames = []
+    skipped_usernames = []
     for entry in batch:
-        add_user({
-            "username": entry["username"],
-            "password": entry["password"],
-            "created_at": utcnow_naive().strftime("%Y-%m-%d"),
-            "expires_at": entry["expires_at"],
-            "status": "active",
-            "telegram_id": None,
-            "notified_days": [],
-            "pending_request": None,
-        })
-        created_usernames.append(entry["username"])
+        # multi_add_username() already checked each of these against the
+        # DB + the rest of the batch at entry time — this only catches an
+        # actual race since then (something else creating the same
+        # username in parallel). Skip and keep going rather than losing
+        # the whole batch to one collision.
+        try:
+            add_user({
+                "username": entry["username"],
+                "password": entry["password"],
+                "created_at": utcnow_naive().strftime("%Y-%m-%d"),
+                "expires_at": entry["expires_at"],
+                "status": "active",
+                "telegram_id": None,
+                "notified_days": [],
+                "pending_request": None,
+            })
+            created_usernames.append(entry["username"])
+        except DuplicateUsernameError:
+            skipped_usernames.append(entry["username"])
 
     # One resync + trusttunnel restart for the whole batch, not per-user.
-    await run_sync()
+    if created_usernames:
+        await run_sync()
 
     await state.set_state(AddUserMulti.done_actions)
     await state.update_data(created_usernames=created_usernames)
 
-    names = ", ".join(created_usernames)
+    names = ", ".join(created_usernames) if created_usernames else "—"
+    text = f"✅ Добавлено {len(created_usernames)}"
+    text += ", туннель пересобран" if created_usernames else " (пересборка не нужна)"
+    text += f":\n{names}"
+    if skipped_usernames:
+        text += (
+            f"\n\n⚠️ Пропущено (имя заняло кто-то параллельно, пока вы заполняли форму): "
+            f"{', '.join(skipped_usernames)}"
+        )
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Завершить", callback_data="multiadd:finish")],
         [InlineKeyboardButton(text="📇 Получить карточки", callback_data="multiadd:cards")],
     ])
 
-    await call.message.answer(
-        f"✅ Добавлено {len(created_usernames)}, туннель пересобран:\n{names}",
-        reply_markup=kb
-    )
+    await call.message.answer(text, reply_markup=kb)
     await call.answer()
 
 

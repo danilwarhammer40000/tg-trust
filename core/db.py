@@ -32,6 +32,20 @@ AI_CLAIM_STALE_SECONDS = 300
 _SYNC_KEYS = ("expires_at", "status")
 
 
+class DuplicateUsernameError(Exception):
+    """Raised by add_user() when the username is already taken. Username
+    is the de-facto primary key everywhere in this file -- get_user()
+    returns the first match, update_user() only touches the first match,
+    delete_user() removes EVERY matching record at once -- so a duplicate
+    doesn't just sit there harmlessly, it silently breaks all three the
+    moment it exists. Enforced here, in the one function that actually
+    creates a user record, rather than only at whichever call site
+    happens to check first, so no future code path (a new handler, a
+    migration script, a second VPN integration) can create one by
+    accident."""
+    pass
+
+
 def _ensure():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     if not os.path.exists(DB_PATH):
@@ -100,6 +114,9 @@ def list_users() -> List[Dict]:
 def add_user(user: Dict) -> Dict:
     with _lock:
         data = load()
+        username = user.get("username")
+        if any(u.get("username") == username for u in data):
+            raise DuplicateUsernameError(username)
         data.append(user)
         save(data)
     return user

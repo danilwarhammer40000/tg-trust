@@ -30,6 +30,16 @@ def test_get_missing_user_returns_none(db):
     assert db.get_user("nobody") is None
 
 
+def test_add_user_rejects_duplicate_username(db):
+    db.add_user({"username": "alice", "password": "pw1", "status": "active"})
+    with pytest.raises(db.DuplicateUsernameError):
+        db.add_user({"username": "alice", "password": "different", "status": "active"})
+    # the original record must be untouched — not overwritten, not duplicated
+    users = [u for u in db.list_users() if u["username"] == "alice"]
+    assert len(users) == 1
+    assert users[0]["password"] == "pw1"
+
+
 def test_update_user_returns_true_on_success(db):
     db.add_user({"username": "bob", "password": "pw2", "status": "active"})
     ok = db.update_user("bob", status="inactive")

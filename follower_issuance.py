@@ -26,7 +26,7 @@ import re
 from bot.config import DOMAIN
 from bot.formatting import format_full_instructions_message
 from core.dates import utcnow_naive
-from core.db import add_user, get_followers, get_user, link_user
+from core.db import DuplicateUsernameError, add_user, get_followers, get_user, link_user
 from core.generator import generate_link
 
 # How many extra links (sub-accounts beyond the leader's own) a client can
@@ -88,7 +88,13 @@ def issue_follower(leader_username: str, existing_followers: list = None):
     responsible for keeping that list current between calls in that case.
 
     Returns the new username on success, or None if leader_username
-    doesn't exist.
+    doesn't exist OR if new_username collided with an existing record
+    (DuplicateUsernameError from core.db.add_user() -- next_follower_username()
+    picks the next free numbered slot from a snapshot that can go stale
+    between the check and the write under concurrent calls; this is rare
+    enough not to warrant a retry loop, and the caller already treats a
+    None return as "stop issuing, something's off" -- see
+    bot/handlers/extra_links.py's _issue_now()).
 
     Does NOT generate a connection link/card — see this module's
     docstring for why that has to happen separately, after a resync. Call
@@ -103,17 +109,20 @@ def issue_follower(leader_username: str, existing_followers: list = None):
 
     new_username = next_follower_username(leader_username, existing_followers)
 
-    add_user({
-        "username": new_username,
-        "password": leader.get("password"),
-        "created_at": utcnow_naive().strftime("%Y-%m-%d"),
-        "expires_at": leader.get("expires_at"),  # placeholder — link_user() below syncs it for real
-        "status": leader.get("status", "active"),
-        "telegram_id": None,
-        "notified_days": [],
-        "post_disable_notified": [],
-        "pending_request": None,
-    })
+    try:
+        add_user({
+            "username": new_username,
+            "password": leader.get("password"),
+            "created_at": utcnow_naive().strftime("%Y-%m-%d"),
+            "expires_at": leader.get("expires_at"),  # placeholder — link_user() below syncs it for real
+            "status": leader.get("status", "active"),
+            "telegram_id": None,
+            "notified_days": [],
+            "post_disable_notified": [],
+            "pending_request": None,
+        })
+    except DuplicateUsernameError:
+        return None
 
     link_user(new_username, leader_username)
 
