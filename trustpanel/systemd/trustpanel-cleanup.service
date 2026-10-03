@@ -1,9 +1,0 @@
-[Unit]
-Description=TrustPanel Cleanup
-
-[Service]
-Type=oneshot
-EnvironmentFile=/opt/trustpanel/.env
-ExecStart=/opt/trustpanel/venv/bin/python -u /opt/trustpanel/services/cleanup.py
-StandardOutput=journal
-StandardError=journal

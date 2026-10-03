@@ -1,9 +1,0 @@
-[Unit]
-Description=TrustPanel DB Backup
-
-[Service]
-Type=oneshot
-EnvironmentFile=/opt/trustpanel/.env
-ExecStart=/opt/trustpanel/venv/bin/python -u /opt/trustpanel/services/backup.py
-StandardOutput=journal
-StandardError=journal
