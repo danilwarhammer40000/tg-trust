@@ -61,6 +61,11 @@ def full_resync_and_reload() -> None:
     rebuild_credentials_from_db(users)
     restart_trusttunnel()
 
+    # Xray (admin-only, opt-in per user): a no-op unless data/xray.json exists.
+    # Imported lazily so Xray problems can never break module import.
+    from core.xray import sync_xray_from_users
+    sync_xray_from_users()
+
 
 def mark_user_inactive(username: str) -> None:
     # Purely a logical marker now — credentials.toml is rebuilt from

@@ -23,6 +23,8 @@ from core.logging_setup import setup_logging
 
 from bot.handlers import (
     add_user,
+    admin_tariff,
+    admin_xray,
     auto_renewal_review,
     broadcast,
     client_menu,
@@ -64,6 +66,8 @@ for router in (
     extend.router,
     mass_delete.router,
     get_link.router,
+    admin_tariff.router,
+    admin_xray.router,
 ):
     dp.include_router(router)
 

@@ -79,7 +79,7 @@ def render_access_expired_message(username: str = None) -> str:
     )
 
 
-def calc_monthly_price(username: str):
+def calc_monthly_price(username: str, ignore_custom: bool = False):
     """
     Returns (price_per_month, surcharged_link_count) for `username`'s
     leader account. Base price + EXTRA_LINK_SURCHARGE for each follower
@@ -107,6 +107,13 @@ def calc_monthly_price(username: str):
     from follower_issuance import FREE_EXTRA_LINKS
 
     user = get_user(username) or {}
+
+    # Manual per-client tariff set by the admin (core/tariff.py) replaces the
+    # automatic price entirely, the extra-link surcharge included.
+    custom = user.get("custom_rate")
+    if custom and not ignore_custom:
+        return int(custom), 0
+
     followers = get_followers(username)
 
     paid_links = max(0, len(followers) - FREE_EXTRA_LINKS)
