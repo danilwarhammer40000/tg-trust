@@ -1,51 +1,132 @@
 """
 Trial tracking (survives user deletion) + trial-signup helpers.
 
-Moved here from bot/trial.py: this logic was never actually Telegram-
-specific (it just needs a numeric account id + a display name), and the
-MAX bot (max_bot/) needs the exact same trial-abuse tracking and username
-generation. One shared trial_used.json, one place to fix bugs in either.
-
 Kept in a separate file from users.json on purpose: if an admin deletes an
 expired trial account (via "🗑 Удаление пользователей"), that shouldn't let
-the same account register for a second free trial.
+the same Telegram account register for a second free trial.
+
+A trial is never issued automatically: the client files a *request*
+(trial_requests.json) and the admin approves or rejects it — see
+bot/handlers/trial_requests.py.
 """
 import json
+import logging
 import os
 import re
 import secrets
+import shutil
 import string
+import tempfile
+from typing import Dict, Optional
+
+from filelock import FileLock
 
 from core.db import get_user
-from core.paths import TRIAL_USED_PATH
+from core.dates import utcnow_naive
+from core.paths import TRIAL_REQUESTS_PATH, TRIAL_USED_PATH
 
+log = logging.getLogger(__name__)
+
+
+# ---------------- small JSON store (atomic + locked + .bak fallback) ----------------
+
+def _lock_for(path: str) -> FileLock:
+    return FileLock(path + ".lock", timeout=10)
+
+
+def _read_json(path: str, default):
+    """Reads `path`; on a corrupt file falls back to the .bak copy (written on
+    every save) instead of silently pretending the store is empty — an empty
+    trial_used.json would hand out second free trials to everybody."""
+    for candidate in (path, path + ".bak"):
+        try:
+            with open(candidate, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            if candidate == path and not os.path.exists(path + ".bak"):
+                return default
+            continue
+        except (OSError, json.JSONDecodeError) as e:
+            log.error("could not read %s: %s", candidate, e)
+    return default
+
+
+def _write_json(path: str, data) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                json.load(f)
+            shutil.copy2(path, path + ".bak")
+        except (OSError, json.JSONDecodeError):
+            pass  # current file is broken — keep the older .bak as it is
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=os.path.dirname(path), encoding="utf-8") as tmp:
+        json.dump(data, tmp)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_path = tmp.name
+    os.replace(tmp_path, path)
+
+
+# ---------------- used trials ----------------
 
 def load_trial_used_ids() -> set:
-    try:
-        with open(TRIAL_USED_PATH, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return set()
+    return set(_read_json(TRIAL_USED_PATH, []))
 
 
 def save_trial_used_ids(ids: set):
-    os.makedirs(os.path.dirname(TRIAL_USED_PATH), exist_ok=True)
-    with open(TRIAL_USED_PATH, "w", encoding="utf-8") as f:
-        json.dump(sorted(ids), f)
+    with _lock_for(TRIAL_USED_PATH):
+        _write_json(TRIAL_USED_PATH, sorted(ids))
 
 
 def has_used_trial(account_id) -> bool:
-    """account_id: a Telegram user id (int) or a MAX chat id (int) — the two
-    platforms use separate id spaces, but both are just ints stored in the
-    same set here. A person trying both messengers can still get one trial
-    per platform; that's an accepted edge case, not a bug."""
     return account_id in load_trial_used_ids()
 
 
 def mark_trial_used(account_id):
-    ids = load_trial_used_ids()
-    ids.add(account_id)
-    save_trial_used_ids(ids)
+    with _lock_for(TRIAL_USED_PATH):
+        ids = set(_read_json(TRIAL_USED_PATH, []))
+        ids.add(account_id)
+        _write_json(TRIAL_USED_PATH, sorted(ids))
+
+
+# ---------------- trial requests (admin approval) ----------------
+
+def _load_requests() -> Dict[str, dict]:
+    data = _read_json(TRIAL_REQUESTS_PATH, {})
+    return data if isinstance(data, dict) else {}
+
+
+def get_trial_request(account_id) -> Optional[dict]:
+    return _load_requests().get(str(account_id))
+
+
+def add_trial_request(account_id, display_name: Optional[str], handle: Optional[str]) -> bool:
+    """Records a pending request. Returns False if this account already has one."""
+    with _lock_for(TRIAL_REQUESTS_PATH):
+        requests_ = _load_requests()
+        if str(account_id) in requests_:
+            return False
+        requests_[str(account_id)] = {
+            "account_id": account_id,
+            "display_name": display_name,
+            "handle": handle,
+            "requested_at": utcnow_naive().isoformat(),
+        }
+        _write_json(TRIAL_REQUESTS_PATH, requests_)
+        return True
+
+
+def pop_trial_request(account_id) -> Optional[dict]:
+    """Atomically removes and returns the request (None if already handled) —
+    whoever gets a non-None value owns the decision, so a double tap on
+    «Одобрить» can never create two accounts."""
+    with _lock_for(TRIAL_REQUESTS_PATH):
+        requests_ = _load_requests()
+        req = requests_.pop(str(account_id), None)
+        if req is not None:
+            _write_json(TRIAL_REQUESTS_PATH, requests_)
+        return req
 
 
 def generate_trial_password(length: int = 10) -> str:
@@ -74,7 +155,7 @@ def slugify_name(name: str) -> str:
 def generate_username_from_name(display_name, handle, account_id) -> str:
     """
     display_name: first name / full name shown by the platform.
-    handle: a secondary fallback (Telegram @username, or None on MAX).
+    handle: a secondary fallback (Telegram @username).
     account_id: numeric id, used as a uniqueness suffix.
     """
     base = slugify_name(display_name) if display_name else ""

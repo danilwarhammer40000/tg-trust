@@ -12,7 +12,7 @@ from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from bot.access import admin_only, is_admin, notify_bg
+from bot.access import admin_only, generate_link_async, is_admin, notify_bg
 from bot.config import ADMIN_ID, bot, DOMAIN
 from bot.formatting import extract_qr_link, format_connection_message
 from bot.keyboards import bot_usage_button_kb, client_menu, instructions_menu_kb, platform_choice_kb, routing_platform_kb
@@ -20,7 +20,6 @@ from bot.states import RateTopup
 from core.auto_renewal import try_auto_verify_topup
 from core.dates import is_expired, utcnow_naive
 from core.db import get_followers, get_user, get_user_by_telegram_id, update_user
-from core.generator import generate_link
 from core.notify import log_to_channel
 from follower_issuance import FREE_EXTRA_LINKS
 from core.instructions import (
@@ -32,7 +31,6 @@ from core.instructions import (
     render_ios_instructions,
 )
 from core.payment import (
-    EXTRA_LINK_SURCHARGE,
     calc_monthly_price,
     calc_rate_gap,
     calc_recalculated_expiry,
@@ -205,6 +203,15 @@ async def rate_topup_receipt(msg: Message, state: FSMContext):
     topup_amount = data.get("topup_amount")
     await state.clear()
 
+    existing = (get_user(username) or {}).get("pending_request")
+    if existing:
+        await msg.answer(
+            "⏳ У вас уже есть заявка на проверке у администратора. "
+            "Дождитесь ответа и повторите доплату после этого.",
+            reply_markup=client_menu,
+        )
+        return
+
     is_photo = bool(msg.photo)
     file_id = msg.photo[-1].file_id if is_photo else msg.document.file_id
 
@@ -240,7 +247,8 @@ async def rate_topup_receipt(msg: Message, state: FSMContext):
     # processed" check in rate_topup_review below — but edit the card's
     # buttons away too, so the admin isn't looking at stale actionable
     # buttons for a request that's already resolved.
-    auto_applied = try_auto_verify_topup(username)
+    # Gemini pipeline is synchronous and can take minutes — keep it off the event loop.
+    auto_applied = await notify_bg(try_auto_verify_topup, username)
 
     if auto_applied:
         try:
@@ -393,7 +401,7 @@ async def client_my_connection_card(call: CallbackQuery):
         await call.answer("Не найдено.", show_alert=True)
         return
 
-    link = generate_link(target_username, DOMAIN)
+    link = await generate_link_async(target_username, DOMAIN)
     await call.message.answer(
         format_connection_message(target_username, target.get("password"), target.get("expires_at"), link)
     )
@@ -490,11 +498,26 @@ async def _howto_dispatch(call: CallbackQuery, platform: str):
 @router.callback_query(F.data.startswith("howtolink:"))
 async def howto_link_pick(call: CallbackQuery):
     _, platform, username = call.data.split(":", 2)
+
+    # SECURITY: callback_data is client-controlled — only the caller's own
+    # account or their own followers may be requested (same rule as
+    # client_my_connection_card), otherwise anyone could pull the
+    # connection link of any account whose username they can guess.
+    user = get_user_by_telegram_id(call.from_user.id)
+    if not user:
+        await call.answer("Не удалось определить ваш аккаунт.", show_alert=True)
+        return
+
+    allowed = {user.get("username")} | {f.get("username") for f in get_followers(user["username"])}
+    if username not in allowed or platform not in ("ios", "android"):
+        await call.answer("Доступ запрещён.", show_alert=True)
+        return
+
     await _send_howto_instructions(call, platform, username)
     await call.answer()
 
 
 async def _send_howto_instructions(call: CallbackQuery, platform: str, username: str):
-    link = extract_qr_link(generate_link(username, DOMAIN))
+    link = extract_qr_link(await generate_link_async(username, DOMAIN))
     text = render_ios_instructions(link) if platform == "ios" else render_android_instructions(link)
     await call.message.answer(text, reply_markup=bot_usage_button_kb())

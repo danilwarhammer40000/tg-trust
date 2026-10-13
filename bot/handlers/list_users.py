@@ -15,7 +15,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from bot.access import admin_only, run_sync
+from bot.access import admin_only, generate_link_async, run_sync
 from bot.config import DOMAIN
 from bot.display import build_follower_counts, prepare_users_for_display, user_button_label
 from bot.formatting import extract_telegram_id_from_message, format_full_instructions_message
@@ -24,7 +24,6 @@ from bot.pagination import paginate, pagination_nav_row
 from bot.states import AdminMessage, ExtendUser, SetTelegramId
 from core.dates import is_expired
 from core.db import delete_user, get_followers, get_user, list_users, unlink_user, update_user
-from core.generator import generate_link
 from core.xray import xray_block
 
 router = Router()
@@ -222,7 +221,7 @@ async def action_get_link(call: CallbackQuery):
 
     username = call.data.split(":", 1)[1]
     user = get_user(username) or {}
-    link = generate_link(username, DOMAIN)
+    link = await generate_link_async(username, DOMAIN)
 
     await call.message.answer(
         format_full_instructions_message(username, user.get("password"), user.get("expires_at"), link)

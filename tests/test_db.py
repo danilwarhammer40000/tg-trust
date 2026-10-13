@@ -6,7 +6,6 @@ at a throwaway file instead of /opt/trustpanel/data/users.json, so tests
 never touch a real deployment's data.
 """
 import importlib
-import os
 
 import pytest
 

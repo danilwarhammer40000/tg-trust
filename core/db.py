@@ -1,8 +1,10 @@
 import json
 import logging
 import os
+import shutil
 import stat
 import tempfile
+import time
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -14,6 +16,9 @@ log = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("TRUSTPANEL_DB_PATH", "/opt/trustpanel/data/users.json")
 LOCK_PATH = DB_PATH + ".lock"
+# Copy of the last known-good users.json, refreshed on every save(). If the
+# main file is ever found corrupted, load() rolls back to this one.
+BACKUP_PATH = DB_PATH + ".bak"
 
 # every read-modify-write cycle (get -> mutate -> save) happens under this
 # lock. FileLock is process-safe and already a project dependency (used in
@@ -25,11 +30,23 @@ _lock = FileLock(LOCK_PATH, timeout=10)
 # retry, or by falling through to manual approval). See
 # claim_pending_request_for_ai() below and bot/handlers/receipt.py's
 # _ai_in_progress_or_done(), which reads this same constant.
-AI_CLAIM_STALE_SECONDS = 300
+# Must be longer than the slowest legitimate run of the Gemini pipeline (model
+# cascade with retries can take 20+ minutes in the worst case), otherwise a
+# second process reclaims a claim that is still being worked on. As a second
+# line of defence apply-time uses pop_pending_request() below.
+AI_CLAIM_STALE_SECONDS = 3600
 
 # expires_at/status are the only two fields that get redirected+propagated
 # across a leader/follower group — see update_user()'s docstring.
 _SYNC_KEYS = ("expires_at", "status")
+
+
+class DBCorruptedError(Exception):
+    """users.json is unreadable AND there is no valid backup to roll back to.
+    Raised instead of returning [] on purpose: an empty list would be written
+    back by the next add/update (wiping every client) and would make the next
+    credentials rebuild disconnect everyone."""
+    pass
 
 
 class DuplicateUsernameError(Exception):
@@ -62,27 +79,104 @@ def _chmod_private(path: str) -> None:
         log.warning("could not chmod %s: %s", path, e)
 
 
+def _read_valid(path: str):
+    """Parses `path` as a users list. Returns the list, or None if the file is
+    missing/unreadable/not a JSON list."""
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, list):
+        return None
+    return data
+
+
+def _atomic_write(path: str, data) -> None:
+    tmp_dir = os.path.dirname(path)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=tmp_dir) as tmp:
+        json.dump(data, tmp, indent=2)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_path = tmp.name
+    _chmod_private(tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _notify_admin_safely(text: str) -> None:
+    # Lazy import + blanket except: a notification problem must never turn a
+    # successful rollback into a crash.
+    try:
+        from core.notify import notify_admin
+        notify_admin(text)
+    except Exception:
+        log.exception("could not notify admin about DB rollback")
+
+
+def _rollback_from_backup() -> List[Dict]:
+    """Called when DB_PATH can't be parsed. Restores the last good backup (the
+    broken file is kept next to it as users.json.corrupt-<ts> for inspection)
+    and returns its contents. Raises DBCorruptedError when there is nothing
+    valid to restore."""
+    with _lock:
+        # Someone else may have fixed it while we waited for the lock.
+        data = _read_valid(DB_PATH)
+        if data is not None:
+            return [u for u in data if isinstance(u, dict)]
+
+        backup = _read_valid(BACKUP_PATH)
+        if backup is None:
+            log.error("%s is corrupted and no valid backup exists at %s", DB_PATH, BACKUP_PATH)
+            _notify_admin_safely(
+                "🔥 users.json повреждён, а рабочей резервной копии нет. Бот не будет "
+                "ничего записывать, чтобы не затереть данные. Восстановите файл вручную "
+                "(Настройки → База данных → импорт, либо скопируйте последний бэкап)."
+            )
+            raise DBCorruptedError(DB_PATH)
+
+        corrupt_copy = f"{DB_PATH}.corrupt-{int(time.time())}"
+        try:
+            shutil.copy2(DB_PATH, corrupt_copy)
+            _chmod_private(corrupt_copy)
+        except OSError as e:
+            log.warning("could not keep a copy of the corrupted file: %s", e)
+
+        _atomic_write(DB_PATH, backup)
+        log.error("%s was corrupted — rolled back to %s (%d records)", DB_PATH, BACKUP_PATH, len(backup))
+        _notify_admin_safely(
+            f"⚠️ users.json был повреждён — автоматически восстановлен из резервной копии "
+            f"({len(backup)} записей). Повреждённый файл сохранён как {os.path.basename(corrupt_copy)}. "
+            f"Изменения, сделанные после последнего успешного сохранения, могли потеряться."
+        )
+        return [u for u in backup if isinstance(u, dict)]
+
+
 def load() -> List[Dict]:
     _ensure()
-    try:
-        with open(DB_PATH, "r") as f:
-            data = json.load(f)
-        return [u for u in data if isinstance(u, dict)]
-    except (OSError, json.JSONDecodeError) as e:
-        log.error("failed to load %s: %s", DB_PATH, e)
-        return []
+    data = _read_valid(DB_PATH)
+    if data is None:
+        log.error("failed to load %s", DB_PATH)
+        return _rollback_from_backup()
+    return [u for u in data if isinstance(u, dict)]
 
 
 def save(data: List[Dict]):
     _ensure()
-    tmp_dir = os.path.dirname(DB_PATH)
 
-    with tempfile.NamedTemporaryFile("w", delete=False, dir=tmp_dir) as tmp:
-        json.dump(data, tmp, indent=2)
-        tmp_path = tmp.name
+    # Refuse to write anything that isn't a list of records — the one thing
+    # that must never happen is replacing the DB with garbage.
+    if not isinstance(data, list) or not all(isinstance(u, dict) for u in data):
+        raise ValueError("save(): data must be a list of dicts")
 
-    _chmod_private(tmp_path)
-    os.replace(tmp_path, DB_PATH)
+    # Keep the previous state (only if it is itself valid) as the rollback copy.
+    if _read_valid(DB_PATH) is not None:
+        try:
+            shutil.copy2(DB_PATH, BACKUP_PATH)
+            _chmod_private(BACKUP_PATH)
+        except OSError as e:
+            log.warning("could not refresh DB backup: %s", e)
+
+    _atomic_write(DB_PATH, data)
 
 
 # ================= SORTING =================
@@ -188,22 +282,13 @@ def update_user(username: str, **kwargs) -> bool:
         return True
 
 
-# ================= TELEGRAM / MAX LOOKUP =================
+# ================= TELEGRAM LOOKUP =================
 
 def get_user_by_telegram_id(tg_id: int) -> Optional[Dict]:
     tg_id = str(tg_id)
 
     for u in load():
         if str(u.get("telegram_id")) == tg_id:
-            return u
-    return None
-
-
-def get_user_by_max_chat_id(chat_id) -> Optional[Dict]:
-    chat_id = str(chat_id)
-
-    for u in load():
-        if str(u.get("max_chat_id")) == chat_id:
             return u
     return None
 
@@ -326,7 +411,7 @@ def claim_pending_request_for_ai(username: str) -> bool:
                 try:
                     claimed_dt = datetime.fromisoformat(claimed_at)
                     still_fresh = (utcnow_naive() - claimed_dt).total_seconds() < AI_CLAIM_STALE_SECONDS
-                except ValueError:
+                except (ValueError, TypeError):
                     still_fresh = False  # unparseable timestamp -- treat as stale, allow reclaim
 
                 if still_fresh:
@@ -340,3 +425,22 @@ def claim_pending_request_for_ai(username: str) -> bool:
             return True
 
         return False
+
+
+def pop_pending_request(username: str):
+    """Atomically removes and returns username's pending_request, or None if
+    there is none. Whoever gets a non-None result owns the request — used so
+    that an auto-renewal, a manual approval or a second AI processor can never
+    all act on the same receipt."""
+    with _lock:
+        data = load()
+        for u in data:
+            if u.get("username") != username:
+                continue
+            pending = u.get("pending_request")
+            if not pending:
+                return None
+            u["pending_request"] = None
+            save(data)
+            return pending
+        return None

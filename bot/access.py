@@ -11,6 +11,7 @@ from aiogram.types import CallbackQuery
 
 from bot.config import ADMIN_ID
 from core.db import update_user
+from core.generator import generate_link
 from core.service import safe_sync
 
 log = logging.getLogger(__name__)
@@ -33,10 +34,35 @@ async def admin_only(msg_or_call) -> bool:
     return False
 
 
-async def run_sync():
-    """Run the blocking systemctl-restart sync off the event loop."""
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, safe_sync)
+async def run_sync() -> str:
+    """Run the blocking systemctl-restart sync off the event loop. Returns
+    safe_sync()'s result ("OK" / "ERROR: ...") and, on failure, tells the
+    admin instead of failing silently."""
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, safe_sync)
+    if result != "OK":
+        log.error("run_sync failed: %s", result)
+        try:
+            from bot.config import bot
+            await bot.send_message(ADMIN_ID, f"⚠️ Синхронизация туннеля не удалась: {result}")
+        except Exception:
+            log.exception("could not report sync failure to admin")
+    return result
+
+
+async def generate_link_async(username: str, domain: str) -> str:
+    """core.generator.generate_link() shells out to the trusttunnel binary
+    (up to 3 tries x 15 s) — never call it directly from a handler, it would
+    freeze the whole bot for every other user meanwhile."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, generate_link, username, domain)
+
+
+async def build_connection_card_async(username: str) -> str:
+    """Same reasoning as generate_link_async, for follower_issuance.build_connection_card."""
+    from follower_issuance import build_connection_card
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, build_connection_card, username)
 
 
 async def notify_bg(func, *args, **kwargs):
@@ -46,7 +72,7 @@ async def notify_bg(func, *args, **kwargs):
     blocks the event loop. Fire-and-forget: callers that don't care about
     the return value just `await notify_bg(some_sync_func, ...)`.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
 
@@ -68,6 +94,13 @@ async def notify_client(bot, telegram_id: int, text: str, clear_username: str = 
         return True
     except (TelegramForbiddenError, TelegramBadRequest) as e:
         log.warning("notify_client: could not deliver to %s: %s", telegram_id, e)
-        if clear_username:
+        # Only unlink when the chat itself is gone. A BadRequest can also mean
+        # "message too long" / "can't parse entities" — that must NOT silently
+        # detach a perfectly reachable client.
+        gone = isinstance(e, TelegramForbiddenError) or any(
+            marker in str(e).lower()
+            for marker in ("chat not found", "user not found", "user is deactivated", "peer_id_invalid")
+        )
+        if clear_username and gone:
             update_user(clear_username, telegram_id=None)
         return False

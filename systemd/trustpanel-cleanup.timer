@@ -1,5 +1,5 @@
 [Unit]
-Description=Run TrustPanel cleanup daily at 08:00 MSK
+Description=Run TrustPanel cleanup daily at 05:00 UTC (12:00 Krasnoyarsk)
 
 [Timer]
 OnCalendar=*-*-* 05:00:00

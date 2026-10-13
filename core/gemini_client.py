@@ -72,6 +72,8 @@ import time
 
 import requests
 
+from core.redact import scrub
+
 log = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -184,7 +186,12 @@ def proxy_url() -> str:
     string if nothing is configured from either source; callers should
     check proxy_configured() first rather than treat "" as a real value."""
     from core.auto_renewal import get_gemini_proxy_url_override
-    return get_gemini_proxy_url_override() or GEMINI_PROXY_URL
+    url = get_gemini_proxy_url_override() or GEMINI_PROXY_URL
+    # Only a Cloudflare Worker / HTTPS reverse-proxy base URL is supported.
+    if url and not url.startswith(("http://", "https://")):
+        log.warning("GEMINI_PROXY_URL ignored: must start with http:// or https:// (Worker URL)")
+        return ""
+    return url
 
 
 def is_proxy_enabled() -> bool:
@@ -228,18 +235,25 @@ def _call_gemini_once(model: str, payload: dict) -> dict:
     url = _endpoint_for(model)
 
     try:
-        r = requests.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=60)
+        # Key goes in a header, not in the query string: the URL ends up in
+        # requests' exception text, which is logged and shown to the admin.
+        r = requests.post(
+            url,
+            headers={"x-goog-api-key": GEMINI_API_KEY or ""},
+            json=payload,
+            timeout=60,
+        )
     except requests.RequestException as e:
-        raise _TransientGeminiError(f"network error on {model}: {e}") from e
+        raise _TransientGeminiError(f"network error on {model}: {scrub(e)}") from e
 
     if not r.ok:
         if r.status_code in _AUTH_STATUS_CODES:
-            raise GeminiError(f"HTTP {r.status_code} (auth) on {model}: {r.text[:300]}")
+            raise GeminiError(f"HTTP {r.status_code} (auth) on {model}: {scrub(r.text[:300])}")
         if r.status_code in _MODEL_UNAVAILABLE_STATUS_CODES:
-            raise _ModelUnavailableError(f"HTTP {r.status_code} (model unavailable) on {model}: {r.text[:300]}")
+            raise _ModelUnavailableError(f"HTTP {r.status_code} (model unavailable) on {model}: {scrub(r.text[:300])}")
         if r.status_code in _TRANSIENT_STATUS_CODES:
-            raise _TransientGeminiError(f"HTTP {r.status_code} (transient) on {model}: {r.text[:300]}")
-        raise GeminiError(f"HTTP {r.status_code} on {model}: {r.text[:300]}")
+            raise _TransientGeminiError(f"HTTP {r.status_code} (transient) on {model}: {scrub(r.text[:300])}")
+        raise GeminiError(f"HTTP {r.status_code} on {model}: {scrub(r.text[:300])}")
 
     try:
         data = r.json()

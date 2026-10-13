@@ -35,6 +35,12 @@ def setup_logging() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # Mask bot token / API keys in every record (requests puts the full URL,
+    # token included, into its exception messages).
+    from core.redact import RedactingFilter
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(RedactingFilter())
+
     # aiogram is chatty at INFO about every update; keep it at WARNING
     # unless the operator explicitly asked for DEBUG.
     if level > logging.DEBUG:

@@ -62,12 +62,11 @@ from either source).
 import json
 import logging
 import os
-import requests
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from core.dates import calc_new_expiry_months, is_expired, utcnow_naive
-from core.db import get_user, update_user
+from core.db import get_user, pop_pending_request, update_user
 from core.notify import get_file_bytes, log_to_channel, notify_admin, notify_user, send_message, send_photo_by_file_id
 from core.paths import AUTO_RENEWAL_SETTINGS_PATH
 from core.service import safe_sync
@@ -78,10 +77,6 @@ KRASNOYARSK_TZ = ZoneInfo("Asia/Krasnoyarsk")
 
 DEFAULT_SETTINGS = {
     "enabled": False,
-    "fully_automatic": False,   # bypasses the night window entirely -- see should_attempt_now()
-    "night_start": "22:00",
-    "night_end": "06:00",
-    "overdue_hours": 3,
     "min_amount": 100,
     "min_confidence": 0.75,
     "abuse_lock_days": 7,   # see _is_locked() -- how long one auto-renewal blocks the next
@@ -107,18 +102,6 @@ DEFAULT_SETTINGS = {
 # main menu (see bot/handlers/auto_renewal_review.py's
 # auto_renewal_menu_kb), shown only when GEMINI_PROXY_URL is set in .env.
 FIELD_META = {
-    "night_start": {
-        "label": "🌙 Начало ночного окна",
-        "prompt": "Введите время начала ночного окна в формате ЧЧ:ММ (например 22:00):",
-    },
-    "night_end": {
-        "label": "🌅 Конец ночного окна",
-        "prompt": "Введите время конца ночного окна в формате ЧЧ:ММ (например 06:00):",
-    },
-    "overdue_hours": {
-        "label": "⏳ Порог просрочки (часов)",
-        "prompt": "Через сколько часов без ответа администратора считать заявку просроченной? Число, можно дробное (например 3 или 2.5):",
-    },
     "min_amount": {
         "label": "💰 Мин. сумма / кратность (₽)",
         "prompt": "Минимальная сумма и шаг кратности в рублях (например 100 = сумма должна быть кратна 100₽):",
@@ -176,20 +159,6 @@ def toggle_auto_renewal() -> bool:
     return new_value
 
 
-def is_fully_automatic_enabled() -> bool:
-    return _load_settings().get("fully_automatic", False)
-
-
-def toggle_fully_automatic() -> bool:
-    """Fully-automatic mode makes should_attempt_now() ignore the night
-    window entirely — every receipt gets an immediate AI attempt, any time
-    of day, as long as the master toggle is also ON."""
-    settings = _load_settings()
-    settings["fully_automatic"] = not settings.get("fully_automatic", False)
-    _save_settings(settings)
-    return settings["fully_automatic"]
-
-
 def toggle_gemini_proxy_enabled() -> bool:
     """Flips whether outbound Gemini calls actually use the configured
     proxy (see core.gemini_client.is_proxy_enabled) — lets the admin fall
@@ -230,14 +199,6 @@ def log_channel_configured() -> bool:
     return bool(LOG_CHANNEL_ID)
 
 
-def _parse_hhmm(raw: str) -> dt_time:
-    h, m = raw.strip().split(":")
-    h, m = int(h), int(m)
-    if not (0 <= h <= 23 and 0 <= m <= 59):
-        raise ValueError("out of range")
-    return dt_time(h, m)
-
-
 def set_setting_validated(key: str, raw_value: str):
     """
     Validates and saves one editable trigger setting from admin-typed text.
@@ -250,22 +211,7 @@ def set_setting_validated(key: str, raw_value: str):
     """
     raw_value = (raw_value or "").strip()
 
-    if key in ("night_start", "night_end"):
-        try:
-            _parse_hhmm(raw_value)
-        except (ValueError, IndexError):
-            return False, "Формат должен быть ЧЧ:ММ, например 22:00"
-        value = raw_value
-
-    elif key == "overdue_hours":
-        try:
-            value = float(raw_value.replace(",", "."))
-            if value <= 0:
-                raise ValueError
-        except ValueError:
-            return False, "Введите положительное число часов, например 3 или 2.5"
-
-    elif key == "min_amount":
+    if key == "min_amount":
         try:
             value = int(raw_value)
             if value <= 0:
@@ -309,48 +255,35 @@ def reset_settings_to_defaults() -> None:
     _save_settings({**DEFAULT_SETTINGS, "enabled": enabled})
 
 
-# ---------------- TIME WINDOW ----------------
+# ---------------- TRIGGER ----------------
+
+# There are no time-of-day / "waiting for the admin" conditions any more: while
+# auto-renewal is switched ON, every receipt is processed by the AI right away,
+# at any hour. The only gates left are the receipt checks themselves
+# (amount / confidence / anti-abuse lock, see evaluate_receipt_extraction and
+# _is_locked). The periodic checker (services/auto_renewal_overdue_check.py)
+# is now just a recovery net for requests nobody processed (bot restarted
+# mid-pipeline etc.): it picks up anything unprocessed older than this.
+STUCK_REQUEST_MINUTES = 10
+
 
 def krasnoyarsk_now() -> datetime:
     return datetime.now(KRASNOYARSK_TZ)
 
 
-def is_in_night_window(now: datetime = None) -> bool:
-    """Night window bounds are configurable (default 22:00-06:00
-    Krasnoyarsk) — handles both a wrapping window (start > end, e.g.
-    22:00-06:00) and a same-day window (start < end, e.g. 09:00-18:00, in
-    case an admin ever wants to invert the idea and only auto-renew during
-    the day) the same way."""
-    now = now or krasnoyarsk_now()
-    t = now.time()
-
-    start = _parse_hhmm(get_setting("night_start"))
-    end = _parse_hhmm(get_setting("night_end"))
-
-    if start <= end:
-        return start <= t < end
-    return t >= start or t < end
-
-
 def should_attempt_now() -> bool:
-    """The real-time trigger's condition: master toggle ON, and either
-    fully-automatic mode is on (any time of day) or it's currently in the
-    night window."""
-    if not is_auto_renewal_enabled():
-        return False
-    if is_fully_automatic_enabled():
-        return True
-    return is_in_night_window()
+    """Auto-renewal ON == attempt immediately, no further conditions."""
+    return is_auto_renewal_enabled()
 
 
 def is_overdue_trigger_active() -> bool:
-    """The periodic checker only fires the overdue rule while the master
-    toggle is ON — flipping auto-renewal off should actually turn it off,
-    not leave the overdue safety net silently running."""
+    """The recovery checker only runs while the master toggle is ON —
+    flipping auto-renewal off should actually turn it off."""
     return is_auto_renewal_enabled()
 
 
 def is_request_overdue(requested_at_iso: str, now: datetime = None) -> bool:
+    """True if a request has sat unprocessed for STUCK_REQUEST_MINUTES+."""
     if not requested_at_iso:
         return False
     try:
@@ -362,8 +295,7 @@ def is_request_overdue(requested_at_iso: str, now: datetime = None) -> bool:
     if requested_at.tzinfo is not None:
         requested_at = requested_at.astimezone().replace(tzinfo=None)
 
-    threshold = timedelta(hours=get_setting("overdue_hours"))
-    return (reference - requested_at) >= threshold
+    return (reference - requested_at) >= timedelta(minutes=STUCK_REQUEST_MINUTES)
 
 
 # ---------------- ANTI-ABUSE LOCK ----------------
@@ -429,13 +361,12 @@ def evaluate_receipt_extraction(extraction: dict, rate: int = None):
     `rate` is the client's price-per-month, snapshotted at the moment
     they submitted the receipt (pending_request["rate_at_submission"],
     set by bot/handlers/receipt.py's receipt_yes,
-    bot/handlers/feedback.py's feedback_media_as_receipt, and
-    max_bot/handlers/receipt.py's receipt_yes — see
+    bot/handlers/feedback.py's feedback_media_as_receipt — see
     core/payment.py's calc_monthly_price docstring for why this is
     snapshotted rather than recalculated here). Deliberately NOT
     recomputed live from the client's CURRENT link count: a client's
     extra-link count can change between "sent the receipt" and "actually
-    processed" (queue backlog, night-mode window), and the amount they
+    processed" (queue backlog, a slow Gemini run), and the amount they
     already paid must be evaluated against the rate that was true when
     they paid, not whatever it drifted to since. Falls back to the
     global min_amount setting only for pending_request records that
@@ -469,47 +400,17 @@ def _pending_file_ref(pending: dict):
     Returns (file_id, is_photo) straight from the pending_request record
     — no network call, no bytes downloaded. Used purely to attach the
     original receipt image to an admin card (e.g. the anti-abuse fallback
-    card, see _process_pending_request_with_ai_inner) at a point in the
-    pipeline that may bail out before ever needing the actual file
-    contents. Contrast with _fetch_receipt_file() below, which downloads
-    real bytes for handing to Gemini and is the source of truth for
-    whether the file can actually be retrieved at all.
-
-    MAX-origin receipts have no Telegram file_id (there's nothing to
-    attach via send_photo_by_file_id) — the caption alone still goes out,
-    it just won't have the image attached. This is a display-only
-    limitation; _fetch_receipt_file() below can still retrieve the actual
-    bytes for Gemini via the stored URL.
+    card) at a point in the pipeline that may bail out before ever
+    needing the actual file contents. Contrast with _fetch_receipt_file()
+    below, which downloads real bytes for handing to Gemini.
     """
-    if pending.get("source") == "max":
-        return None, True
     return pending.get("receipt_file_id"), pending.get("receipt_is_photo", True)
 
 
 def _fetch_receipt_file(pending: dict):
     """
     Returns (bytes, mime_type, file_id, is_photo) or (None, None, None, None).
-
-    MAX-origin receipts (pending["source"] == "max") store a plain
-    download URL instead of a Telegram file_id — see
-    max_bot/handlers/receipt.py, which sets receipt_url the same way its
-    own receipt_yes already downloads a receipt for forwarding to the
-    admin. `file_id` in the returned tuple is None for these (there's no
-    Telegram file to re-send by ID), but the bytes are real and Gemini
-    doesn't care which platform they came from.
     """
-    if pending.get("source") == "max":
-        url = pending.get("receipt_url")
-        if not url:
-            return None, None, None, None
-        try:
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-        except requests.RequestException as e:
-            log.error("failed to download MAX receipt attachment: %s", e)
-            return None, None, None, None
-        return r.content, "image/jpeg", None, True
-
     file_id = pending.get("receipt_file_id")
     if not file_id:
         return None, None, None, None
@@ -535,8 +436,8 @@ def _fetch_receipt_file(pending: dict):
 
 def _trigger_label(trigger: str) -> str:
     return {
-        "night_window": "ночной режим",
-        "overdue_3h": "заявка висела > порога",
+        "immediate": "сразу при получении чека",
+        "overdue_3h": "подхвачена проверкой зависших заявок",
         "manual_retry": "повтор вручную",
     }.get(trigger, trigger)
 
@@ -745,6 +646,14 @@ def _apply_and_request_review(username, months, extraction, trigger, file_id=Non
     instead, and pending_request is cleared right here — the review card
     is now purely an FYI-with-an-undo-button, not a gate on anything.
     """
+    # Atomic "only one processor may apply this request": takes the pending
+    # request out under the DB lock. If it is already gone (the other process
+    # that reclaimed a slow claim applied it first, or the admin handled it
+    # manually in the meantime) we must NOT extend a second time.
+    if pop_pending_request(username) is None:
+        log.warning("auto-renewal for %s skipped: pending request already consumed", username)
+        return
+
     user = get_user(username)
     previous_expires_at = user.get("expires_at")
     previous_status = user.get("status")

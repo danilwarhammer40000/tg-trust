@@ -60,7 +60,7 @@ async def try_auto_renewal(username: str, file_id: str, is_photo: bool) -> str:
 
     loop = asyncio.get_event_loop()
     approved = await loop.run_in_executor(
-        None, auto_renewal.process_pending_request_with_ai, username, "night_window"
+        None, auto_renewal.process_pending_request_with_ai, username, "immediate"
     )
     return "approved" if approved else "fallback"
 

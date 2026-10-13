@@ -16,14 +16,14 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
-from bot.access import admin_only, run_sync
+from bot.access import admin_only, generate_link_async, run_sync
 from bot.config import DOMAIN, bot
 from bot.formatting import format_full_instructions_message
 from bot.keyboards import cancel_kb, main_menu
 from bot.states import AddUser, AddUserMulti
 from core.dates import add_calendar_months, utcnow_naive
+from core.trial import USERNAME_RE
 from core.db import DuplicateUsernameError, add_user, get_user
-from core.generator import generate_link
 from core.invite import build_invite_link, generate_invite_token
 
 router = Router()
@@ -99,7 +99,11 @@ async def add_username(msg: Message, state: FSMContext):
     if not await admin_only(msg):
         return
 
-    username = msg.text.strip()
+    username = (msg.text or "").strip()
+
+    if not USERNAME_RE.match(username):
+        await msg.answer("⚠️ Имя должно состоять только из латинских букв, цифр и «_», длина 3–20 символов (оно попадает в ссылки и кнопки). Введите другое:")
+        return
 
     # Same check multi_add_username() below already does — catching it
     # here, before even asking for a password, is both better UX and the
@@ -168,7 +172,7 @@ async def finalize_add_user(msg: Message, state: FSMContext, expires_at):
 
     await run_sync()
 
-    link = generate_link(username, DOMAIN)
+    link = await generate_link_async(username, DOMAIN)
 
     await msg.answer(
         format_full_instructions_message(username, password, expires_at, link),
@@ -299,6 +303,9 @@ async def multi_add_username(msg: Message, state: FSMContext):
         return
 
     username = (msg.text or "").strip()
+    if not USERNAME_RE.match(username):
+        await msg.answer("⚠️ Имя должно состоять только из латинских букв, цифр и «_», длина 3–20 символов (оно попадает в ссылки и кнопки). Введите другое:")
+        return
     data = await state.get_data()
     batch = data.get("batch", [])
 
@@ -487,7 +494,7 @@ async def multi_add_get_cards(call: CallbackQuery, state: FSMContext):
         user = get_user(username)
         if not user:
             continue
-        link = generate_link(username, DOMAIN)
+        link = await generate_link_async(username, DOMAIN)
         await call.message.answer(
             format_full_instructions_message(username, user.get("password"), user.get("expires_at"), link),
             reply_markup=_invite_link_button(username)

@@ -28,13 +28,6 @@ BOT_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 # caller in bot/handlers/auto_renewal_review.py).
 LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID")
 
-# MAX (max.ru) Bot API — used to reach clients who signed up through the
-# MAX bot (max_bot/) instead of Telegram. Optional: if MAX_BOT_TOKEN isn't
-# set, every send_max_* call below is a harmless no-op, so a deployment
-# that never set up the MAX bot is unaffected.
-MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
-MAX_API_BASE = "https://platform-api2.max.ru"
-
 
 def send_message(chat_id, text: str) -> bool:
     """Plain synchronous send via raw HTTP call to Bot API.
@@ -88,13 +81,10 @@ def send_photo_bytes(
     """
     Synchronous photo upload FROM IN-MEMORY BYTES (as opposed to
     send_document(), which needs a local file path). This is what lets
-    max_bot/handlers/receipt.py relay a receipt photo it received over the
-    MAX Bot API into the Telegram admin's chat, without ever writing it to
-    disk: download the bytes from MAX, hand them straight to this function.
+    callers hold bytes they never wrote to disk.
 
-    reply_markup, if given, is a plain dict in Telegram's own JSON shape
-    (see max_bot/handlers/receipt.py for how it's built) — it gets
-    JSON-encoded into the multipart form field Telegram expects.
+    reply_markup, if given, is a plain dict in Telegram's own JSON shape —
+    it gets JSON-encoded into the multipart form field Telegram expects.
     """
     target = chat_id or ADMIN_ID
     if not PHOTO_API_URL or not target:
@@ -214,19 +204,10 @@ def notify_admin(text: str) -> None:
 
 
 def notify_user(user: dict, text: str) -> None:
-    """
-    Sends to whichever platform(s) this user is actually bound on. A user
-    normally has exactly one of telegram_id/max_chat_id set (depending on
-    which bot they signed up through), but nothing stops both being sent
-    if somehow both are present.
-    """
+    """Sends `text` to the user's Telegram chat (no-op if not bound yet)."""
     tg_id = user.get("telegram_id")
     if tg_id:
         send_message(tg_id, text)
-
-    max_chat_id = user.get("max_chat_id")
-    if max_chat_id:
-        send_max_message(max_chat_id, text)
 
 
 # ---------------- DIAGNOSTICS ----------------
@@ -340,35 +321,3 @@ def diagnose_log_channel() -> dict:
         result["test_send_error"] = str(e)
 
     return result
-
-
-# ---------------- MAX ----------------
-
-def send_max_message(chat_id, text: str) -> bool:
-    """
-    Synchronous send via the raw MAX Bot API — same rationale as
-    send_message()'s Telegram equivalent: services/cleanup.py and
-    services/post_disable_reminders.py are standalone scripts with no
-    event loop, so they can't use the maxapi library's async Bot directly.
-
-    NOTE: MAX requires requests to platform-api2.max.ru (NOT the older
-    platform-api.max.ru) and, per MAX's own docs, that your server trusts
-    the Минцифры (Ministry of Digital Development) TLS certificate for
-    that domain — see README.md's MAX bot setup section.
-    """
-    if not MAX_BOT_TOKEN or not chat_id:
-        return False
-    try:
-        r = requests.post(
-            f"{MAX_API_BASE}/messages",
-            params={"chat_id": chat_id},
-            headers={"Authorization": MAX_BOT_TOKEN},
-            json={"text": text},
-            timeout=10,
-        )
-        if not r.ok:
-            log.warning("MAX sendMessage failed for %s: %s", chat_id, r.text)
-        return r.ok
-    except requests.RequestException as e:
-        log.error("MAX sendMessage error for %s: %s", chat_id, e)
-        return False

@@ -19,7 +19,10 @@ def restart_trusttunnel(wait_ready: bool = True, max_wait_seconds: float = 5.0) 
 
     if result.returncode != 0:
         log.error("trusttunnel restart failed: %s", result.stderr.strip())
-        return
+        # Raise (safe_sync turns this into "ERROR: ...") instead of returning
+        # quietly — callers and the admin must know the tunnel did NOT pick up
+        # the new credentials.
+        raise RuntimeError(f"systemctl restart {TRUSTTUNNEL_SERVICE} failed: {result.stderr.strip() or result.returncode}")
 
     log.info("trusttunnel restarted")
 

@@ -41,6 +41,7 @@ from bot.handlers import (
     sorting,
     start,
     sync_deploy,
+    trial_requests,
 )
 from bot import pagination
 
@@ -68,6 +69,7 @@ for router in (
     get_link.router,
     admin_tariff.router,
     admin_xray.router,
+    trial_requests.router,
 ):
     dp.include_router(router)
 

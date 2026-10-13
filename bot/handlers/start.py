@@ -9,27 +9,24 @@ inline buttons, not FSM), so there's no state-ownership overlap with any
 other handlers/ file.
 """
 import time
-from datetime import timedelta
 
 from aiogram import Router, F
 from aiogram.filters import CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyKeyboardRemove
 
-from bot.access import is_admin, run_sync
+from bot.access import is_admin
 from bot.config import ADMIN_ID, bot
 from bot.formatting import CARD_RE, looks_like_card
-from bot.keyboards import client_menu, main_menu, platform_choice_kb
-from core.dates import utcnow_naive
+from bot.keyboards import client_menu, main_menu
 from core.db import (
-    DuplicateUsernameError,
-    add_user,
     get_user,
     get_user_by_invite_token,
     get_user_by_telegram_id,
     update_user,
 )
-from core.trial import generate_trial_password, generate_username_from_name, has_used_trial, mark_trial_used
+from bot.handlers.trial_requests import send_trial_request_card
+from core.trial import add_trial_request, has_used_trial
 from core.instructions import render_bot_usage_instructions
 
 router = Router()
@@ -64,7 +61,7 @@ async def start(msg: Message, command: CommandObject):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да, пользуюсь — привязать карточку", callback_data="onboard:existing")],
-        [InlineKeyboardButton(text="🆕 Нет — попробовать 4 дня бесплатно", callback_data="onboard:trial")],
+        [InlineKeyboardButton(text="🆕 Нет — запросить 4 дня бесплатно", callback_data="onboard:trial")],
     ])
 
     await msg.answer(
@@ -129,62 +126,26 @@ async def onboard_existing(call: CallbackQuery):
 
 @router.callback_query(F.data == "onboard:trial")
 async def onboard_trial_start(call: CallbackQuery):
-    if has_used_trial(call.from_user.id):
+    """The trial is NOT issued here. The client only files a request; the admin
+    approves or rejects it (bot/handlers/trial_requests.py) and the account is
+    created at that moment."""
+    uid = call.from_user.id
+
+    if has_used_trial(uid) or get_user_by_telegram_id(uid):
         await call.answer("Пробный период уже был использован этим аккаунтом.", show_alert=True)
         return
 
-    username = generate_username_from_name(
-        call.from_user.first_name, call.from_user.username, call.from_user.id
-    )
-    password = generate_trial_password()
-    expires_at = (utcnow_naive() + timedelta(days=4)).strftime("%Y-%m-%d")
+    is_new = add_trial_request(uid, call.from_user.first_name, call.from_user.username)
 
-    try:
-        add_user({
-            "username": username,
-            "password": password,
-            "created_at": utcnow_naive().strftime("%Y-%m-%d"),
-            "expires_at": expires_at,
-            "status": "active",
-            "telegram_id": call.from_user.id,
-            "notified_days": [],
-            "pending_request": None,
-        })
-    except DuplicateUsernameError:
-        # username is deterministic from this Telegram account's id (see
-        # generate_username_from_name) -- a collision here can only mean
-        # THIS account already has a trial record, almost certainly a
-        # double-tap on this button landing before mark_trial_used()
-        # below persisted from the first tap. Same message as the normal
-        # has_used_trial() check above, just reached via the race instead.
-        await call.answer("Пробный период уже был использован этим аккаунтом.", show_alert=True)
-        return
+    # Re-send the card to the admin on a repeat tap too (e.g. the first one got
+    # buried in the chat) — but never create a second request.
+    await send_trial_request_card(uid, call.from_user.first_name, call.from_user.username)
 
-    mark_trial_used(call.from_user.id)
-
-    await run_sync()
-
-    await call.message.answer(
-        f"🎁 Пробный доступ на 4 дня активирован! Доступ до {expires_at}.\n\n"
-        f"👤 Username: {username}\n"
-        f"🔑 Password: {password}\n"
-        f"⏳ Expires: {expires_at}\n\n"
-        "Об истечении напомню заранее, а продлить сможете прямо в этом чате.",
-        reply_markup=client_menu
-    )
-
-    await call.message.answer(
-        "📖 Осталось настроить подключение — выберите вашу платформу:",
-        reply_markup=platform_choice_kb()
-    )
-
-    await call.message.answer(render_bot_usage_instructions())
-
-    await bot.send_message(
-        ADMIN_ID,
-        f"🆕 Новая регистрация по триалу: {username} (tg id {call.from_user.id}), доступ до {expires_at}."
-    )
-
+    if is_new:
+        text = "📨 Заявка на пробный доступ отправлена администратору. Как только она будет одобрена — пришлю данные для подключения."
+    else:
+        text = "⏳ Ваша заявка уже у администратора — напомнил ему. Ожидайте, пришлю данные сразу после одобрения."
+    await call.message.answer(text)
     await call.answer()
 
 

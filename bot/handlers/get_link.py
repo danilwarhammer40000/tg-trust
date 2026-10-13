@@ -1,13 +1,12 @@
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from bot.access import admin_only
+from bot.access import admin_only, generate_link_async
 from bot.config import DOMAIN
 from bot.display import prepare_users_for_display, user_button_label
 from bot.formatting import format_full_instructions_message
 from bot.pagination import paginate, pagination_nav_row
 from core.db import get_user, list_users
-from core.generator import generate_link
 
 router = Router()
 
@@ -70,7 +69,7 @@ async def link_callback(call: CallbackQuery):
     username = call.data.split(":")[1]
 
     user = get_user(username) or {}
-    link = generate_link(username, DOMAIN)
+    link = await generate_link_async(username, DOMAIN)
 
     await call.message.answer(
         format_full_instructions_message(username, user.get("password"), user.get("expires_at"), link)

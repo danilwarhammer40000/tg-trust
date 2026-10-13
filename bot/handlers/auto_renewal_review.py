@@ -3,7 +3,7 @@ Owns: AutoRenewalSettings.waiting_value.
 
 Four things live in this file:
 1. "🤖 Автопродление" admin menu — ON/OFF toggle, "🚀 Полностью
-   автоматический режим" toggle, "⚙️ Настроить условия" (opens the
+   автоматический режим" toggle, "⚙️ Правила проверки" (opens the
    trigger-tuning submenu), and "🔍 Диагностика" (live Bot API checks for
    why the log channel might not be receiving posts). Turning the master
    toggle ON is refused if LOG_CHANNEL_ID isn't configured (see
@@ -59,18 +59,13 @@ log = logging.getLogger(__name__)
 
 def auto_renewal_menu_kb() -> InlineKeyboardMarkup:
     enabled = auto_renewal.is_auto_renewal_enabled()
-    fully_auto = auto_renewal.is_fully_automatic_enabled()
 
     rows = [
         [InlineKeyboardButton(
             text=f"{'✅ Включено' if enabled else '⬜ Выключено'} — переключить",
             callback_data="autoren:toggle"
         )],
-        [InlineKeyboardButton(
-            text=f"{'🚀 Полностью автоматически' if fully_auto else '🌙 Только в ночном окне'} — переключить",
-            callback_data="autoren:toggle_full"
-        )],
-        [InlineKeyboardButton(text="⚙️ Настроить условия", callback_data="autoren:settings")],
+        [InlineKeyboardButton(text="⚙️ Правила проверки", callback_data="autoren:settings")],
         [InlineKeyboardButton(text="ℹ️ Как это работает", callback_data="autoren:howitworks")],
         [InlineKeyboardButton(text="🔍 Диагностика лога", callback_data="autoren:diag")],
     ]
@@ -99,16 +94,7 @@ def _status_text() -> str:
     button instead — see auto_renewal_menu_kb().
     """
     enabled = auto_renewal.is_auto_renewal_enabled()
-    fully_auto = auto_renewal.is_fully_automatic_enabled()
     log_ok = auto_renewal.log_channel_configured()
-
-    if fully_auto:
-        window_line = "• Круглосуточно, при поступлении любого чека (полностью автоматический режим)"
-    else:
-        window_line = (
-            f"• {auto_renewal.get_setting('night_start')}–{auto_renewal.get_setting('night_end')} "
-            f"по Красноярску — сразу при поступлении чека"
-        )
 
     lines = [
         "🤖 Автопродление по чеку через Gemini",
@@ -123,10 +109,8 @@ def _status_text() -> str:
 
     lines += [
         "",
-        "Условия срабатывания:",
-        window_line,
-        f"• Заявка висит без ответа администратора > {auto_renewal.get_setting('overdue_hours')} ч. "
-        f"— в любое время суток",
+        "Пока включено — каждый чек проверяется сразу, в любое время суток, "
+        "без дополнительных условий по времени.",
     ]
     return "\n".join(lines)
 
@@ -202,22 +186,6 @@ async def auto_renewal_toggle(call: CallbackQuery):
     await call.answer()
 
 
-@router.callback_query(F.data == "autoren:toggle_full")
-async def auto_renewal_toggle_full(call: CallbackQuery):
-    if not await admin_only(call):
-        return
-
-    now_full = auto_renewal.toggle_fully_automatic()
-
-    try:
-        await call.message.edit_text(_status_text(), reply_markup=auto_renewal_menu_kb())
-    except Exception:
-        pass
-    await call.answer(
-        "Теперь работает круглосуточно" if now_full else "Теперь только в ночном окне"
-    )
-
-
 @router.callback_query(F.data == "autoren:toggle_proxy")
 async def auto_renewal_toggle_proxy(call: CallbackQuery):
     if not await admin_only(call):
@@ -245,7 +213,7 @@ async def auto_renewal_toggle_proxy(call: CallbackQuery):
 # ---------------- SETTINGS SUBMENU ----------------
 
 def _settings_text() -> str:
-    lines = ["⚙️ Условия срабатывания автопродления:", ""]
+    lines = ["⚙️ Правила проверки чека:", ""]
     for key, meta in auto_renewal.FIELD_META.items():
         lines.append(f"{meta['label']}: {auto_renewal.get_setting(key)}")
     lines += ["", "Дата платежа на чеке не проверяется — важна только сумма."]
@@ -469,7 +437,6 @@ async def auto_renewal_review(call: CallbackQuery):
 
     if action == "disable":
         previous_expires_at = decision.get("previous_expires_at")
-        previous_status = decision.get("previous_status", "active")
 
         # Full rollback, not just a disable -- undo the auto-renewal
         # entirely: status AND expiry both go back to what they were

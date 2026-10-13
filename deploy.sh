@@ -98,10 +98,6 @@ source "$PROJECT_DIR/venv/bin/activate"
 
 pip install -r requirements.txt --quiet
 
-if [ -n "${MAX_BOT_TOKEN:-}" ]; then
-    pip install -r requirements-max.txt --quiet
-fi
-
 # -------------------------
 # 3) REFRESH SYSTEMD UNITS
 # -------------------------
@@ -149,10 +145,6 @@ install_unit_if_changed "trustpanel-post-disable.timer"
 install_unit_if_changed "trustpanel-auto-renewal-check.service"
 install_unit_if_changed "trustpanel-auto-renewal-check.timer"
 
-if [ -n "${MAX_BOT_TOKEN:-}" ]; then
-    install_unit_if_changed "trustpanel-max-bot.service"
-fi
-
 if [ "$UNITS_CHANGED" = "1" ]; then
     systemctl daemon-reload
 fi
@@ -167,10 +159,6 @@ fi
 echo "[4/6] Restarting bot..."
 
 systemctl restart trustpanel-bot.service
-
-if [ -n "${MAX_BOT_TOKEN:-}" ]; then
-    systemctl restart trustpanel-max-bot.service
-fi
 
 # -------------------------
 # 5) RESTART TIMERS (only if their unit actually changed — a timer restart
@@ -219,18 +207,6 @@ fi
 echo ""
 echo "=== TIMERS ==="
 systemctl list-timers | grep trustpanel || true
-
-if [ -n "${MAX_BOT_TOKEN:-}" ]; then
-    echo ""
-    echo "=== MAX BOT STATUS ==="
-    if systemctl is-active --quiet trustpanel-max-bot.service; then
-        echo "✅ MAX BOT RUNNING"
-    else
-        echo "❌ MAX BOT FAILED"
-        systemctl status trustpanel-max-bot.service --no-pager || true
-        journalctl -u trustpanel-max-bot.service -n 40 --no-pager || true
-    fi
-fi
 
 notify "✅ Деплой завершён, бот работает."
 

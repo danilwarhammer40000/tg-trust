@@ -36,12 +36,12 @@ from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
-from bot.access import admin_only, run_sync
+from bot.access import admin_only, build_connection_card_async, run_sync
 from bot.display import sorted_users_for_display, user_button_label
 from bot.keyboards import main_menu
 from bot.pagination import paginate, pagination_nav_row
 from bot.states import LeaderLink
-from follower_issuance import build_connection_card, issue_follower, leader_is_active
+from follower_issuance import issue_follower, leader_is_active
 from core.dates import is_expired
 from core.db import get_followers, get_leaders, get_unlinked_users, get_user, link_user, list_users, unlink_user
 
@@ -359,7 +359,7 @@ async def issue_new_follower(call: CallbackQuery):
         await run_sync()
 
     # STEP 3: now it's safe to generate the actual connection link.
-    card = build_connection_card(new_username)
+    card = await build_connection_card_async(new_username)
 
     await call.message.answer(f"✅ Выпущен новый ведомый: {new_username}")
     await call.message.answer(card)

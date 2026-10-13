@@ -8,6 +8,9 @@ echo "=== TrustPanel Installer ==="
 # -------------------------
 DEFAULT_DIR="/opt/trustpanel"
 PROJECT_DIR="${PROJECT_DIR:-$DEFAULT_DIR}"
+# Repository to install from. Override with your own fork:
+#   REPO_URL=https://github.com/<you>/tg-trust.git bash install.sh
+REPO_URL="${REPO_URL:-https://github.com/danilwarhammer40000/tg-trust.git}"
 
 # -------------------------
 # SYSTEM DEPENDENCIES
@@ -16,7 +19,6 @@ echo "[1/9] Installing system dependencies..."
 
 export DEBIAN_FRONTEND=noninteractive
 apt update -y
-apt upgrade -y
 apt install -y python3 python3-venv python3-pip git curl ca-certificates
 
 # -------------------------
@@ -28,12 +30,19 @@ if [ -d "$PROJECT_DIR/.git" ]; then
     echo "[INFO] Updating repository..."
     cd "$PROJECT_DIR"
     git fetch --all
-    git reset --hard origin/main
-    git pull --ff-only
+    # Never discard local changes silently: fast-forward only, otherwise stop.
+    if ! git pull --ff-only; then
+        echo "[ERROR] Cannot fast-forward (local changes or diverged history)."
+        echo "        Inspect: git -C $PROJECT_DIR status"
+        exit 1
+    fi
 else
-    echo "[INFO] Cloning repository..."
-    rm -rf "$PROJECT_DIR"
-    git clone https://github.com/danilwarhammer40000/tg-trust.git "$PROJECT_DIR"
+    echo "[INFO] Cloning repository from $REPO_URL ..."
+    if [ -e "$PROJECT_DIR" ] && [ -n "$(ls -A "$PROJECT_DIR" 2>/dev/null)" ]; then
+        echo "[ERROR] $PROJECT_DIR exists and is not empty (and is not a git checkout) — refusing to delete it."
+        exit 1
+    fi
+    git clone "$REPO_URL" "$PROJECT_DIR"
     cd "$PROJECT_DIR"
 fi
 
@@ -69,11 +78,6 @@ BOT_TOKEN=$(echo "$BOT_TOKEN" | tr -d '\r')
 ADMIN_ID=$(echo "$ADMIN_ID" | tr -d '\r')
 DOMAIN=$(echo "$DOMAIN" | tr -d '\r')
 
-# Optional — the MAX bot (max_bot/) only gets installed/started if this is
-# given. Leave blank and press Enter to skip it entirely.
-read -r -p "MAX_BOT_TOKEN (Enter to skip MAX bot): " MAX_BOT_TOKEN
-MAX_BOT_TOKEN=$(echo "$MAX_BOT_TOKEN" | tr -d '\r')
-
 # Optional — AI auto-renewal (🤖 Автопродление). Both empty = feature
 # stays off and unconfigured; the bot itself also refuses to let it be
 # turned ON without LOG_CHANNEL_ID (every decision must be logged).
@@ -87,21 +91,23 @@ GEMINI_API_KEY=$(echo "$GEMINI_API_KEY" | tr -d '\r')
 read -r -p "LOG_CHANNEL_ID (numeric channel id, needed for auto-renewal, Enter to skip): " LOG_CHANNEL_ID
 LOG_CHANNEL_ID=$(echo "$LOG_CHANNEL_ID" | tr -d '\r')
 
-# Optional — proxy for outbound Gemini API calls. Google's Gemini API
-# enforces a region allowlist independent of API-key validity; a
-# Russian-hosted VPS IP typically gets FAILED_PRECONDITION ("User
-# location is not supported") even with a valid key. Two forms accepted,
-# same as the in-bot "🌐 Прокси для Gemini API" setting (which can
-# override this later without touching .env or restarting anything):
-#   - a Worker / HTTPS reverse-proxy base URL, e.g.
-#     https://your-worker.workers.dev
-#   - a SOCKS5 endpoint, e.g. socks5h://user:pass@host:port
-# Leave blank for a direct connection (no proxy).
+# Optional — Cloudflare Worker (HTTPS reverse-proxy) for outbound Gemini API
+# calls. Google's Gemini API enforces a region allowlist independent of
+# API-key validity; a Russian-hosted VPS IP typically gets
+# FAILED_PRECONDITION ("User location is not supported") even with a valid
+# key. The URL given here is only the default — it can be changed later in
+# the bot ("🤖 Автопродление" → "⚙️ Правила проверки" → "🌐 Прокси-адрес")
+# without touching .env or restarting anything. Leave blank for a direct
+# connection.
 echo ""
-echo "Прокси для Gemini API (опционально, можно поменять позже в боте) —"
-echo "Worker/HTTPS URL (https://...) или SOCKS5 (socks5h://user:pass@host:port)."
-read -r -p "GEMINI_PROXY_URL (Enter чтобы пропустить): " GEMINI_PROXY_URL
+echo "Cloudflare Worker для Gemini API (опционально, можно поменять позже в боте) —"
+echo "адрес вида https://your-worker.workers.dev"
+read -r -p "GEMINI_PROXY_URL — Worker URL (Enter чтобы пропустить): " GEMINI_PROXY_URL
 GEMINI_PROXY_URL=$(echo "$GEMINI_PROXY_URL" | tr -d '\r')
+if [ -n "$GEMINI_PROXY_URL" ] && [[ ! "$GEMINI_PROXY_URL" =~ ^https?:// ]]; then
+    echo "[ERROR] GEMINI_PROXY_URL must start with http:// or https:// (Cloudflare Worker URL)"
+    exit 1
+fi
 
 # -------------------------
 # ENV
@@ -112,7 +118,6 @@ cat > "$PROJECT_DIR/.env" <<EOF
 BOT_TOKEN=$BOT_TOKEN
 ADMIN_ID=$ADMIN_ID
 TRUSTTUNNEL_DOMAIN=$DOMAIN
-MAX_BOT_TOKEN=$MAX_BOT_TOKEN
 GEMINI_API_KEY=$GEMINI_API_KEY
 GEMINI_PROXY_URL=$GEMINI_PROXY_URL
 LOG_CHANNEL_ID=$LOG_CHANNEL_ID
@@ -120,11 +125,6 @@ PYTHONPATH=$PROJECT_DIR
 EOF
 
 chmod 600 "$PROJECT_DIR/.env"
-
-if [ -n "$MAX_BOT_TOKEN" ]; then
-    echo "[INFO] MAX_BOT_TOKEN given — installing maxapi..."
-    pip install -r requirements-max.txt
-fi
 
 # -------------------------
 # DATA DIRECTORY (users.json etc. contain plaintext VPN passwords)
@@ -167,10 +167,6 @@ install_unit "trustpanel-backup.timer"
 install_unit "trustpanel-post-disable.timer"
 install_unit "trustpanel-auto-renewal-check.timer"
 
-if [ -n "$MAX_BOT_TOKEN" ]; then
-    install_unit "trustpanel-max-bot.service"
-fi
-
 # -------------------------
 # SYSTEMD APPLY
 # -------------------------
@@ -188,12 +184,6 @@ systemctl start trustpanel-backup.timer 2>/dev/null || true
 systemctl start trustpanel-post-disable.timer 2>/dev/null || true
 systemctl start trustpanel-auto-renewal-check.timer 2>/dev/null || true
 
-if [ -n "$MAX_BOT_TOKEN" ]; then
-    systemctl stop trustpanel-max-bot.service 2>/dev/null || true
-    systemctl enable trustpanel-max-bot.service
-    systemctl restart trustpanel-max-bot.service
-fi
-
 # -------------------------
 # HEALTH CHECK
 # -------------------------
@@ -208,17 +198,6 @@ if systemctl is-active --quiet trustpanel-bot.service; then
 else
     echo "❌ BOT FAILED"
     systemctl status trustpanel-bot.service --no-pager || true
-fi
-
-if [ -n "$MAX_BOT_TOKEN" ]; then
-    echo ""
-    echo "=== MAX BOT STATUS ==="
-    if systemctl is-active --quiet trustpanel-max-bot.service; then
-        echo "✅ MAX BOT RUNNING"
-    else
-        echo "❌ MAX BOT FAILED"
-        systemctl status trustpanel-max-bot.service --no-pager || true
-    fi
 fi
 
 echo ""
