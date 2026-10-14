@@ -59,6 +59,7 @@ core.gemini_client.is_proxy_enabled()/proxy_configured(), and the
 main menu (only shown at all when a proxy URL is actually configured,
 from either source).
 """
+import hashlib
 import json
 import logging
 import os
@@ -68,7 +69,9 @@ from zoneinfo import ZoneInfo
 from core.dates import calc_new_expiry_months, is_expired, utcnow_naive
 from core.db import get_user, pop_pending_request, update_user
 from core.notify import get_file_bytes, log_to_channel, notify_admin, notify_user, send_message, send_photo_by_file_id
-from core.paths import AUTO_RENEWAL_SETTINGS_PATH
+from core.paths import AUTO_RENEWAL_SETTINGS_PATH, RECEIPT_HASHES_PATH
+from core.redact import scrub
+from core.trial import _lock_for, _read_json, _write_json
 from core.service import safe_sync
 
 log = logging.getLogger(__name__)
@@ -79,6 +82,7 @@ DEFAULT_SETTINGS = {
     "enabled": False,
     "min_amount": 100,
     "min_confidence": 0.75,
+    "max_months": 12,       # one receipt can never auto-extend by more than this many months
     "abuse_lock_days": 7,   # see _is_locked() -- how long one auto-renewal blocks the next
     # Live on/off for the Gemini proxy (see module docstring). Defaults to
     # True so that simply setting GEMINI_PROXY_URL in .env and restarting
@@ -109,6 +113,11 @@ FIELD_META = {
     "min_confidence": {
         "label": "🎯 Мин. уверенность Gemini",
         "prompt": "Минимальная уверенность распознавания чека, от 0 до 1 (например 0.75):",
+    },
+    "max_months": {
+        "label": "📆 Макс. месяцев за один чек",
+        "prompt": "Максимум месяцев, на которые один чек может продлить доступ автоматически "
+                  "(чек на большую сумму уйдёт на ручную проверку). Целое число, например 12:",
     },
     "abuse_lock_days": {
         "label": "🔒 Блокировка повтора (дней)",
@@ -226,6 +235,14 @@ def set_setting_validated(key: str, raw_value: str):
                 raise ValueError
         except ValueError:
             return False, "Введите число от 0 до 1, например 0.75"
+
+    elif key == "max_months":
+        try:
+            value = int(raw_value)
+            if not (1 <= value <= 60):
+                raise ValueError
+        except ValueError:
+            return False, "Введите целое число от 1 до 60, например 12"
 
     elif key == "abuse_lock_days":
         try:
@@ -390,7 +407,37 @@ def evaluate_receipt_extraction(extraction: dict, rate: int = None):
         return False, 0, f"Сумма не кратна ставке клиента ({effective_rate}₽) или не распознана: {amount!r}"
 
     months = int(amount) // effective_rate
+    max_months = get_setting("max_months")
+    if months > max_months:
+        return False, 0, (
+            f"Сумма {amount!r}₽ = {months} мес. — больше лимита автопродления "
+            f"({max_months} мес. за один чек), нужна ручная проверка"
+        )
     return True, months, "OK"
+
+
+# ---------------- DUPLICATE RECEIPT FILES ----------------
+#
+# SHA-256 of every receipt file the auto-renewal has accepted. The same file
+# (e.g. forwarded again, or re-sent from the Telegram history) can never extend
+# access twice. Limits: it only catches byte-identical files — a re-taken
+# screenshot of the same payment has different bytes and is only held back by
+# the anti-abuse lock above.
+
+def _receipt_seen(receipt_hash: str):
+    """Returns the username the file was accepted for, or None."""
+    return _read_json(RECEIPT_HASHES_PATH, {}).get(receipt_hash)
+
+
+def _remember_receipt(receipt_hash: str, username: str) -> bool:
+    """Records the hash; False if it was already there (someone beat us to it)."""
+    with _lock_for(RECEIPT_HASHES_PATH):
+        hashes = _read_json(RECEIPT_HASHES_PATH, {})
+        if receipt_hash in hashes:
+            return False
+        hashes[receipt_hash] = username
+        _write_json(RECEIPT_HASHES_PATH, hashes)
+        return True
 
 
 # ---------------- FILE RETRIEVAL ----------------
@@ -532,10 +579,20 @@ def _process_pending_request_with_ai_inner(username: str, trigger: str) -> bool:
         _fallback_to_manual(username, "Не удалось получить файл чека для проверки", trigger)
         return False
 
+    receipt_hash = hashlib.sha256(file_bytes).hexdigest()
+    previous_owner = _receipt_seen(receipt_hash)
+    if previous_owner:
+        _fallback_to_manual(
+            username,
+            f"Этот же файл чека уже принимался автопродлением (клиент {previous_owner}) — возможна повторная отправка",
+            trigger, file_id, is_photo,
+        )
+        return False
+
     try:
         extraction = extract_receipt_data(file_bytes, mime_type)
     except GeminiError as e:
-        _fallback_to_manual(username, f"Ошибка при обращении к Gemini: {e}", trigger, file_id, is_photo)
+        _fallback_to_manual(username, f"Ошибка при обращении к Gemini: {scrub(e)}", trigger, file_id, is_photo)
         return False
 
     approved, months, reason = evaluate_receipt_extraction(extraction, rate=pending.get("rate_at_submission"))
@@ -545,6 +602,10 @@ def _process_pending_request_with_ai_inner(username: str, trigger: str) -> bool:
         return False
 
     effective_rate = pending.get("rate_at_submission") or get_setting("min_amount")
+    if not _remember_receipt(receipt_hash, username):
+        # Lost a race with another processor that accepted the same file a moment ago.
+        _fallback_to_manual(username, "Этот же файл чека только что был принят другой проверкой", trigger, file_id, is_photo)
+        return False
     _apply_and_request_review(username, months, extraction, trigger, file_id, is_photo, rate=effective_rate)
     return True
 

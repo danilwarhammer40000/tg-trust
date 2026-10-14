@@ -12,6 +12,7 @@ Nothing reaches the VPN (credentials.toml / tunnel restart) before the admin
 approves, which also stops a flood of fake sign-ups from restarting the
 tunnel over and over.
 """
+import html
 import logging
 from datetime import timedelta
 
@@ -43,15 +44,28 @@ def _who(display_name, handle, account_id) -> str:
     return f"{display_name or '—'} {tg} (id {account_id})"
 
 
+def profile_url(account_id: int, handle) -> str:
+    """Link that opens the person's Telegram profile (to write to them).
+    @username link when there is one, otherwise the id deep-link."""
+    return f"https://t.me/{handle}" if handle else f"tg://user?id={account_id}"
+
+
 async def send_trial_request_card(account_id: int, display_name, handle) -> None:
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"trialreq:ok:{account_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"trialreq:no:{account_id}"),
-    ]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Профиль / написать", url=profile_url(account_id, handle))],
+        [
+            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"trialreq:ok:{account_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"trialreq:no:{account_id}"),
+        ],
+    ])
+    name = html.escape(display_name or "—")
     await bot.send_message(
         ADMIN_ID,
-        f"🆕 Заявка на пробный доступ ({TRIAL_DAYS} дня)\n{_who(display_name, handle, account_id)}",
+        f"🆕 Заявка на пробный доступ ({TRIAL_DAYS} дня)\n"
+        f'<a href="tg://user?id={account_id}">{name}</a> '
+        f"{'@' + html.escape(handle) if handle else '(без username)'} (id {account_id})",
         reply_markup=kb,
+        parse_mode="HTML",
     )
 
 

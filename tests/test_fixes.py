@@ -133,3 +133,33 @@ def test_username_validation(trial):
     assert trial.USERNAME_RE.match("ivan_123")
     for bad in ("-c", "a b", "иван", "x", "a:b", "x" * 21):
         assert not trial.USERNAME_RE.match(bad)
+
+
+def test_trial_card_profile_link():
+    from bot.handlers.trial_requests import profile_url
+    assert profile_url(5, "ivan") == "https://t.me/ivan"
+    assert profile_url(5, None) == "tg://user?id=5"
+
+
+# ---------- forged / repeated receipts ----------
+
+def test_months_cap_sends_huge_receipt_to_manual(ar):
+    ok, months, _ = ar.evaluate_receipt_extraction({"readable": True, "confidence": 0.99, "amount": 1200}, rate=100)
+    assert ok and months == 12
+    ok, months, reason = ar.evaluate_receipt_extraction({"readable": True, "confidence": 0.99, "amount": 100000}, rate=100)
+    assert not ok and months == 0 and "лимит" in reason
+
+
+def test_max_months_is_validated_and_editable(ar):
+    assert ar.set_setting_validated("max_months", "0")[0] is False
+    assert ar.set_setting_validated("max_months", "61")[0] is False
+    assert ar.set_setting_validated("max_months", "3")[0] is True
+    ok, months, _ = ar.evaluate_receipt_extraction({"readable": True, "confidence": 0.99, "amount": 400}, rate=100)
+    assert not ok
+
+
+def test_same_receipt_file_accepted_only_once(ar):
+    assert ar._receipt_seen("abc") is None
+    assert ar._remember_receipt("abc", "ivan") is True
+    assert ar._remember_receipt("abc", "petr") is False
+    assert ar._receipt_seen("abc") == "ivan"

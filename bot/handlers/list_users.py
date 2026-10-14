@@ -24,7 +24,6 @@ from bot.pagination import paginate, pagination_nav_row
 from bot.states import AdminMessage, ExtendUser, SetTelegramId
 from core.dates import is_expired
 from core.db import delete_user, get_followers, get_user, list_users, unlink_user, update_user
-from core.xray import xray_block
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -160,8 +159,7 @@ async def user_actions_menu(call: CallbackQuery):
         )],
     ]
 
-    # Admin-only: Xray and the manual tariff (a follower's tariff is its leader's).
-    rows.append([InlineKeyboardButton(text="🛰 Xray", callback_data=f"act_xray:{username}")])
+    # Admin-only: the manual tariff (a follower's tariff is its leader's).
     if not linked_to:
         rows.append([InlineKeyboardButton(text="💰 Тариф", callback_data=f"act_tariff:{username}")])
 
@@ -226,10 +224,6 @@ async def action_get_link(call: CallbackQuery):
     await call.message.answer(
         format_full_instructions_message(username, user.get("password"), user.get("expires_at"), link)
     )
-
-    block = xray_block(user)
-    if block:
-        await call.message.answer(block, parse_mode="HTML")
 
     await call.answer()
 
